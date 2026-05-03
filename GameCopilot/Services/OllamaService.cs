@@ -62,6 +62,104 @@ public class OllamaService
     };
 
     /// <summary>
+    /// Best-effort detection of available VRAM in GB. On Apple Silicon the GPU
+    /// shares unified memory with the CPU, so we report total RAM. On Windows
+    /// we try `nvidia-smi --query-gpu=memory.total` first; if that fails we
+    /// fall back to total RAM. On Linux we try nvidia-smi too. Returns 0 if
+    /// detection fails entirely.
+    /// </summary>
+    public static async Task<int> DetectVramGbAsync()
+    {
+        try
+        {
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+            {
+                // Apple Silicon: unified memory. `sysctl -n hw.memsize` → bytes.
+                var raw = await RunAndCapture("/usr/sbin/sysctl", "-n hw.memsize");
+                if (long.TryParse(raw.Trim(), out var bytes) && bytes > 0)
+                    return (int)Math.Round(bytes / 1024.0 / 1024.0 / 1024.0);
+            }
+            else if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                // Try NVIDIA first.
+                var nv = await RunAndCapture("nvidia-smi", "--query-gpu=memory.total --format=csv,noheader,nounits");
+                if (!string.IsNullOrWhiteSpace(nv))
+                {
+                    var firstLine = nv.Split('\n', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault()?.Trim();
+                    if (int.TryParse(firstLine, out var mb) && mb > 0)
+                        return (int)Math.Round(mb / 1024.0);
+                }
+                // Fallback: total system RAM via wmic.
+                var wm = await RunAndCapture("wmic", "ComputerSystem get TotalPhysicalMemory /value");
+                var match = System.Text.RegularExpressions.Regex.Match(wm, @"TotalPhysicalMemory=(\d+)");
+                if (match.Success && long.TryParse(match.Groups[1].Value, out var winBytes))
+                    return (int)Math.Round(winBytes / 1024.0 / 1024.0 / 1024.0);
+            }
+            else
+            {
+                // Linux: nvidia-smi if present.
+                var nv = await RunAndCapture("nvidia-smi", "--query-gpu=memory.total --format=csv,noheader,nounits");
+                if (!string.IsNullOrWhiteSpace(nv))
+                {
+                    var firstLine = nv.Split('\n', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault()?.Trim();
+                    if (int.TryParse(firstLine, out var mb) && mb > 0)
+                        return (int)Math.Round(mb / 1024.0);
+                }
+            }
+        }
+        catch { /* swallow — detection is best-effort */ }
+        return 0;
+    }
+
+    /// <summary>
+    /// Pick the best model id from <see cref="SupportedModels"/> for the given
+    /// VRAM budget. Conservative: leaves headroom for OS / overlays. Returns
+    /// the largest model that should comfortably fit; falls back to the
+    /// smallest entry if VRAM is unknown or too small.
+    /// </summary>
+    public static string RecommendedModelForVram(int vramGb)
+    {
+        // Each entry: (minimum VRAM in GB to recommend this model, model id).
+        // Order matters — first entry that the budget can afford wins.
+        var ladder = new (int MinGb, string ModelId)[]
+        {
+            (80, "llama3.3:70b"),       // ~40 GB but huge ctx + headroom
+            (24, "qwen3:30b-a3b"),      // MoE — fast for its weight class
+            (20, "gpt-oss:20b"),
+            (16, "qwen2.5-coder:14b"),  // strong for tools/code
+            (12, "qwen3:14b"),
+            (8,  "qwen3:8b"),
+            (6,  "qwen2.5-coder:7b"),
+            (0,  "qwen3:4b"),           // last-resort tiny model
+        };
+        foreach (var (min, id) in ladder)
+            if (vramGb >= min) return id;
+        return "qwen3:4b";
+    }
+
+    private static async Task<string> RunAndCapture(string file, string args)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = file,
+                Arguments = args,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            using var proc = Process.Start(psi);
+            if (proc == null) return "";
+            var stdout = await proc.StandardOutput.ReadToEndAsync();
+            await proc.WaitForExitAsync();
+            return stdout;
+        }
+        catch { return ""; }
+    }
+
+    /// <summary>
     /// Check if Ollama is running and list available models.
     /// </summary>
     public async Task<bool> CheckConnectionAsync()
@@ -589,6 +687,118 @@ public class OllamaService
     }
 
     /// <summary>
+    /// Streaming chat call that ALSO supports tool calling.
+    /// Tokens are delivered live via <paramref name="onToken"/>; if the model
+    /// chooses to call tools instead of answering, the tool_calls land in the
+    /// returned result and onToken is simply not invoked. This lets the final
+    /// answer (after the last tool round) appear token-by-token instead of
+    /// freezing the UI for 10–60s.
+    /// </summary>
+    public async Task<OllamaStreamWithToolsResult> StreamChatWithToolsAsync(
+        string model,
+        List<object> messages,
+        List<object>? tools,
+        Action<string> onToken,
+        CancellationToken ct = default)
+    {
+        var hasTools = tools != null && tools.Count > 0;
+        var payloadObj = new Dictionary<string, object>
+        {
+            ["model"] = model,
+            ["messages"] = messages,
+            ["stream"] = true,
+            ["keep_alive"] = "30m",
+            ["options"] = new { temperature = 0.7, num_predict = 4096, num_ctx = hasTools ? 8192 : 16384 },
+        };
+        if (hasTools)
+            payloadObj["tools"] = tools!;
+
+        var payload = JsonSerializer.Serialize(payloadObj);
+
+        var request = new HttpRequestMessage(HttpMethod.Post, $"{BaseUrl}/api/chat")
+        {
+            Content = new StringContent(payload, Encoding.UTF8, "application/json"),
+        };
+
+        using var resp = await Http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
+        resp.EnsureSuccessStatusCode();
+
+        using var stream = await resp.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+        using var reader = new StreamReader(stream);
+
+        var result = new OllamaStreamWithToolsResult();
+        var contentBuffer = new StringBuilder();
+        // Build the assistant message we have to echo back next round (so
+        // Ollama can correlate tool results with their tool_calls).
+        var collectedToolCalls = new List<JsonElement>();
+
+        while (!reader.EndOfStream)
+        {
+            ct.ThrowIfCancellationRequested();
+            var line = await reader.ReadLineAsync().ConfigureAwait(false);
+            if (string.IsNullOrEmpty(line)) continue;
+
+            try
+            {
+                using var doc = JsonDocument.Parse(line);
+                var root = doc.RootElement;
+                if (!root.TryGetProperty("message", out var msg)) continue;
+
+                if (msg.TryGetProperty("content", out var content))
+                {
+                    var token = content.GetString();
+                    if (!string.IsNullOrEmpty(token))
+                    {
+                        contentBuffer.Append(token);
+                        onToken(token);
+                    }
+                }
+
+                if (msg.TryGetProperty("tool_calls", out var toolCallsEl) &&
+                    toolCallsEl.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var tc in toolCallsEl.EnumerateArray())
+                    {
+                        // Clone so we still have it after `doc` is disposed.
+                        collectedToolCalls.Add(tc.Clone());
+                        if (tc.TryGetProperty("function", out var fn))
+                        {
+                            result.ToolCalls.Add(new OllamaToolCall
+                            {
+                                Name = fn.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "",
+                                ArgumentsJson = fn.TryGetProperty("arguments", out var a) ? a.GetRawText() : "{}",
+                            });
+                        }
+                    }
+                }
+            }
+            catch { /* skip malformed chunk */ }
+        }
+
+        result.Content = contentBuffer.ToString();
+
+        // Build the message echo Ollama expects on the next turn:
+        // { role: "assistant", content: "...", tool_calls: [...] }
+        var echo = new Dictionary<string, object>
+        {
+            ["role"] = "assistant",
+            ["content"] = result.Content,
+        };
+        if (collectedToolCalls.Count > 0)
+        {
+            // Re-serialize the cloned tool_calls so it round-trips cleanly.
+            var arr = "[" + string.Join(",", collectedToolCalls.Select(e => e.GetRawText())) + "]";
+            // We can't put pre-serialized JSON inside a Dictionary<string,object>
+            // and expect JsonSerializer to keep it raw, so build the final
+            // string manually for RawMessageJson.
+            using var doc = JsonDocument.Parse(arr);
+            echo["tool_calls"] = doc.RootElement.Clone();
+        }
+        result.RawMessageJson = JsonSerializer.Serialize(echo);
+        return result;
+    }
+
+    /// <summary>
     /// Non-streaming chat call that supports tool calling.
     /// Returns the full response including any tool_calls.
     /// </summary>
@@ -658,6 +868,14 @@ public class OllamaService
 }
 
 public class OllamaChatResponse
+{
+    public string Content { get; set; } = "";
+    public List<OllamaToolCall> ToolCalls { get; } = new();
+    public bool HasToolCalls => ToolCalls.Count > 0;
+    public string RawMessageJson { get; set; } = "";
+}
+
+public class OllamaStreamWithToolsResult
 {
     public string Content { get; set; } = "";
     public List<OllamaToolCall> ToolCalls { get; } = new();

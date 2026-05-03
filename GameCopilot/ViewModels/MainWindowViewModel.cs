@@ -3,6 +3,7 @@ using System.Collections.ObjectModel;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using Avalonia.Threading;
@@ -440,10 +441,30 @@ public partial class MainWindowViewModel : ViewModelBase
             foreach (var m in ChatModelList)
                 m.IsInstalled = _ollamaService.HasModel(m.Id);
 
-            // Auto-select first installed model, show picker if none installed
-            SelectedChatModel = ChatModelList.FirstOrDefault(m => m.IsInstalled);
+            // Detect available VRAM (NVIDIA via nvidia-smi on Win/Linux,
+            // unified memory via sysctl on Apple Silicon) and prefer the
+            // recommended model for this hardware if it's installed. Falls
+            // back to the first installed model if nothing matches.
+            var vramGb = await Services.OllamaService.DetectVramGbAsync();
+            var recommendedId = vramGb > 0
+                ? Services.OllamaService.RecommendedModelForVram(vramGb)
+                : null;
+            var recommendedInstalled = recommendedId != null
+                ? ChatModelList.FirstOrDefault(m => m.IsInstalled && m.Id == recommendedId)
+                : null;
+            SelectedChatModel = recommendedInstalled
+                ?? ChatModelList.FirstOrDefault(m => m.IsInstalled);
             ShowModelPicker = SelectedChatModel == null;
             UpdateModelStatus();
+            // Surface the detection AFTER UpdateModelStatus so it doesn't get
+            // overwritten by the default "<id> bereit" message.
+            if (vramGb > 0)
+            {
+                if (SelectedChatModel != null)
+                    ChatModelStatus = $"{SelectedChatModel.Id} bereit · {vramGb} GB erkannt";
+                else if (recommendedId != null)
+                    ChatModelStatus = $"{vramGb} GB erkannt → empfohlen: {recommendedId} (installieren)";
+            }
 
             // Start MCP server in background
             McpStatus = "MCP wird gestartet...";
@@ -795,17 +816,56 @@ public partial class MainWindowViewModel : ViewModelBase
                             streamMsg.AgentSteps.Add(thinkingStep);
                         });
 
-                        var response = await _ollamaService.ChatWithToolsAsync(modelId, ollamaMessages, tools).ConfigureAwait(false);
+                        // Stream tokens directly into the chat bubble. If the
+                        // model decides to call tools instead of answering,
+                        // onToken is simply not invoked and ToolCalls fills.
+                        var streamedSoFar = new StringBuilder();
+                        var firstTokenSeen = false;
+                        var response = await _ollamaService.StreamChatWithToolsAsync(
+                            modelId,
+                            ollamaMessages,
+                            tools,
+                            token =>
+                            {
+                                streamedSoFar.Append(token);
+                                if (!firstTokenSeen)
+                                {
+                                    firstTokenSeen = true;
+                                    var snapshot1 = streamedSoFar.ToString();
+                                    Dispatcher.UIThread.Post(() =>
+                                    {
+                                        // Hide the "thinking" placeholder once the
+                                        // model actually starts producing answer text.
+                                        streamMsg.AgentSteps.Remove(thinkingStep);
+                                        IsToolRunning = false;
+                                        streamMsg.IsAgentWorking = false;
+                                        streamMsg.Content = CleanMarkdown(snapshot1);
+                                    });
+                                }
+                                else
+                                {
+                                    var snapshot2 = streamedSoFar.ToString();
+                                    Dispatcher.UIThread.Post(() =>
+                                    {
+                                        streamMsg.Content = CleanMarkdown(snapshot2);
+                                    });
+                                }
+                            }).ConfigureAwait(false);
 
-                        // Remove thinking step
-                        Dispatcher.UIThread.Post(() =>
+                        // If we never saw a content token (model jumped straight
+                        // to a tool call), make sure the thinking step is removed.
+                        if (!firstTokenSeen)
                         {
-                            streamMsg.AgentSteps.Remove(thinkingStep);
-                        });
+                            Dispatcher.UIThread.Post(() =>
+                            {
+                                streamMsg.AgentSteps.Remove(thinkingStep);
+                            });
+                        }
 
                         if (!response.HasToolCalls)
                         {
-                            // Final answer - show it
+                            // Final answer already streamed in — just make sure
+                            // the bubble shows the cleaned full text.
                             var finalText = CleanMarkdown(response.Content);
                             Dispatcher.UIThread.Post(() =>
                             {
