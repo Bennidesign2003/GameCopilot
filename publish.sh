@@ -14,7 +14,7 @@ set -e
 # ============================================================
 
 REPO="Bennidesign2003/GodotRenderingAI"
-VERSION="3.5.2"
+VERSION="3.5.3"
 TAG="v${VERSION}"
 PROJECT_DIR="$(cd "$(dirname "$0")/GameCopilot" && pwd)"
 PUBLISH_DIR="${PROJECT_DIR}/bin/publish"
@@ -90,11 +90,16 @@ cat > "${UPDATE_JSON}" <<EOF
   "LatestVersion": "${VERSION}",
   "DownloadUrl": "${DOWNLOAD_URL}",
   "Changelog": [
-    "Neue Modelle im Picker: Qwen 3 (4B/8B/14B/30B-MoE/32B), Qwen 2.5 Coder, GPT-OSS 20B/120B, Llama 3.3 70B, Gemma 3 12B/27B",
-    "Auto-Modellwahl beim Start: VRAM/Unified-Memory wird erkannt und das passende Modell vorausgewaehlt",
-    "Live-Streaming auch im Tool-Modus: finale Antwort erscheint Wort-fuer-Wort statt nach 30s am Stueck",
-    "Schnellere Folge-Anfragen: Modell bleibt 30 Min im VRAM (keep_alive) - kein Cold-Load mehr zwischen Fragen",
-    "Professionellerer System-Prompt: klare Rolle, Markdown-Tabellen mit Einheiten, Diagnose vor Empfehlung, keine erfundenen Daten"
+    "MCP-Server wird beim App-Start vorgewaermt - erste Tool-Antwort ist sofort schnell",
+    "Halluzinationen behoben: Kontext-Fenster auf 16k erhoeht (war 8k zu klein bei 14 Tools - Modell verlor Historie und erfand Werte)",
+    "Tool-Auswahl deterministischer (temperature 0.1), finale Antwort natuerlicher (temperature 0.65)",
+    "Erweiterte Tool-Hinweise im System-Prompt: diagnose_msfs_config, set_msfs_setting, fix_msfs, check_and_install_driver",
+    "Klare Fehlermeldung statt leerer Bubble wenn der Agent nach 15 Tool-Runden ohne Antwort endet",
+    "Live-Streaming Indikator (typing dots) waehrend die Antwort eintrifft",
+    "(aus 3.5.2) Neue Modelle: Qwen 3, Qwen 2.5 Coder, GPT-OSS, Llama 3.3, Gemma 3",
+    "(aus 3.5.2) Auto-Modellwahl basierend auf erkanntem VRAM",
+    "(aus 3.5.2) Modell bleibt 30 Min im VRAM zwischen Fragen (keep_alive)",
+    "(aus 3.5.2) Streaming auch im Tool-Modus statt 30s Spinner"
   ]
 }
 EOF
@@ -135,26 +140,27 @@ else
         --title "GameCopilot ${VERSION}" \
         --notes "## GameCopilot ${VERSION}
 
-Komplett ueberarbeiteter AI-Chat - schneller, professioneller, modernere Modelle.
+Stabilitaet, Geschwindigkeit und Antwort-Qualitaet weiter verbessert auf Basis von 3.5.2.
 
-### Neue Modelle
-- **Qwen 3** in 4B / 8B / 14B / **30B-A3B (MoE)** / 32B
-- **Qwen 2.5 Coder** in 7B / 14B / 32B fuer Code- und Tool-Workloads
-- **GPT-OSS** 20B und 120B (OpenAI Open-Weights)
-- **Llama 3.3** 70B (Meta-Flagship)
-- **Gemma 3** 12B und 27B mit 128k Kontext
-- DeepSeek R1 8B / 14B / 32B bleiben fuer Reasoning
+### Bugfixes
+- **Halluzinationen weg**: Kontext-Fenster bei aktivierten Tools von 8192 auf 16384 Tokens erhoeht. Mit 14 Tool-Schemas (~5000 Tokens) lief das Fenster im Tool-Modus still ueber - das Modell verlor Historie und erfand Werte
+- **Klare Fehlermeldung** statt leerer Bubble wenn der Agent alle 15 Tool-Runden braucht ohne fertig zu werden
 
 ### Schneller
-- **Auto-Modellwahl beim Start**: VRAM (NVIDIA via nvidia-smi) bzw. Unified Memory (Apple Silicon via sysctl) wird erkannt und das passende Modell aus der Liste vorausgewaehlt - Status zeigt z.B. \`qwen3:14b bereit · 24 GB erkannt\`
-- **keep_alive 30m**: Modell bleibt 30 Min nach jedem Chat im VRAM. Folgefragen starten ohne 5-30s Cold-Load
-- **Streaming auch im Tool-Modus**: die finale Antwort erscheint Wort-fuer-Wort statt nach 30s am Stueck. Thinking-Spinner verschwindet beim ersten Token
+- **MCP-Server vorgewaermt**: Wird waehrend des Splash-Screens schon im Hintergrund gestartet. Erste Tool-Anfrage ist sofort schnell statt nach 5-10s Cold-Start
+- **Streaming-Indikator**: Typing-Dots erscheinen ab dem ersten Token
 
 ### Professioneller
-- Neuer System-Prompt mit vier expliziten Sektionen (Identitaet / Stil / Ehrlichkeit / Tools)
-- Tool-Output immer als Markdown-Tabelle \`| Einstellung | Aktuell | Empfehlung |\`
-- Werte mit Einheiten, Diagnose vor Empfehlung, klare Annahmen-Markierung
-- \`/no_think\` fuer Qwen3 im Tool-Modus bleibt - vermeidet versteckte Reasoning-Tokens"
+- **Tool-Auswahl mit temperature 0.1** (deterministisch, gleiche Frage liefert gleiche Tools)
+- **Finale Antwort mit temperature 0.65** (natuerlicher Sprachfluss)
+- **System-Prompt erweitert** mit Hinweisen auf \`diagnose_msfs_config\`, \`set_msfs_setting\`, \`fix_msfs\`, \`check_and_install_driver\`
+
+### Aus 3.5.2
+- Neue Modelle: Qwen 3 (4B/8B/14B/30B-MoE/32B), Qwen 2.5 Coder (7B/14B/32B), GPT-OSS 20B/120B, Llama 3.3 70B, Gemma 3 12B/27B
+- Auto-Modellwahl basierend auf erkanntem VRAM
+- keep_alive 30m haelt Modell zwischen Fragen im VRAM
+- Streaming auch im Tool-Modus, finale Antwort Wort-fuer-Wort statt 30s Spinner
+- Komplett neu geschriebener System-Prompt (Identitaet / Stil / Ehrlichkeit / Tools)"
 fi
 
 echo ""

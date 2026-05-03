@@ -702,13 +702,18 @@ public class OllamaService
         CancellationToken ct = default)
     {
         var hasTools = tools != null && tools.Count > 0;
+        // Tool-calling rounds need low temperature (0.1) for reliable tool selection.
+        // Without tools the model is writing a final answer — use 0.65 for natural text.
+        var temperature = hasTools ? 0.1 : 0.65;
         var payloadObj = new Dictionary<string, object>
         {
             ["model"] = model,
             ["messages"] = messages,
             ["stream"] = true,
             ["keep_alive"] = "30m",
-            ["options"] = new { temperature = 0.7, num_predict = 4096, num_ctx = hasTools ? 8192 : 16384 },
+            // 14 tool schemas ≈ 4000–5000 tokens alone. 8192 was silently overflowing,
+            // causing the model to lose history and hallucinate. Always use 16384.
+            ["options"] = new { temperature, num_predict = 4096, num_ctx = 16384 },
         };
         if (hasTools)
             payloadObj["tools"] = tools!;
@@ -809,6 +814,8 @@ public class OllamaService
         CancellationToken ct = default)
     {
         var hasTools = tools != null && tools.Count > 0;
+        // Low temperature for tool selection (0.1), natural temperature for final prose (0.65).
+        var temperature = hasTools ? 0.1 : 0.65;
         var payloadObj = new Dictionary<string, object>
         {
             ["model"] = model,
@@ -817,8 +824,9 @@ public class OllamaService
             // Same keep_alive as the streaming path — VRAM-resident model = no
             // 5–10s reload delay between turns.
             ["keep_alive"] = "30m",
-            // Tool-calling: moderate output for tool selection + tables in final answer
-            ["options"] = new { temperature = 0.7, num_predict = 4096, num_ctx = hasTools ? 8192 : 16384 }
+            // 14 tool schemas ≈ 4000–5000 tokens alone. 8192 was silently overflowing,
+            // causing the model to lose history and hallucinate. Always use 16384.
+            ["options"] = new { temperature, num_predict = 4096, num_ctx = 16384 }
         };
         if (hasTools)
             payloadObj["tools"] = tools!;

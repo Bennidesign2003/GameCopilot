@@ -247,10 +247,27 @@ public partial class MainWindowViewModel : ViewModelBase
 
         // Step 7: Prepare UI
         SplashStatus = "Bereite Benutzeroberflaeche vor...";
-        SplashProgress = 1.0;
+        SplashProgress = 7.0 / 8;
         LoadPresets();
         DetectEnvironment();
         await Task.Delay(300);
+
+        // Step 8: Pre-warm Nvidia MCP Server so it's ready before first chat message
+        SplashStatus = "Nvidia MCP Server wird gestartet...";
+        SplashProgress = 1.0;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await _mcpService.StartAsync(progress =>
+                    Dispatcher.UIThread.Post(() => McpStatus = progress));
+            }
+            catch
+            {
+                // Non-fatal: MCP will lazy-start on first chat message if pre-warm fails
+            }
+        });
+        await Task.Delay(400);
 
         SplashStatus = "Bereit!";
         await Task.Delay(400);
@@ -683,12 +700,16 @@ public partial class MainWindowViewModel : ViewModelBase
             sb.AppendLine("Du bist ein AI-Agent mit System-Tools. Du KANNST und SOLLST Tools aufrufen, um echte Werte vom System zu lesen statt zu raten.");
             sb.AppendLine();
             sb.AppendLine("Wann welches Tool:");
-            sb.AppendLine("- Hardware/GPU-Frage  → get_gpu_status + get_system_info");
-            sb.AppendLine("- MSFS Performance    → analyze_msfs_graphics, dann optimize_msfs_graphics");
-            sb.AppendLine("- VR / Pimax-Probleme → analyze_pimax_settings + analyze_openxr");
-            sb.AppendLine("- Bildqualitaet       → analyze_reshade");
+            sb.AppendLine("- Hardware/GPU-Frage      → get_gpu_status + get_system_info");
+            sb.AppendLine("- MSFS nicht gefunden     → diagnose_msfs_config (findet UserCfg.opt)");
+            sb.AppendLine("- MSFS Performance        → analyze_msfs_graphics, dann optimize_msfs_graphics");
+            sb.AppendLine("- Einzelne MSFS-Einst.    → set_msfs_setting (z.B. Texturqualitaet, Sichtweite)");
+            sb.AppendLine("- MSFS Abstuerze/Fehler   → fix_msfs (Cache, Shader, Reparatur)");
+            sb.AppendLine("- Nvidia-Treiber veraltet → check_and_install_driver");
+            sb.AppendLine("- VR / Pimax-Probleme     → analyze_pimax_settings + analyze_openxr");
+            sb.AppendLine("- Bildqualitaet           → analyze_reshade");
             sb.AppendLine();
-            sb.AppendLine("Tool-Reihenfolge: erst LESEN (analyze_*, get_*), dann erst SCHREIBEN (set_*, optimize_*) und nur wenn der User explizit zugestimmt hat.");
+            sb.AppendLine("Tool-Reihenfolge: erst LESEN (analyze_*, get_*, diagnose_*), dann erst SCHREIBEN (set_*, optimize_*, fix_*) und nur wenn der User explizit zugestimmt hat.");
             sb.AppendLine();
             sb.AppendLine("# AUSGABE-FORMAT FUER TOOL-ERGEBNISSE");
             sb.AppendLine("Tool-Output IMMER als Markdown-Tabelle mit drei Spalten: | Einstellung | Aktuell | Empfehlung |");
@@ -797,6 +818,7 @@ public partial class MainWindowViewModel : ViewModelBase
                 {
                     const int maxToolRounds = 15;
                     int totalToolCalls = 0;
+                    bool reachedFinalAnswer = false;
                     for (int round = 0; round < maxToolRounds; round++)
                     {
                         // Show "thinking" step while waiting for model
@@ -839,6 +861,7 @@ public partial class MainWindowViewModel : ViewModelBase
                                         streamMsg.AgentSteps.Remove(thinkingStep);
                                         IsToolRunning = false;
                                         streamMsg.IsAgentWorking = false;
+                                        streamMsg.IsStreaming = true;
                                         streamMsg.Content = CleanMarkdown(snapshot1);
                                     });
                                 }
@@ -867,6 +890,7 @@ public partial class MainWindowViewModel : ViewModelBase
                             // Final answer already streamed in — just make sure
                             // the bubble shows the cleaned full text.
                             var finalText = CleanMarkdown(response.Content);
+                            reachedFinalAnswer = true;
                             Dispatcher.UIThread.Post(() =>
                             {
                                 IsToolRunning = false;
@@ -884,7 +908,6 @@ public partial class MainWindowViewModel : ViewModelBase
                         {
                             totalToolCalls++;
                             var statusText = ToolStatusText(tc.Name);
-                            var stepNum = totalToolCalls;
                             var step = new AgentStep
                             {
                                 Icon = "⏳",
@@ -927,6 +950,19 @@ public partial class MainWindowViewModel : ViewModelBase
 
                             ollamaMessages.Add(new { role = "tool", content = truncated });
                         }
+                    } // end for-loop over tool rounds
+                    // If the model used all 15 rounds without a final answer,
+                    // surface a clear message so the user isn't left with a blank bubble.
+                    if (!reachedFinalAnswer)
+                    {
+                        Dispatcher.UIThread.Post(() =>
+                        {
+                            IsToolRunning = false;
+                            streamMsg.IsAgentWorking = false;
+                            streamMsg.Content = string.IsNullOrWhiteSpace(streamMsg.Content)
+                                ? "Das Modell hat die maximale Anzahl an Tool-Runden erreicht (15). Bitte versuche es mit einer praeziiseren Anfrage."
+                                : streamMsg.Content;
+                        });
                     }
                 });
             }
@@ -950,7 +986,13 @@ public partial class MainWindowViewModel : ViewModelBase
                             var cleaned = CleanMarkdown(fullText);
                             Dispatcher.UIThread.Post(() =>
                             {
-                                if (!messageAdded) { ChatMessages.Add(streamMsg); IsChatLoading = false; messageAdded = true; }
+                                if (!messageAdded)
+                                {
+                                    ChatMessages.Add(streamMsg);
+                                    IsChatLoading = false;
+                                    streamMsg.IsStreaming = true;
+                                    messageAdded = true;
+                                }
                                 streamMsg.Content = cleaned;
                             });
                         }).ConfigureAwait(false);
@@ -972,7 +1014,8 @@ public partial class MainWindowViewModel : ViewModelBase
         }
         catch (Exception ex)
         {
-            streamMsg.Content = $"Fehler: {ex.Message}";
+            var errText = $"Fehler: {ex.Message}";
+            Dispatcher.UIThread.Post(() => streamMsg.Content = errText);
             if (!messageAdded)
             {
                 messageAdded = true;
@@ -989,6 +1032,8 @@ public partial class MainWindowViewModel : ViewModelBase
             {
                 IsChatLoading = false;
                 IsToolRunning = false;
+                streamMsg.IsStreaming = false;
+                streamMsg.IsAgentWorking = false;   // always reset — safety net on exception/timeout
                 ThinkingStatusText = "Analysiere...";
             });
         }
@@ -1156,6 +1201,21 @@ public partial class MainWindowViewModel : ViewModelBase
 
                 "set_reshade_effect" =>
                     TryGetAny(root, "effekt", "status"),
+
+                "set_msfs_setting" => TryGet(root, "einstellung", "neuer_wert")
+                    is (string setting, string val, _, _)
+                    ? $"{setting} → {val}"
+                    : TryGetAny(root, "einstellung", "status"),
+
+                "fix_msfs" => TryGet(root, "aktion", "ergebnis")
+                    is (string action, string result, _, _)
+                    ? $"{Truncate(action, 30)}: {Truncate(result, 40)}"
+                    : TryGetAny(root, "aktion", "status", "ergebnis"),
+
+                "check_and_install_driver" => TryGet(root, "installiert", "version")
+                    is (string installed, string version, _, _)
+                    ? (installed == "True" ? $"Treiber {version} installiert" : $"Aktuell: {version}")
+                    : TryGetAny(root, "version", "status"),
 
                 _ => TryGetAny(root, "status", "result", "message") ?? "Fertig"
             };
