@@ -90,11 +90,11 @@ cat > "${UPDATE_JSON}" <<EOF
   "LatestVersion": "${VERSION}",
   "DownloadUrl": "${DOWNLOAD_URL}",
   "Changelog": [
-    "Bugfix: MCP startet automatisch wenn nicht aktiv - AI nutzt immer Tools",
-    "Bugfix: UI blockiert nicht mehr bei Tool-Aufrufen (Background-Thread)",
-    "Bugfix: AI ruft Tools einzeln auf statt alles auf einmal",
-    "Bugfix: Weniger Tools (10 statt 22) fuer schnellere Verarbeitung",
-    "Bugfix: OpenXR Toolkit Auto-Discovery (alle MSFS exe-Namen)"
+    "Neue Modelle im Picker: Qwen 3 (4B/8B/14B/30B-MoE/32B), Qwen 2.5 Coder, GPT-OSS 20B/120B, Llama 3.3 70B, Gemma 3 12B/27B",
+    "Auto-Modellwahl beim Start: VRAM/Unified-Memory wird erkannt und das passende Modell vorausgewaehlt",
+    "Live-Streaming auch im Tool-Modus: finale Antwort erscheint Wort-fuer-Wort statt nach 30s am Stueck",
+    "Schnellere Folge-Anfragen: Modell bleibt 30 Min im VRAM (keep_alive) - kein Cold-Load mehr zwischen Fragen",
+    "Professionellerer System-Prompt: klare Rolle, Markdown-Tabellen mit Einheiten, Diagnose vor Empfehlung, keine erfundenen Daten"
   ]
 }
 EOF
@@ -135,13 +135,26 @@ else
         --title "GameCopilot ${VERSION}" \
         --notes "## GameCopilot ${VERSION}
 
-### Bugfixes
-- **AI erfindet keine Daten mehr**: Wenn MCP-Tools Fehler zurueckgeben (ReShade nicht installiert, OpenXR Toolkit nicht gefunden, Pimax Config fehlt), zeigt die AI jetzt ehrlich den Fehler an statt Tabellen mit erfundenen Werten
-- **Tool-Fehler sichtbar**: Agent-Steps zeigen Warnungs-Icon bei Fehlern statt gruenen Haken
-- **Qwen3 /no_think**: Schnellere Tool-Aufrufe durch deaktivierten Thinking-Modus
+Komplett ueberarbeiteter AI-Chat - schneller, professioneller, modernere Modelle.
 
-### Neu
-- **Bessere Steam Library Erkennung**: ReShade-Suche liest libraryfolders.vdf und findet MSFS auf allen Laufwerken automatisch"
+### Neue Modelle
+- **Qwen 3** in 4B / 8B / 14B / **30B-A3B (MoE)** / 32B
+- **Qwen 2.5 Coder** in 7B / 14B / 32B fuer Code- und Tool-Workloads
+- **GPT-OSS** 20B und 120B (OpenAI Open-Weights)
+- **Llama 3.3** 70B (Meta-Flagship)
+- **Gemma 3** 12B und 27B mit 128k Kontext
+- DeepSeek R1 8B / 14B / 32B bleiben fuer Reasoning
+
+### Schneller
+- **Auto-Modellwahl beim Start**: VRAM (NVIDIA via nvidia-smi) bzw. Unified Memory (Apple Silicon via sysctl) wird erkannt und das passende Modell aus der Liste vorausgewaehlt - Status zeigt z.B. \`qwen3:14b bereit · 24 GB erkannt\`
+- **keep_alive 30m**: Modell bleibt 30 Min nach jedem Chat im VRAM. Folgefragen starten ohne 5-30s Cold-Load
+- **Streaming auch im Tool-Modus**: die finale Antwort erscheint Wort-fuer-Wort statt nach 30s am Stueck. Thinking-Spinner verschwindet beim ersten Token
+
+### Professioneller
+- Neuer System-Prompt mit vier expliziten Sektionen (Identitaet / Stil / Ehrlichkeit / Tools)
+- Tool-Output immer als Markdown-Tabelle \`| Einstellung | Aktuell | Empfehlung |\`
+- Werte mit Einheiten, Diagnose vor Empfehlung, klare Annahmen-Markierung
+- \`/no_think\` fuer Qwen3 im Tool-Modus bleibt - vermeidet versteckte Reasoning-Tokens"
 fi
 
 echo ""
