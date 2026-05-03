@@ -1,0 +1,2260 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:GameCopilot.ViewModels"
+        xmlns:models="using:GameCopilot.Models"
+        xmlns:conv="using:GameCopilot.Converters"
+        xmlns:ctrl="using:GameCopilot.Controls"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        mc:Ignorable="d" d:DesignWidth="1600" d:DesignHeight="900"
+        x:Class="GameCopilot.Views.MainWindow"
+        x:DataType="vm:MainWindowViewModel"
+        Icon="/Assets/app-icon.ico"
+        Title="MSFS24 Game Copilot"
+        Width="1600" Height="900"
+        MinWidth="1200" MinHeight="700"
+        Background="Transparent"
+        ExtendClientAreaToDecorationsHint="True"
+        ExtendClientAreaTitleBarHeightHint="-1"
+        WindowDecorations="BorderOnly">
+
+    <Design.DataContext>
+        <vm:MainWindowViewModel/>
+    </Design.DataContext>
+
+    <Window.Resources>
+        <conv:BoolToStatusTextConverter x:Key="BoolToStatusText"/>
+        <conv:BoolToColorConverter x:Key="BoolToColor"/>
+        <conv:PercentConverter x:Key="PercentConverter"/>
+        <conv:ActivePresetConverter x:Key="ActivePreset"/>
+        <conv:BarWidthConverter x:Key="BarWidth"/>
+        <conv:BoolToCheckConverter x:Key="BoolToCheck"/>
+        <conv:BoolToShaderColorConverter x:Key="BoolToShaderColor"/>
+    </Window.Resources>
+
+    <!-- ===================================================================
+         STYLES - Migrated from WPF MainWindow.xaml + Page Resources
+         WPF ControlTemplate.Triggers -> Avalonia pseudo-class styles
+         WPF VisualStateManager -> Avalonia Transitions
+         =================================================================== -->
+    <Window.Styles>
+
+        <!-- ═══ Kinetic Cockpit Design System Styles ═══ -->
+
+        <!-- Primary Action Button -->
+        <Style Selector="Button.modern">
+            <Setter Property="Background" Value="#69daff"/>
+            <Setter Property="Foreground" Value="#004a5d"/>
+            <Setter Property="FontSize" Value="14"/>
+            <Setter Property="FontWeight" Value="Bold"/>
+            <Setter Property="Padding" Value="28,14"/>
+            <Setter Property="CornerRadius" Value="8"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="HorizontalContentAlignment" Value="Center"/>
+            <Setter Property="VerticalContentAlignment" Value="Center"/>
+        </Style>
+        <Style Selector="Button.modern:pointerover /template/ ContentPresenter">
+            <Setter Property="Background" Value="#89e4ff"/>
+        </Style>
+        <Style Selector="Button.modern:pressed /template/ ContentPresenter">
+            <Setter Property="Background" Value="#00c0ea"/>
+        </Style>
+        <Style Selector="Button.modern:disabled /template/ ContentPresenter">
+            <Setter Property="Background" Value="#232629"/>
+        </Style>
+
+        <!-- Secondary / Outline Button -->
+        <Style Selector="Button.outline">
+            <Setter Property="Background" Value="#1d2023"/>
+            <Setter Property="Foreground" Value="#aaabad"/>
+            <Setter Property="FontSize" Value="14"/>
+            <Setter Property="FontWeight" Value="Normal"/>
+            <Setter Property="Padding" Value="28,14"/>
+            <Setter Property="CornerRadius" Value="8"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="HorizontalContentAlignment" Value="Center"/>
+            <Setter Property="VerticalContentAlignment" Value="Center"/>
+        </Style>
+        <Style Selector="Button.outline:pointerover /template/ ContentPresenter">
+            <Setter Property="Background" Value="#232629"/>
+            <Setter Property="Foreground" Value="#eeeef0"/>
+        </Style>
+        <Style Selector="Button.outline:pressed /template/ ContentPresenter">
+            <Setter Property="Background" Value="#171a1c"/>
+        </Style>
+
+        <!-- Nav Button (sidebar) -->
+        <Style Selector="Button.nav">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Foreground" Value="#aaabad"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="FontWeight" Value="Normal"/>
+            <Setter Property="Padding" Value="16,12"/>
+            <Setter Property="CornerRadius" Value="8"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="HorizontalAlignment" Value="Stretch"/>
+            <Setter Property="HorizontalContentAlignment" Value="Left"/>
+        </Style>
+        <Style Selector="Button.nav:pointerover /template/ ContentPresenter">
+            <Setter Property="Background" Value="#1d2023"/>
+            <Setter Property="Foreground" Value="#eeeef0"/>
+        </Style>
+
+        <!-- Icon Button -->
+        <Style Selector="Button.icon">
+            <Setter Property="Background" Value="#1d2023"/>
+            <Setter Property="Foreground" Value="#aaabad"/>
+            <Setter Property="FontSize" Value="16"/>
+            <Setter Property="Width" Value="40"/>
+            <Setter Property="Height" Value="40"/>
+            <Setter Property="CornerRadius" Value="8"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Padding" Value="0"/>
+        </Style>
+        <Style Selector="Button.icon:pointerover /template/ ContentPresenter">
+            <Setter Property="Background" Value="#232629"/>
+            <Setter Property="Foreground" Value="#eeeef0"/>
+        </Style>
+
+        <!-- Card (tonal shift, NO borders per design system) -->
+        <Style Selector="Border.card">
+            <Setter Property="Background" Value="#111416"/>
+            <Setter Property="CornerRadius" Value="12"/>
+            <Setter Property="Padding" Value="24"/>
+            <Setter Property="BorderThickness" Value="0"/>
+        </Style>
+
+        <!-- Search TextBox (inset look) -->
+        <Style Selector="TextBox.search">
+            <Setter Property="Background" Value="#000000"/>
+            <Setter Property="Foreground" Value="#eeeef0"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="CornerRadius" Value="8"/>
+            <Setter Property="Padding" Value="16,12"/>
+            <Setter Property="FontSize" Value="14"/>
+        </Style>
+
+        <!-- Section header label -->
+        <Style Selector="TextBlock.section-header">
+            <Setter Property="FontSize" Value="10"/>
+            <Setter Property="FontWeight" Value="Bold"/>
+            <Setter Property="Foreground" Value="#aaabad"/>
+            <Setter Property="LetterSpacing" Value="2"/>
+            <Setter Property="Margin" Value="0,0,0,12"/>
+        </Style>
+        <Style Selector="TextBlock.label">
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="Foreground" Value="#aaabad"/>
+        </Style>
+        <Style Selector="TextBlock.value">
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="Foreground" Value="#69daff"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+        </Style>
+
+        <!-- Slider -->
+        <Style Selector="Slider">
+            <Setter Property="Minimum" Value="0"/>
+            <Setter Property="Maximum" Value="1"/>
+            <Setter Property="Foreground" Value="#69daff"/>
+        </Style>
+
+        <!-- CheckBox -->
+        <Style Selector="CheckBox">
+            <Setter Property="Foreground" Value="#eeeef0"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="Margin" Value="0,4"/>
+        </Style>
+
+        <!-- ListBox -->
+        <Style Selector="ListBox">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="0"/>
+        </Style>
+        <Style Selector="ListBoxItem">
+            <Setter Property="Padding" Value="12,10"/>
+            <Setter Property="Margin" Value="0,2"/>
+            <Setter Property="CornerRadius" Value="8"/>
+            <Setter Property="Foreground" Value="#eeeef0"/>
+            <Setter Property="FontSize" Value="14"/>
+        </Style>
+        <Style Selector="ListBoxItem:pointerover /template/ ContentPresenter">
+            <Setter Property="Background" Value="#1d2023"/>
+        </Style>
+        <Style Selector="ListBoxItem:selected /template/ ContentPresenter">
+            <Setter Property="Background" Value="#1d2023"/>
+        </Style>
+        <Style Selector="ListBoxItem:selected">
+            <Setter Property="BorderBrush" Value="#69daff"/>
+            <Setter Property="BorderThickness" Value="0,0,2,0"/>
+        </Style>
+
+        <!-- Blinking streaming cursor (ChatGPT-style ▋) -->
+        <Style Selector="TextBlock.streaming-cursor">
+            <Style.Animations>
+                <Animation Duration="0:0:0.9" IterationCount="INFINITE" PlaybackDirection="Alternate" Easing="LinearEasing">
+                    <KeyFrame Cue="0%">
+                        <Setter Property="Opacity" Value="1"/>
+                    </KeyFrame>
+                    <KeyFrame Cue="100%">
+                        <Setter Property="Opacity" Value="0"/>
+                    </KeyFrame>
+                </Animation>
+            </Style.Animations>
+        </Style>
+
+        <!-- Window Close Button -->
+        <Style Selector="Button.close-btn">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Foreground" Value="#aaabad"/>
+            <Setter Property="FontSize" Value="20"/>
+            <Setter Property="Width" Value="40"/>
+            <Setter Property="Height" Value="40"/>
+            <Setter Property="CornerRadius" Value="8"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Padding" Value="0"/>
+        </Style>
+        <Style Selector="Button.close-btn:pointerover /template/ ContentPresenter">
+            <Setter Property="Background" Value="#FF4444"/>
+            <Setter Property="Foreground" Value="White"/>
+        </Style>
+        <Style Selector="Button.min-btn">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Foreground" Value="#aaabad"/>
+            <Setter Property="FontSize" Value="16"/>
+            <Setter Property="Width" Value="40"/>
+            <Setter Property="Height" Value="40"/>
+            <Setter Property="CornerRadius" Value="8"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Padding" Value="0"/>
+        </Style>
+        <Style Selector="Button.min-btn:pointerover /template/ ContentPresenter">
+            <Setter Property="Background" Value="#1d2023"/>
+        </Style>
+    </Window.Styles>
+
+
+    <!-- ===================================================================
+         MAIN OUTER BORDER (from WPF: Border with CornerRadius + DropShadow)
+         WPF DropShadowEffect -> Avalonia BoxShadow
+         =================================================================== -->
+    <Border Background="#0c0e10" CornerRadius="12"
+            BorderThickness="0"
+            BoxShadow="0 20 40 0 #66000000"
+            ClipToBounds="True">
+
+        <Panel>
+
+            <!-- ===================================================================
+                 SPLASH SCREEN (from WPF SplashScreenPage.xaml)
+                 Shown first, then hidden. Animated loading bar + logo.
+                 =================================================================== -->
+            <Panel IsVisible="{Binding !SplashDone}">
+                <Grid Background="#0c0e10">
+
+                    <!-- Decorative plane (from WPF SplashScreen) -->
+                    <TextBlock Text="&#9992;" FontSize="280"
+                               HorizontalAlignment="Right" VerticalAlignment="Top"
+                               Foreground="#69daff" Opacity="0.04"
+                               Margin="0,-80,100,0">
+                        <TextBlock.RenderTransform>
+                            <RotateTransform Angle="25"/>
+                        </TextBlock.RenderTransform>
+                    </TextBlock>
+
+                    <!-- Decorative wave lines (from WPF Canvas/Path) -->
+                    <Canvas Opacity="0.1">
+                        <Line StartPoint="0,450" EndPoint="1600,450" Stroke="#69daff" StrokeThickness="2"/>
+                        <Line StartPoint="0,500" EndPoint="1600,500" Stroke="#69daff" StrokeThickness="1.5"/>
+                        <Line StartPoint="0,550" EndPoint="1600,550" Stroke="#69daff" StrokeThickness="2"/>
+                    </Canvas>
+
+                    <!-- Center content -->
+                    <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
+
+                        <!-- Logo Circle (from WPF SplashScreen logo area) -->
+                        <Panel Margin="0,0,0,40" HorizontalAlignment="Center">
+                            <!-- Glow -->
+                            <Ellipse Width="230" Height="200" Opacity="0.3">
+                                <Ellipse.Fill>
+                                    <RadialGradientBrush>
+                                        <GradientStop Color="#69daff" Offset="0"/>
+                                        <GradientStop Color="Transparent" Offset="1"/>
+                                    </RadialGradientBrush>
+                                </Ellipse.Fill>
+                            </Ellipse>
+                            <!-- Logo border -->
+                            <Border Width="140" Height="140" CornerRadius="70"
+                                    Background="#111416" BorderBrush="#00D9FF" BorderThickness="3"
+                                    HorizontalAlignment="Center" VerticalAlignment="Center"
+                                    BoxShadow="0 0 30 0 #9969daff">
+                                <Border Background="#69daff" CornerRadius="12"
+                                        Width="80" Height="80"
+                                        HorizontalAlignment="Center" VerticalAlignment="Center">
+                                    <TextBlock Text="&#9992;" FontSize="42"
+                                               HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                </Border>
+                            </Border>
+                        </Panel>
+
+                        <!-- Title (from WPF SplashScreen) -->
+                        <TextBlock Text="MSFS24 GAME COPILOT" FontSize="52" FontWeight="Bold"
+                                   Foreground="#eeeef0" HorizontalAlignment="Center" Margin="0,0,0,12"/>
+                        <TextBlock Text="Microsoft Flight Simulator 2024 Game Manager"
+                                   FontSize="16" Foreground="#aaabad"
+                                   HorizontalAlignment="Center" Margin="0,0,0,60"/>
+
+                        <!-- Loading bar (from WPF SplashScreen LoadingBar) -->
+                        <Border Width="400" Height="6" Background="#111416" CornerRadius="3"
+                                Margin="0,0,0,20" BoxShadow="0 2 10 0 #80000000">
+                            <Border HorizontalAlignment="Left" Height="6" CornerRadius="3"
+                                    Width="{Binding SplashProgress, Converter={x:Static conv:ProgressWidthConverter.Instance}}"
+                                    BoxShadow="0 0 15 0 #CC69daff">
+                                <Border.Background>
+                                    <LinearGradientBrush StartPoint="0%,0%" EndPoint="100%,0%">
+                                        <GradientStop Color="#69daff" Offset="0"/>
+                                        <GradientStop Color="#00FF88" Offset="1"/>
+                                    </LinearGradientBrush>
+                                </Border.Background>
+                            </Border>
+                        </Border>
+
+                        <!-- Status text -->
+                        <TextBlock Text="{Binding SplashStatus}" FontSize="14"
+                                   Foreground="#aaabad" HorizontalAlignment="Center"/>
+
+                        <!-- Version -->
+                        <TextBlock Text="{Binding CurrentVersionDisplay}" FontSize="12" Foreground="#aaabad"
+                                   HorizontalAlignment="Center" Opacity="0.6" Margin="0,60,0,0"/>
+                    </StackPanel>
+
+                    <!-- Bottom brand (from WPF SplashScreen) -->
+                    <TextBlock Text="Powered by Pimax Technology" FontSize="11"
+                               Foreground="#aaabad" Opacity="0.5"
+                               HorizontalAlignment="Center" VerticalAlignment="Bottom"
+                               Margin="0,0,0,40"/>
+
+                    <!-- Corner accents (from WPF Canvas lines) -->
+                    <Canvas Opacity="0.5">
+                        <Line StartPoint="0,60" EndPoint="60,60" Stroke="#69daff" StrokeThickness="2"/>
+                        <Line StartPoint="60,0" EndPoint="60,60" Stroke="#69daff" StrokeThickness="2"/>
+                        <Line StartPoint="1540,60" EndPoint="1600,60" Stroke="#69daff" StrokeThickness="2"/>
+                        <Line StartPoint="1540,0" EndPoint="1540,60" Stroke="#69daff" StrokeThickness="2"/>
+                        <Line StartPoint="0,840" EndPoint="60,840" Stroke="#69daff" StrokeThickness="2"/>
+                        <Line StartPoint="60,840" EndPoint="60,900" Stroke="#69daff" StrokeThickness="2"/>
+                        <Line StartPoint="1540,840" EndPoint="1600,840" Stroke="#69daff" StrokeThickness="2"/>
+                        <Line StartPoint="1540,840" EndPoint="1540,900" Stroke="#69daff" StrokeThickness="2"/>
+                    </Canvas>
+                </Grid>
+            </Panel>
+
+
+            <!-- ===================================================================
+                 MAIN APP (visible after splash)
+                 Layout: Sidebar (280px) | Content
+                 Exactly mirrors WPF MainWindow Grid layout
+                 =================================================================== -->
+            <Grid ColumnDefinitions="256,*" IsVisible="{Binding SplashDone}">
+
+                <!-- ═══════════ SIDEBAR (Kinetic Cockpit) ═══════════ -->
+                <Border Grid.Column="0" Background="#0c0e10"
+                        CornerRadius="12,0,0,12"
+                        IsVisible="{Binding SidebarVisible}">
+                    <Grid RowDefinitions="Auto,Auto,*,Auto">
+
+                        <!-- Logo / Brand -->
+                        <StackPanel Grid.Row="0" Margin="32,32,32,4">
+                            <TextBlock Text="PIMAX COPILOT" FontSize="20" FontWeight="Bold"
+                                       Foreground="#eeeef0" LetterSpacing="0.5"/>
+                            <TextBlock Text="KINETIC COCKPIT v1.0" FontSize="10"
+                                       Foreground="#69daff" LetterSpacing="3" Margin="0,4,0,0"/>
+                        </StackPanel>
+
+                        <!-- Navigation -->
+                        <StackPanel Grid.Row="1" Margin="16,24,16,0" Spacing="4">
+
+                            <!-- Launch -->
+                            <Button Classes="nav" HorizontalAlignment="Stretch"
+                                    Command="{Binding NavigateLaunchCommand}"
+                                    Background="{Binding IsLaunchActive, Converter={x:Static conv:NavBgConverter.Instance}}"
+                                    Foreground="{Binding IsLaunchActive, Converter={x:Static conv:NavFgConverter.Instance}}"
+                                    BorderBrush="{Binding IsLaunchActive, Converter={x:Static conv:NavBgConverter.Instance}}"
+                                    BorderThickness="0,0,2,0">
+                                <StackPanel Orientation="Horizontal" Spacing="12">
+                                    <TextBlock Text="&#9889;" FontSize="18" VerticalAlignment="Center"/>
+                                    <TextBlock Text="Launch" FontSize="13" VerticalAlignment="Center"/>
+                                </StackPanel>
+                            </Button>
+
+                            <!-- Profiles (ReShade) -->
+                            <Button Classes="nav" HorizontalAlignment="Stretch"
+                                    Command="{Binding NavigateReshadeCommand}"
+                                    Background="{Binding IsReshadeActive, Converter={x:Static conv:NavBgConverter.Instance}}"
+                                    Foreground="{Binding IsReshadeActive, Converter={x:Static conv:NavFgConverter.Instance}}"
+                                    BorderBrush="{Binding IsReshadeActive, Converter={x:Static conv:NavBgConverter.Instance}}"
+                                    BorderThickness="0,0,2,0">
+                                <StackPanel Orientation="Horizontal" Spacing="12">
+                                    <TextBlock Text="&#9635;" FontSize="18" VerticalAlignment="Center"/>
+                                    <TextBlock Text="Profiles" FontSize="13" VerticalAlignment="Center"/>
+                                </StackPanel>
+                            </Button>
+
+                            <!-- Mods -->
+                            <Button Classes="nav" HorizontalAlignment="Stretch"
+                                    Command="{Binding NavigateModsCommand}"
+                                    Background="{Binding IsModsActive, Converter={x:Static conv:NavBgConverter.Instance}}"
+                                    Foreground="{Binding IsModsActive, Converter={x:Static conv:NavFgConverter.Instance}}"
+                                    BorderBrush="{Binding IsModsActive, Converter={x:Static conv:NavBgConverter.Instance}}"
+                                    BorderThickness="0,0,2,0">
+                                <StackPanel Orientation="Horizontal" Spacing="12">
+                                    <TextBlock Text="&#9992;" FontSize="18" VerticalAlignment="Center"/>
+                                    <TextBlock Text="Mods" FontSize="13" VerticalAlignment="Center"/>
+                                </StackPanel>
+                            </Button>
+
+                            <!-- Updates -->
+                            <Button Classes="nav" HorizontalAlignment="Stretch"
+                                    Command="{Binding NavigateUpdatesCommand}"
+                                    Background="{Binding IsUpdatesActive, Converter={x:Static conv:NavBgConverter.Instance}}"
+                                    Foreground="{Binding IsUpdatesActive, Converter={x:Static conv:NavFgConverter.Instance}}"
+                                    BorderBrush="{Binding IsUpdatesActive, Converter={x:Static conv:NavBgConverter.Instance}}"
+                                    BorderThickness="0,0,2,0">
+                                <StackPanel Orientation="Horizontal" Spacing="12">
+                                    <TextBlock Text="&#8635;" FontSize="18" VerticalAlignment="Center"/>
+                                    <TextBlock Text="Updates" FontSize="13" VerticalAlignment="Center"/>
+                                </StackPanel>
+                            </Button>
+
+                            <!-- AI Chat -->
+                            <Button Classes="nav" HorizontalAlignment="Stretch"
+                                    Command="{Binding NavigateAiChatCommand}"
+                                    Background="{Binding IsAiChatActive, Converter={x:Static conv:NavBgConverter.Instance}}"
+                                    Foreground="{Binding IsAiChatActive, Converter={x:Static conv:NavFgConverter.Instance}}"
+                                    BorderBrush="{Binding IsAiChatActive, Converter={x:Static conv:NavBgConverter.Instance}}"
+                                    BorderThickness="0,0,2,0">
+                                <StackPanel Orientation="Horizontal" Spacing="12">
+                                    <Border Width="22" Height="22" CornerRadius="11"
+                                            ClipToBounds="True" VerticalAlignment="Center">
+                                        <ctrl:GifImage SourceUri="avares://GameCopilot/Assets/copilot-avatar.gif"
+                                               Width="22" Height="22" Stretch="UniformToFill"/>
+                                    </Border>
+                                    <TextBlock Text="AI Chat" FontSize="13" VerticalAlignment="Center"/>
+                                </StackPanel>
+                            </Button>
+                        </StackPanel>
+
+                        <!-- Spacer -->
+                        <Panel Grid.Row="2"/>
+
+                        <!-- User Card (bottom) -->
+                        <Border Grid.Row="3" Margin="24,16,24,24"
+                                Background="#111416" CornerRadius="12" Padding="12">
+                            <StackPanel Orientation="Horizontal" Spacing="12">
+                                <Border Width="40" Height="40" CornerRadius="20"
+                                        Background="#1d2023">
+                                    <TextBlock Text="&#9992;" FontSize="20"
+                                               HorizontalAlignment="Center" VerticalAlignment="Center"
+                                               Foreground="#69daff"/>
+                                </Border>
+                                <StackPanel VerticalAlignment="Center">
+                                    <TextBlock Text="PILOT_01" FontSize="12" FontWeight="Bold"
+                                               Foreground="#eeeef0"/>
+                                    <TextBlock Text="ONLINE" FontSize="10" Foreground="#69daff"
+                                               LetterSpacing="3"/>
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+                    </Grid>
+                </Border>
+
+                <!-- ═══════════ CONTENT AREA ═══════════ -->
+                <Grid Grid.Column="1" RowDefinitions="56,*">
+
+                    <!-- ── Top Navigation Bar (Kinetic Cockpit) ── -->
+                    <Panel Grid.Row="0" ZIndex="10">
+                        <Border Background="#0c0e10" Opacity="0.85"
+                                Padding="32,0"/>
+                        <Grid ColumnDefinitions="*,Auto" Margin="32,0">
+                            <!-- Breadcrumb -->
+                            <TextBlock Text="SECTOR: TELEMETRY / PROFILES" FontSize="10"
+                                       Foreground="#aaabad" LetterSpacing="3"
+                                       VerticalAlignment="Center"/>
+                            <!-- Right: status + window controls -->
+                            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8"
+                                        VerticalAlignment="Center">
+                                <Border Background="#111416" CornerRadius="16" Padding="12,6">
+                                    <StackPanel Orientation="Horizontal" Spacing="12">
+                                        <StackPanel Orientation="Horizontal" Spacing="4">
+                                            <TextBlock Text="&#9889;" FontSize="11" Foreground="#69daff"
+                                                       VerticalAlignment="Center"/>
+                                            <TextBlock Text="{Binding IsReshadeFound, Converter={StaticResource BoolToStatusText}}"
+                                                       FontSize="11" Foreground="#eeeef0"
+                                                       VerticalAlignment="Center"/>
+                                        </StackPanel>
+                                        <Border Width="1" Height="12" Background="#46484a"/>
+                                        <StackPanel Orientation="Horizontal" Spacing="4">
+                                            <TextBlock Text="&#9670;" FontSize="11" Foreground="#17c0fd"
+                                                       VerticalAlignment="Center"/>
+                                            <TextBlock Text="{Binding OllamaStatus}" FontSize="11"
+                                                       Foreground="#eeeef0" VerticalAlignment="Center"/>
+                                        </StackPanel>
+                                    </StackPanel>
+                                </Border>
+                                <Button Content="&#9472;" Classes="min-btn"
+                                        Click="OnMinimizeClick"/>
+                                <Button Content="&#10005;" Classes="close-btn"
+                                        Click="OnCloseClick"/>
+                            </StackPanel>
+                        </Grid>
+                    </Panel>
+
+                    <!-- ── Page Content ── -->
+                    <Panel Grid.Row="1">
+
+
+                    <!-- ===== GAMES PAGE =====
+                         Kinetic Cockpit "Launch Mode" – stitch (2) design
+                    -->
+                    <Panel IsVisible="{Binding CurrentPage, Converter={x:Static conv:PageVisibleConverter.Instance}, ConverterParameter=Launch}">
+                        <!-- No ScrollViewer — full-viewport fit -->
+                        <Grid RowDefinitions="Auto,*,Auto" Margin="40,16,40,20">
+
+                            <!-- ── Row 0: System Header ── -->
+                            <Grid Grid.Row="0" ColumnDefinitions="*,Auto" Margin="0,0,0,20">
+                                <StackPanel Grid.Column="0">
+                                    <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
+                                        <Ellipse Width="8" Height="8" Fill="#69daff" Margin="0,0,10,0"
+                                                 VerticalAlignment="Center"/>
+                                        <TextBlock Text="SYSTEM STATUS: READY" FontSize="10" FontWeight="Bold"
+                                                   Foreground="#69daff" LetterSpacing="3"
+                                                   VerticalAlignment="Center"/>
+                                    </StackPanel>
+                                    <StackPanel Orientation="Horizontal" Margin="0,2,0,8">
+                                        <TextBlock Text="Select " FontSize="40" FontWeight="ExtraBold"
+                                                   Foreground="#eeeef0"/>
+                                        <TextBlock Text="LAUNCH" FontSize="40" FontWeight="ExtraBold"
+                                                   Foreground="#69daff"/>
+                                        <TextBlock Text=" Mode" FontSize="40" FontWeight="ExtraBold"
+                                                   Foreground="#eeeef0"/>
+                                    </StackPanel>
+                                    <TextBlock Text="Optimize your Pimax environment for the desired output. Kinetic Cockpit protocols will automatically adjust thermal and compute priority."
+                                               FontSize="13" Foreground="#aaabad" TextWrapping="Wrap"
+                                               MaxWidth="520"/>
+                                </StackPanel>
+                                <Border Grid.Column="1" Background="#111416" CornerRadius="8"
+                                        Padding="14,10" VerticalAlignment="Top"
+                                        BorderThickness="2,0,0,0" BorderBrush="#69daff">
+                                    <StackPanel>
+                                        <TextBlock Text="ACTIVE HEADSET" FontSize="9"
+                                                   Foreground="#aaabad" LetterSpacing="3" Margin="0,0,0,3"/>
+                                        <TextBlock Text="PIMAX CRYSTAL SUPER" FontSize="13"
+                                                   FontWeight="Bold" Foreground="#eeeef0"/>
+                                        <TextBlock Text="FIRMWARE: V4.1.2-ALPHA" FontSize="9"
+                                                   Foreground="#69daff" Margin="0,3,0,0"/>
+                                    </StackPanel>
+                                </Border>
+                            </Grid>
+
+                            <!-- ── Row 1: Mode Selection Cards (stretch to fill) ── -->
+                            <Grid Grid.Row="1" ColumnDefinitions="7*,5*">
+
+                                <!-- ═══ VR Mode Card ═══ -->
+                                <Border Grid.Column="0" Background="#111416" CornerRadius="12"
+                                        Margin="0,0,12,0" ClipToBounds="True">
+                                    <Panel>
+                                        <!-- Background image — larger & more visible -->
+                                        <Image Source="avares://GameCopilot/Assets/background_vr.png"
+                                               Stretch="UniformToFill" Opacity="0.25"
+                                               IsHitTestVisible="False"/>
+                                        <!-- Dark gradient overlay — lighter at top for image visibility -->
+                                        <Border CornerRadius="12" IsHitTestVisible="False">
+                                            <Border.Background>
+                                                <LinearGradientBrush StartPoint="0%,0%" EndPoint="0%,100%">
+                                                    <GradientStop Color="#30111416" Offset="0.0"/>
+                                                    <GradientStop Color="#90111416" Offset="0.40"/>
+                                                    <GradientStop Color="#E8111416" Offset="0.65"/>
+                                                    <GradientStop Color="#FF111416" Offset="1.0"/>
+                                                </LinearGradientBrush>
+                                            </Border.Background>
+                                        </Border>
+
+                                        <!-- Content — pushed to bottom via VerticalAlignment -->
+                                        <DockPanel Margin="28" LastChildFill="True">
+                                            <!-- Top row: icon + protocol -->
+                                            <Grid DockPanel.Dock="Top" ColumnDefinitions="*,Auto" Margin="0,0,0,0">
+                                                <Border Grid.Column="0" Width="48" Height="48"
+                                                        CornerRadius="24" Background="#0D69daff"
+                                                        BorderBrush="#3069daff" BorderThickness="1"
+                                                        HorizontalAlignment="Left">
+                                                    <TextBlock Text="&#128083;" FontSize="24"
+                                                               HorizontalAlignment="Center"
+                                                               VerticalAlignment="Center"/>
+                                                </Border>
+                                                <StackPanel Grid.Column="1" HorizontalAlignment="Right">
+                                                    <TextBlock Text="PROTOCOL: VR_IMMERSION_V2" FontSize="9"
+                                                               Foreground="#4069daff" LetterSpacing="2"
+                                                               HorizontalAlignment="Right"/>
+                                                    <TextBlock Text="LATENCY: 0.8ms TARGET" FontSize="9"
+                                                               Foreground="#4069daff" LetterSpacing="2"
+                                                               HorizontalAlignment="Right" Margin="0,2,0,0"/>
+                                                </StackPanel>
+                                            </Grid>
+
+                                            <!-- Bottom content block -->
+                                            <StackPanel VerticalAlignment="Bottom">
+                                                <TextBlock Text="INITIATE VR MODE" FontSize="28" FontWeight="Bold"
+                                                           Foreground="#eeeef0" Margin="0,0,0,8"/>
+                                                <TextBlock Text="Deploy full immersive performance. Optimized for Pimax wide-FOV lenses and high-fidelity panel resolution."
+                                                           FontSize="13" Foreground="#aaabad" TextWrapping="Wrap"
+                                                           LineHeight="20" MaxWidth="400" Margin="0,0,0,6"/>
+                                                <TextBlock Text="{Binding VrErrorText}" FontSize="12"
+                                                           Foreground="#ff716c" Margin="0,0,0,4"/>
+
+                                                <!-- 3-col Telemetry -->
+                                                <Grid ColumnDefinitions="*,*,*" Margin="0,0,0,16">
+                                                    <Border Grid.Column="0" Background="#08000000" CornerRadius="4"
+                                                            Padding="10,8" Margin="0,0,6,0"
+                                                            BorderBrush="#1046484a" BorderThickness="1">
+                                                        <StackPanel>
+                                                            <TextBlock Text="RENDER SCALE" FontSize="9"
+                                                                       Foreground="#aaabad" LetterSpacing="1"/>
+                                                            <TextBlock Text="125%" FontSize="14" FontWeight="Bold"
+                                                                       Foreground="#69daff" Margin="0,2,0,0"/>
+                                                        </StackPanel>
+                                                    </Border>
+                                                    <Border Grid.Column="1" Background="#08000000" CornerRadius="4"
+                                                            Padding="10,8" Margin="0,0,6,0"
+                                                            BorderBrush="#1046484a" BorderThickness="1">
+                                                        <StackPanel>
+                                                            <TextBlock Text="REFRESH RATE" FontSize="9"
+                                                                       Foreground="#aaabad" LetterSpacing="1"/>
+                                                            <TextBlock Text="120Hz" FontSize="14" FontWeight="Bold"
+                                                                       Foreground="#69daff" Margin="0,2,0,0"/>
+                                                        </StackPanel>
+                                                    </Border>
+                                                    <Border Grid.Column="2" Background="#08000000" CornerRadius="4"
+                                                            Padding="10,8"
+                                                            BorderBrush="#1046484a" BorderThickness="1">
+                                                        <StackPanel>
+                                                            <TextBlock Text="FOV POLICY" FontSize="9"
+                                                                       Foreground="#aaabad" LetterSpacing="1"/>
+                                                            <TextBlock Text="NATIVE" FontSize="14" FontWeight="Bold"
+                                                                       Foreground="#69daff" Margin="0,2,0,0"/>
+                                                        </StackPanel>
+                                                    </Border>
+                                                </Grid>
+
+                                                <!-- Primary button -->
+                                                <Button Classes="modern" HorizontalAlignment="Stretch"
+                                                        Height="48" FontSize="13"
+                                                        Content="{Binding VrButtonText}"
+                                                        IsEnabled="{Binding VrButtonEnabled}"
+                                                        Command="{Binding StartVRCommand}"
+                                                        Margin="0,0,0,8"/>
+                                                <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                                                    <TextBlock Text="&#9679;" Foreground="{Binding VrStatusColor}"
+                                                               FontSize="12" Margin="0,0,6,0"/>
+                                                    <TextBlock Text="{Binding VrStatusText}" FontSize="11"
+                                                               Foreground="{Binding VrStatusColor}"/>
+                                                </StackPanel>
+                                            </StackPanel>
+                                        </DockPanel>
+                                    </Panel>
+                                </Border>
+
+                                <!-- ═══ Desktop Mode Card ═══ -->
+                                <Border Grid.Column="1" Background="#111416" CornerRadius="12"
+                                        ClipToBounds="True">
+                                    <Panel>
+                                        <Border CornerRadius="12" IsHitTestVisible="False">
+                                            <Border.Background>
+                                                <LinearGradientBrush StartPoint="0%,0%" EndPoint="0%,100%">
+                                                    <GradientStop Color="#00111416" Offset="0.0"/>
+                                                    <GradientStop Color="#30101418" Offset="0.4"/>
+                                                    <GradientStop Color="#111416" Offset="0.8"/>
+                                                </LinearGradientBrush>
+                                            </Border.Background>
+                                        </Border>
+
+                                        <DockPanel Margin="28" LastChildFill="True">
+                                            <!-- Top: icon -->
+                                            <Border DockPanel.Dock="Top" Width="48" Height="48" CornerRadius="24"
+                                                    Background="#0D17c0fd" BorderBrush="#3017c0fd"
+                                                    BorderThickness="1" HorizontalAlignment="Left">
+                                                <TextBlock Text="&#128421;" FontSize="24"
+                                                           HorizontalAlignment="Center"
+                                                           VerticalAlignment="Center"/>
+                                            </Border>
+
+                                            <!-- Bottom content -->
+                                            <StackPanel VerticalAlignment="Bottom">
+                                                <TextBlock Text="LAUNCH DESKTOP MODE" FontSize="22" FontWeight="Bold"
+                                                           Foreground="#eeeef0" Margin="0,0,0,8"/>
+                                                <TextBlock Text="Maximize frame-rate delivery for 2D displays. Direct GPU pipe optimization for ultra-high refresh monitor performance."
+                                                           FontSize="12" Foreground="#aaabad" TextWrapping="Wrap"
+                                                           LineHeight="20" Margin="0,0,0,20"/>
+
+                                                <!-- CPU Priority bar -->
+                                                <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,6">
+                                                    <TextBlock Grid.Column="0" Text="CPU PRIORITY" FontSize="10"
+                                                               Foreground="#aaabad" LetterSpacing="1"/>
+                                                    <TextBlock Grid.Column="1" Text="REAL_TIME" FontSize="10"
+                                                               FontWeight="Bold" Foreground="#17c0fd"/>
+                                                </Grid>
+                                                <Border Height="3" CornerRadius="2" Background="#232629"
+                                                        Margin="0,0,0,12">
+                                                    <Border Height="3" CornerRadius="2" Background="#17c0fd"
+                                                            HorizontalAlignment="Stretch"/>
+                                                </Border>
+
+                                                <!-- FPS Cap bar -->
+                                                <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,6">
+                                                    <TextBlock Grid.Column="0" Text="FPS CAP" FontSize="10"
+                                                               Foreground="#aaabad" LetterSpacing="1"/>
+                                                    <TextBlock Grid.Column="1" Text="UNLOCKED" FontSize="10"
+                                                               FontWeight="Bold" Foreground="#eeeef0"/>
+                                                </Grid>
+                                                <Border Height="3" CornerRadius="2" Background="#232629"
+                                                        Margin="0,0,0,20">
+                                                    <Border Height="3" CornerRadius="2" Background="#46484a"
+                                                            HorizontalAlignment="Left" Width="80"/>
+                                                </Border>
+
+                                                <!-- Secondary button -->
+                                                <Button Classes="outline" HorizontalAlignment="Stretch"
+                                                        Height="48" FontSize="13"
+                                                        Content="{Binding DesktopButtonText}"
+                                                        IsEnabled="{Binding DesktopButtonEnabled}"
+                                                        Command="{Binding StartDesktopCommand}"/>
+                                            </StackPanel>
+                                        </DockPanel>
+                                    </Panel>
+                                </Border>
+                            </Grid>
+
+                            <!-- ── Row 2: Bottom Data Cluster ── -->
+                            <Border Grid.Row="2" BorderThickness="0,1,0,0" BorderBrush="#1046484a"
+                                    Margin="0,16,0,0" Padding="0,14,0,0">
+                                <Grid ColumnDefinitions="*,*,Auto">
+                                    <StackPanel Grid.Column="0">
+                                        <TextBlock Text="CORE TELEMETRY" FontSize="9" Foreground="#aaabad"
+                                                   LetterSpacing="3" Margin="0,0,0,8"/>
+                                        <Grid ColumnDefinitions="Auto,36,Auto">
+                                            <StackPanel Grid.Column="0">
+                                                <TextBlock Text="GPU TEMP" FontSize="9" Foreground="#aaabad"/>
+                                                <TextBlock Text="54°C" FontSize="16" FontWeight="Bold"
+                                                           Foreground="#eeeef0"/>
+                                            </StackPanel>
+                                            <StackPanel Grid.Column="2">
+                                                <TextBlock Text="VRAM LOAD" FontSize="9" Foreground="#aaabad"/>
+                                                <TextBlock Text="8.2GB" FontSize="16" FontWeight="Bold"
+                                                           Foreground="#69daff"/>
+                                            </StackPanel>
+                                        </Grid>
+                                    </StackPanel>
+                                    <StackPanel Grid.Column="1">
+                                        <TextBlock Text="NETWORK NODE" FontSize="9" Foreground="#aaabad"
+                                                   LetterSpacing="3" Margin="0,0,0,8"/>
+                                        <StackPanel Orientation="Horizontal">
+                                            <Border Width="32" Height="32" CornerRadius="4"
+                                                    BorderBrush="#2046484a" BorderThickness="1"
+                                                    Margin="0,0,10,0">
+                                                <TextBlock Text="&#128225;" FontSize="16"
+                                                           HorizontalAlignment="Center"
+                                                           VerticalAlignment="Center"/>
+                                            </Border>
+                                            <StackPanel VerticalAlignment="Center">
+                                                <TextBlock Text="CONNECTION" FontSize="9" Foreground="#aaabad"/>
+                                                <TextBlock Text="PIMAX_CLOUD_NORTH_04" FontSize="11"
+                                                           FontWeight="Bold" Foreground="#eeeef0"/>
+                                            </StackPanel>
+                                        </StackPanel>
+                                    </StackPanel>
+                                    <Border Grid.Column="2" Background="#CC1d2023" CornerRadius="8"
+                                            Padding="14,10" BorderBrush="#1046484a" BorderThickness="1">
+                                        <StackPanel Orientation="Horizontal">
+                                            <TextBlock Text="&#128737;" FontSize="18" Foreground="#aaabad"
+                                                       VerticalAlignment="Center" Margin="0,0,10,0"/>
+                                            <StackPanel VerticalAlignment="Center">
+                                                <TextBlock Text="IDENTITY CHECK" FontSize="9" Foreground="#aaabad"/>
+                                                <TextBlock Text="BIOMETRIC_PASS" FontSize="11"
+                                                           FontWeight="Bold" Foreground="#eeeef0"/>
+                                            </StackPanel>
+                                        </StackPanel>
+                                    </Border>
+                                </Grid>
+                            </Border>
+                        </Grid>
+                    </Panel>
+
+
+                    <!-- ===== MODS PAGE =====
+                         Kinetic Cockpit "Mods Management" – stitch (4) design
+                    -->
+                    <Panel IsVisible="{Binding CurrentPage, Converter={x:Static conv:PageVisibleConverter.Instance}, ConverterParameter=Mods}">
+                        <ScrollViewer Padding="40,20,50,40" HorizontalScrollBarVisibility="Disabled">
+                            <StackPanel>
+
+                                <!-- Title row: title left, stats right -->
+                                <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,16">
+                                    <StackPanel Grid.Column="0">
+                                        <TextBlock Text="MODS MANAGEMENT" FontSize="38" FontWeight="Bold"
+                                                   Foreground="#eeeef0" Margin="0,0,0,4"/>
+                                        <TextBlock Text="Enhanced performance and realism modules for your flight deck."
+                                                   FontSize="13" Foreground="#aaabad"/>
+                                    </StackPanel>
+                                    <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="28"
+                                                VerticalAlignment="Center">
+                                        <StackPanel HorizontalAlignment="Right">
+                                            <TextBlock Text="ACTIVE MODULES" FontSize="9" Foreground="#aaabad"
+                                                       LetterSpacing="1" HorizontalAlignment="Right"/>
+                                            <TextBlock FontSize="22" FontWeight="Bold" Foreground="#69daff"
+                                                       HorizontalAlignment="Right">
+                                                <TextBlock.Text>
+                                                    <MultiBinding StringFormat="{}{0} / {1}">
+                                                        <Binding Path="ModCount"/>
+                                                        <Binding Path="ModCount"/>
+                                                    </MultiBinding>
+                                                </TextBlock.Text>
+                                            </TextBlock>
+                                        </StackPanel>
+                                        <StackPanel HorizontalAlignment="Right">
+                                            <TextBlock Text="TOTAL SIZE" FontSize="9" Foreground="#aaabad"
+                                                       LetterSpacing="1" HorizontalAlignment="Right"/>
+                                            <TextBlock Text="{Binding TotalModSize}" FontSize="22" FontWeight="Bold"
+                                                       Foreground="#eeeef0" HorizontalAlignment="Right"/>
+                                        </StackPanel>
+                                    </StackPanel>
+                                </Grid>
+
+                                <!-- Path bar + Action buttons side by side -->
+                                <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,12">
+                                    <!-- Community Folder Path -->
+                                    <Border Grid.Column="0" Background="#111416" CornerRadius="6"
+                                            Padding="14,10" Margin="0,0,12,0">
+                                        <Grid ColumnDefinitions="Auto,*,Auto">
+                                            <TextBlock Grid.Column="0" Text="&#128193;" FontSize="14"
+                                                       Foreground="#4069daff" VerticalAlignment="Center"
+                                                       Margin="0,0,10,0"/>
+                                            <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                                <TextBlock Text="COMMUNITY FOLDER PATH" FontSize="8"
+                                                           Foreground="#aaabad" LetterSpacing="2"
+                                                           Margin="0,0,0,2"/>
+                                                <TextBlock Text="{Binding SettingsCommunityPath}" FontSize="11"
+                                                           Foreground="#eeeef0"
+                                                           TextTrimming="CharacterEllipsis"/>
+                                            </StackPanel>
+                                            <TextBlock Grid.Column="2" Text="CHANGE PATH" FontSize="10"
+                                                       FontWeight="Bold" Foreground="#69daff"
+                                                       LetterSpacing="1" VerticalAlignment="Center"
+                                                       Margin="16,0,0,0"/>
+                                        </Grid>
+                                    </Border>
+                                    <!-- Action Buttons -->
+                                    <StackPanel Grid.Column="1" Spacing="6" Width="220">
+                                        <Button Classes="modern" HorizontalAlignment="Stretch"
+                                                Height="36" FontSize="12" Padding="0"
+                                                Content="IMPORT NEW MOD"
+                                                Click="OnAddModClick"/>
+                                        <Button Classes="outline" HorizontalAlignment="Stretch"
+                                                Height="30" FontSize="11" Padding="0"
+                                                Content="UPDATE"
+                                                Command="{Binding RefreshModsCommand}"/>
+                                    </StackPanel>
+                                </Grid>
+
+                                <!-- Search + Category filter -->
+                                <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,14">
+                                    <TextBox Grid.Column="0" Classes="search" MinHeight="38"
+                                             Text="{Binding SearchText}"
+                                             PlaceholderText="Search modules..."
+                                             Margin="0,0,12,0"/>
+                                    <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="4"
+                                                VerticalAlignment="Center">
+                                        <Button Height="38" FontSize="11" Padding="14,0" FontWeight="Bold"
+                                                CornerRadius="6" BorderThickness="0" Cursor="Hand"
+                                                Content="All"
+                                                Command="{Binding SetModCategoryCommand}"
+                                                CommandParameter="All"
+                                                Background="{Binding ModCategoryFilter, Converter={x:Static conv:CategoryBgConverter.Instance}, ConverterParameter=All}"
+                                                Foreground="{Binding ModCategoryFilter, Converter={x:Static conv:CategoryFgConverter.Instance}, ConverterParameter=All}"/>
+                                        <Button Height="38" FontSize="11" Padding="14,0" FontWeight="Bold"
+                                                CornerRadius="6" BorderThickness="0" Cursor="Hand"
+                                                Content="Aircraft"
+                                                Command="{Binding SetModCategoryCommand}"
+                                                CommandParameter="Aircraft"
+                                                Background="{Binding ModCategoryFilter, Converter={x:Static conv:CategoryBgConverter.Instance}, ConverterParameter=Aircraft}"
+                                                Foreground="{Binding ModCategoryFilter, Converter={x:Static conv:CategoryFgConverter.Instance}, ConverterParameter=Aircraft}"/>
+                                        <Button Height="38" FontSize="11" Padding="14,0" FontWeight="Bold"
+                                                CornerRadius="6" BorderThickness="0" Cursor="Hand"
+                                                Content="Helicopters"
+                                                Command="{Binding SetModCategoryCommand}"
+                                                CommandParameter="Helicopters"
+                                                Background="{Binding ModCategoryFilter, Converter={x:Static conv:CategoryBgConverter.Instance}, ConverterParameter=Helicopters}"
+                                                Foreground="{Binding ModCategoryFilter, Converter={x:Static conv:CategoryFgConverter.Instance}, ConverterParameter=Helicopters}"/>
+                                        <Button Height="38" FontSize="11" Padding="14,0" FontWeight="Bold"
+                                                CornerRadius="6" BorderThickness="0" Cursor="Hand"
+                                                Content="Scenery"
+                                                Command="{Binding SetModCategoryCommand}"
+                                                CommandParameter="Scenery"
+                                                Background="{Binding ModCategoryFilter, Converter={x:Static conv:CategoryBgConverter.Instance}, ConverterParameter=Scenery}"
+                                                Foreground="{Binding ModCategoryFilter, Converter={x:Static conv:CategoryFgConverter.Instance}, ConverterParameter=Scenery}"/>
+                                    </StackPanel>
+                                </Grid>
+
+                                <!-- ── Mods Grid (3 columns) ── -->
+                                <ItemsControl ItemsSource="{Binding ModGridItems}" Margin="0,0,0,0">
+                                    <ItemsControl.ItemsPanel>
+                                        <ItemsPanelTemplate>
+                                            <WrapPanel Orientation="Horizontal"/>
+                                        </ItemsPanelTemplate>
+                                    </ItemsControl.ItemsPanel>
+                                    <ItemsControl.DataTemplates>
+                                        <!-- Mod card template -->
+                                        <DataTemplate DataType="models:ModItem">
+                                            <Border Background="#111416" Margin="8,0,8,14"
+                                                    CornerRadius="8" ClipToBounds="True" Height="280"
+                                                    Width="230">
+                                                <Grid RowDefinitions="*,Auto,Auto">
+                                                    <!-- Row 0: Card image -->
+                                                    <Border Grid.Row="0" Background="#0c0e10" ClipToBounds="True">
+                                                        <Panel>
+                                                            <Image Source="{Binding Category, Converter={x:Static conv:CategoryImageConverter.Instance}}"
+                                                                   Stretch="UniformToFill" Opacity="0.35"/>
+                                                            <Border>
+                                                                <Border.Background>
+                                                                    <LinearGradientBrush StartPoint="0%,0%" EndPoint="0%,100%">
+                                                                        <GradientStop Color="#00111416" Offset="0.3"/>
+                                                                        <GradientStop Color="#FF111416" Offset="1"/>
+                                                                    </LinearGradientBrush>
+                                                                </Border.Background>
+                                                            </Border>
+                                                            <Border Background="#2069daff" CornerRadius="4"
+                                                                    Padding="8,3" HorizontalAlignment="Right"
+                                                                    VerticalAlignment="Top" Margin="0,8,8,0">
+                                                                <StackPanel Orientation="Horizontal" Spacing="4">
+                                                                    <Ellipse Width="5" Height="5" Fill="#69daff"/>
+                                                                    <TextBlock Text="ACTIVE" FontSize="8"
+                                                                               FontWeight="Bold" Foreground="#69daff"
+                                                                               LetterSpacing="1"/>
+                                                                </StackPanel>
+                                                            </Border>
+                                                        </Panel>
+                                                    </Border>
+                                                    <!-- Row 1: Body -->
+                                                    <StackPanel Grid.Row="1" Margin="12,6,12,4">
+                                                        <Grid ColumnDefinitions="*,Auto">
+                                                            <TextBlock Text="{Binding Name}" FontSize="13"
+                                                                       FontWeight="Bold" Foreground="#eeeef0"
+                                                                       TextTrimming="CharacterEllipsis"
+                                                                       VerticalAlignment="Center"/>
+                                                            <ComboBox Grid.Column="1" ItemsSource="{x:Static models:ModItem.Categories}"
+                                                                      SelectedItem="{Binding Category}"
+                                                                      FontSize="9" Padding="6,3"
+                                                                      MinHeight="0" Height="24"
+                                                                      Background="#1d2023" Foreground="#aaabad"
+                                                                      BorderThickness="0" CornerRadius="4"/>
+                                                        </Grid>
+                                                        <TextBlock Text="{Binding FullPath}" FontSize="9"
+                                                                   Foreground="#aaabad" Opacity="0.6"
+                                                                   TextTrimming="CharacterEllipsis"
+                                                                   Margin="0,2,0,0"/>
+                                                    </StackPanel>
+                                                    <!-- Row 2: Footer -->
+                                                    <Border Grid.Row="2" Margin="12,0,12,10"
+                                                            BorderThickness="0,1,0,0" BorderBrush="#15ffffff"
+                                                            Padding="0,8,0,0">
+                                                        <Grid ColumnDefinitions="Auto,*,Auto">
+                                                            <TextBlock Text="{Binding SizeFormatted}" FontSize="10"
+                                                                       Foreground="#aaabad" VerticalAlignment="Center"/>
+                                                            <Button Grid.Column="2" Width="28" Height="28" Padding="0" CornerRadius="6"
+                                                                    Background="#1d2023" BorderThickness="0" Cursor="Hand"
+                                                                    HorizontalContentAlignment="Center"
+                                                                    VerticalContentAlignment="Center"
+                                                                    Command="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).DeleteModCommand}"
+                                                                    CommandParameter="{Binding}">
+                                                                <TextBlock Text="&#128465;" FontSize="13" Foreground="#aaabad"
+                                                                           HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                                            </Button>
+                                                        </Grid>
+                                                    </Border>
+                                                </Grid>
+                                            </Border>
+                                        </DataTemplate>
+
+                                        <!-- ADD NEW MODULE placeholder card -->
+                                        <DataTemplate DataType="models:AddModPlaceholder">
+                                            <Border Margin="8,0,8,14" CornerRadius="8" Height="280"
+                                                    Width="230" BorderBrush="#30464848" BorderThickness="1.5"
+                                                    Background="#08ffffff" ClipToBounds="True">
+                                                <Button Classes="nav" HorizontalAlignment="Stretch"
+                                                        VerticalAlignment="Stretch"
+                                                        Click="OnAddModClick">
+                                                    <StackPanel HorizontalAlignment="Center"
+                                                                VerticalAlignment="Center">
+                                                        <Border Width="48" Height="48" CornerRadius="24"
+                                                                Background="#1d2023"
+                                                                HorizontalAlignment="Center" Margin="0,0,0,12">
+                                                            <TextBlock Text="+" FontSize="24" Foreground="#69daff"
+                                                                       HorizontalAlignment="Center"
+                                                                       VerticalAlignment="Center"/>
+                                                        </Border>
+                                                        <TextBlock Text="ADD NEW MODULE" FontSize="12"
+                                                                   FontWeight="Bold" Foreground="#eeeef0"
+                                                                   HorizontalAlignment="Center"/>
+                                                        <TextBlock Text="Drop your community folder ZIP here to install automatically"
+                                                                   FontSize="9" Foreground="#aaabad"
+                                                                   HorizontalAlignment="Center" Margin="0,6,0,0"
+                                                                   TextAlignment="Center" TextWrapping="Wrap"
+                                                                   MaxWidth="180"/>
+                                                    </StackPanel>
+                                                </Button>
+                                            </Border>
+                                        </DataTemplate>
+                                    </ItemsControl.DataTemplates>
+                                </ItemsControl>
+
+                            </StackPanel>
+                        </ScrollViewer>
+
+                        <!-- Delete Confirmation Modal -->
+                        <Border IsVisible="{Binding DeleteModalVisible}"
+                                Background="#CC000000"
+                                HorizontalAlignment="Stretch" VerticalAlignment="Stretch">
+                            <Border Background="#1d2023" CornerRadius="12" Padding="32,28"
+                                    MaxWidth="380" MaxHeight="220"
+                                    HorizontalAlignment="Center" VerticalAlignment="Center"
+                                    BorderBrush="#30ffffff" BorderThickness="1">
+                                <StackPanel Spacing="16">
+                                    <TextBlock Text="Delete Module" FontSize="20" FontWeight="Bold"
+                                               Foreground="#eeeef0"/>
+                                    <TextBlock Foreground="#aaabad" FontSize="13" TextWrapping="Wrap">
+                                        <TextBlock.Text>
+                                            <MultiBinding StringFormat="Are you sure you want to delete &quot;{0}&quot;? This action cannot be undone.">
+                                                <Binding Path="DeleteModName"/>
+                                            </MultiBinding>
+                                        </TextBlock.Text>
+                                    </TextBlock>
+                                    <Grid ColumnDefinitions="*,8,*" Margin="0,8,0,0">
+                                        <Button Grid.Column="0" Classes="outline"
+                                                HorizontalAlignment="Stretch" Height="38"
+                                                FontSize="12" Content="CANCEL"
+                                                Command="{Binding CancelDeleteModCommand}"/>
+                                        <Button Grid.Column="2" HorizontalAlignment="Stretch"
+                                                Height="38" FontSize="12" FontWeight="Bold"
+                                                Content="DELETE" Background="#ff4d4d" Foreground="White"
+                                                CornerRadius="8" BorderThickness="0" Cursor="Hand"
+                                                HorizontalContentAlignment="Center"
+                                                VerticalContentAlignment="Center"
+                                                Command="{Binding ConfirmDeleteModCommand}"/>
+                                    </Grid>
+                                </StackPanel>
+                            </Border>
+                        </Border>
+                    </Panel>
+
+
+                    <!-- ===== RESHADE PAGE - Kinetic Cockpit Design ===== -->
+                    <Panel IsVisible="{Binding CurrentPage, Converter={x:Static conv:PageVisibleConverter.Instance}, ConverterParameter=ReShade}">
+                        <ScrollViewer Background="#0c0e10">
+                            <StackPanel Margin="40,32,40,40">
+
+                                <!-- ── Header Section (asymmetric: title left, status right) ── -->
+                                <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,36">
+                                    <StackPanel Grid.Column="0" MaxWidth="600">
+                                        <TextBlock Text="PRESET PROFILES" FontSize="36" FontWeight="Bold"
+                                                   Foreground="#eeeef0" LetterSpacing="0.5"/>
+                                        <TextBlock Text="Verwalte deine ReShade-Presets. Jedes Profil ist eine Momentaufnahme von Shader-Parametern, optimiert fuer spezifische Flugszenarien."
+                                                   FontSize="14" Foreground="#aaabad" Margin="0,8,0,0"
+                                                   TextWrapping="Wrap" LineHeight="22"/>
+                                    </StackPanel>
+                                    <StackPanel Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Top">
+                                        <TextBlock Text="SYSTEM STATUS" FontSize="10" Foreground="#69daff"
+                                                   LetterSpacing="3" HorizontalAlignment="Right"/>
+                                        <StackPanel Orientation="Horizontal" Spacing="8" Margin="0,4,0,0"
+                                                    HorizontalAlignment="Right">
+                                            <Ellipse Width="8" Height="8" VerticalAlignment="Center"
+                                                     Fill="{Binding IsReshadeFound, Converter={StaticResource BoolToColor}}"/>
+                                            <TextBlock Text="{Binding IsReshadeFound, Converter={StaticResource BoolToStatusText}}"
+                                                       FontSize="18" FontWeight="Bold" Foreground="#eeeef0"/>
+                                        </StackPanel>
+                                        <TextBlock Text="{Binding ActivePresetName}" FontSize="11"
+                                                   Foreground="#69daff" HorizontalAlignment="Right" Margin="0,4,0,0"/>
+                                    </StackPanel>
+                                </Grid>
+
+                                <!-- ── Bento Grid: Preset Cards ── -->
+                                <ItemsControl ItemsSource="{Binding Presets}">
+                                    <ItemsControl.ItemsPanel>
+                                        <ItemsPanelTemplate>
+                                            <WrapPanel Orientation="Horizontal"/>
+                                        </ItemsPanelTemplate>
+                                    </ItemsControl.ItemsPanel>
+                                    <ItemsControl.ItemTemplate>
+                                        <DataTemplate x:DataType="models:ReShadePreset">
+                                            <Border Width="340" Margin="0,0,16,16"
+                                                    Background="#111416" CornerRadius="12"
+                                                    ClipToBounds="True">
+                                                <StackPanel>
+                                                    <!-- Card header gradient -->
+                                                    <Panel Height="100">
+                                                        <Border CornerRadius="12,12,0,0">
+                                                            <Border.Background>
+                                                                <LinearGradientBrush StartPoint="0%,0%" EndPoint="100%,100%">
+                                                                    <GradientStop Color="#0c2a35" Offset="0"/>
+                                                                    <GradientStop Color="#111416" Offset="1"/>
+                                                                </LinearGradientBrush>
+                                                            </Border.Background>
+                                                        </Border>
+                                                        <!-- Active badge -->
+                                                        <Border Margin="16,0,0,12" VerticalAlignment="Bottom"
+                                                                HorizontalAlignment="Left"
+                                                                CornerRadius="3" Padding="8,3"
+                                                                Background="#10699aff" BorderBrush="#3369daff"
+                                                                BorderThickness="1">
+                                                            <Border.IsVisible>
+                                                                <MultiBinding Converter="{StaticResource ActivePreset}">
+                                                                    <Binding Path="Name"/>
+                                                                    <Binding Path="$parent[ItemsControl].DataContext.ActivePresetName"/>
+                                                                </MultiBinding>
+                                                            </Border.IsVisible>
+                                                            <TextBlock Text="AKTIV" FontSize="10"
+                                                                       Foreground="#69daff" LetterSpacing="2"/>
+                                                        </Border>
+                                                    </Panel>
+
+                                                    <!-- Card body -->
+                                                    <StackPanel Margin="20,16,20,20">
+                                                        <!-- Title -->
+                                                        <TextBlock Text="{Binding Name}" FontSize="18"
+                                                                   FontWeight="Bold" Foreground="#eeeef0"/>
+                                                        <!-- Description -->
+                                                        <TextBlock Text="{Binding Description}" FontSize="12"
+                                                                   Foreground="#aaabad" Margin="0,4,0,16"
+                                                                   TextTrimming="CharacterEllipsis"
+                                                                   MaxLines="2" TextWrapping="Wrap"
+                                                                   MaxHeight="36"/>
+
+                                                        <!-- Sharpen bar (hero metric) -->
+                                                        <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,6">
+                                                            <TextBlock Text="SHARPEN" FontSize="10"
+                                                                       Foreground="#aaabad" LetterSpacing="1"/>
+                                                            <TextBlock Grid.Column="1" FontSize="12"
+                                                                       Foreground="#69daff"
+                                                                       Text="{Binding SharpenStrength, Converter={StaticResource PercentConverter}}"/>
+                                                        </Grid>
+                                                        <Border Height="4" CornerRadius="2" Background="#232629"
+                                                                Margin="0,0,0,16" HorizontalAlignment="Stretch">
+                                                            <Border Height="4" CornerRadius="2"
+                                                                    Background="#69daff" HorizontalAlignment="Left"
+                                                                    Width="{Binding SharpenStrength, Converter={StaticResource BarWidth}, ConverterParameter=300}"/>
+                                                        </Border>
+
+                                                        <!-- Data grid: 2x2 -->
+                                                        <Grid ColumnDefinitions="*,*" RowDefinitions="Auto,Auto"
+                                                              Margin="0,0,0,20">
+                                                            <StackPanel Grid.Row="0" Grid.Column="0" Margin="0,0,0,10">
+                                                                <TextBlock Text="BLOOM" FontSize="10"
+                                                                           Foreground="#aaabad" LetterSpacing="1"/>
+                                                                <TextBlock FontSize="13" Foreground="#eeeef0"
+                                                                           Text="{Binding BloomStrength, Converter={StaticResource PercentConverter}}"/>
+                                                            </StackPanel>
+                                                            <StackPanel Grid.Row="0" Grid.Column="1" Margin="0,0,0,10">
+                                                                <TextBlock Text="VIBRANCE" FontSize="10"
+                                                                           Foreground="#aaabad" LetterSpacing="1"/>
+                                                                <TextBlock FontSize="13" Foreground="#eeeef0"
+                                                                           Text="{Binding VibranceStrength, Converter={StaticResource PercentConverter}}"/>
+                                                            </StackPanel>
+                                                            <StackPanel Grid.Row="1" Grid.Column="0">
+                                                                <TextBlock Text="CONTRAST" FontSize="10"
+                                                                           Foreground="#aaabad" LetterSpacing="1"/>
+                                                                <TextBlock FontSize="13" Foreground="#eeeef0"
+                                                                           Text="{Binding Contrast, Converter={StaticResource PercentConverter}}"/>
+                                                            </StackPanel>
+                                                            <StackPanel Grid.Row="1" Grid.Column="1">
+                                                                <TextBlock Text="BRIGHTNESS" FontSize="10"
+                                                                           Foreground="#aaabad" LetterSpacing="1"/>
+                                                                <TextBlock FontSize="13" Foreground="#eeeef0"
+                                                                           Text="{Binding Brightness, Converter={StaticResource PercentConverter}}"/>
+                                                            </StackPanel>
+                                                        </Grid>
+
+                                                        <!-- Action buttons -->
+                                                        <Grid ColumnDefinitions="*,Auto" Height="38">
+                                                            <Button Grid.Column="0"
+                                                                    Content="Profil laden"
+                                                                    FontSize="13" FontWeight="Bold"
+                                                                    Foreground="#004a5d"
+                                                                    Background="#69daff"
+                                                                    CornerRadius="8"
+                                                                    HorizontalAlignment="Stretch"
+                                                                    HorizontalContentAlignment="Center"
+                                                                    Padding="0,8"
+                                                                    Command="{Binding $parent[ItemsControl].DataContext.SelectPresetCardCommand}"
+                                                                    CommandParameter="{Binding}"/>
+                                                            <Button Grid.Column="1" Width="38" Height="38"
+                                                                    Margin="8,0,0,0"
+                                                                    Background="#1d2023" CornerRadius="8"
+                                                                    HorizontalContentAlignment="Center"
+                                                                    VerticalContentAlignment="Center"
+                                                                    Padding="0"
+                                                                    Command="{Binding $parent[ItemsControl].DataContext.DeletePresetItemCommand}"
+                                                                    CommandParameter="{Binding}">
+                                                                <TextBlock Text="..." FontSize="16"
+                                                                           Foreground="#aaabad"/>
+                                                            </Button>
+                                                        </Grid>
+                                                    </StackPanel>
+                                                </StackPanel>
+                                            </Border>
+                                        </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                </ItemsControl>
+
+                                <!-- ── Create New Card ── -->
+                                <Border Width="340" Height="200" Margin="0,0,0,16"
+                                        Background="#111416" CornerRadius="12" Opacity="0.6"
+                                        BorderBrush="#46484a" BorderThickness="2"
+                                        HorizontalAlignment="Left"
+                                        Cursor="Hand">
+                                    <Button Background="Transparent" BorderThickness="0"
+                                            HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
+                                            HorizontalContentAlignment="Center" VerticalContentAlignment="Center"
+                                            Command="{Binding NewPresetCommand}">
+                                        <StackPanel HorizontalAlignment="Center">
+                                            <Border Width="52" Height="52" CornerRadius="26"
+                                                    Background="#1d2023" HorizontalAlignment="Center"
+                                                    Margin="0,0,0,12">
+                                                <TextBlock Text="+" FontSize="28" Foreground="#aaabad"
+                                                           HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                            </Border>
+                                            <TextBlock Text="Neues Preset" FontSize="16" FontWeight="Bold"
+                                                       Foreground="#eeeef0" HorizontalAlignment="Center"/>
+                                            <TextBlock Text="Erstelle ein neues ReShade-Profil"
+                                                       FontSize="11" Foreground="#aaabad"
+                                                       HorizontalAlignment="Center" Margin="0,4,0,0"/>
+                                        </StackPanel>
+                                    </Button>
+                                </Border>
+
+                                <!-- ── Shader Detail Panel (shown when a preset is selected) ── -->
+                                <Border IsVisible="{Binding ShowShaderDetail}"
+                                        Background="#111416" CornerRadius="12"
+                                        Padding="32,28" Margin="0,20,0,0">
+                                    <StackPanel>
+                                        <!-- Detail header -->
+                                        <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,24">
+                                            <StackPanel>
+                                                <TextBlock Text="SHADER KONFIGURATION" FontSize="10"
+                                                           Foreground="#69daff" LetterSpacing="3" Margin="0,0,0,6"/>
+                                                <TextBlock Text="{Binding SelectedPreset.Name, FallbackValue='Kein Preset'}"
+                                                           FontSize="24" FontWeight="Bold" Foreground="#eeeef0"/>
+                                            </StackPanel>
+                                            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="10"
+                                                        VerticalAlignment="Center">
+                                                <Button Content="Speichern" Padding="16,8"
+                                                        Background="#1d2023" Foreground="#69daff"
+                                                        CornerRadius="8" FontSize="12"
+                                                        Command="{Binding SavePresetCommand}"/>
+                                                <Button Content="Anwenden" Padding="20,8"
+                                                        Background="#69daff" Foreground="#004a5d"
+                                                        CornerRadius="8" FontSize="12" FontWeight="Bold"
+                                                        Command="{Binding ApplyPresetCommand}"/>
+                                            </StackPanel>
+                                        </Grid>
+
+                                        <!-- Shader toggles row -->
+                                        <Grid ColumnDefinitions="*,*,*,*" Margin="0,0,0,28">
+                                            <Border Grid.Column="0" Background="#1d2023" CornerRadius="8"
+                                                    Padding="16,12" Margin="0,0,8,0">
+                                                <StackPanel>
+                                                    <TextBlock Text="SHARPEN" FontSize="10" Foreground="#aaabad"
+                                                               LetterSpacing="1" Margin="0,0,0,6"/>
+                                                    <CheckBox IsChecked="{Binding SharpenEnabled}"
+                                                              Content="Aktiv" Foreground="#eeeef0" FontSize="12"/>
+                                                </StackPanel>
+                                            </Border>
+                                            <Border Grid.Column="1" Background="#1d2023" CornerRadius="8"
+                                                    Padding="16,12" Margin="4,0,4,0">
+                                                <StackPanel>
+                                                    <TextBlock Text="BLOOM" FontSize="10" Foreground="#aaabad"
+                                                               LetterSpacing="1" Margin="0,0,0,6"/>
+                                                    <CheckBox IsChecked="{Binding BloomEnabled}"
+                                                              Content="Aktiv" Foreground="#eeeef0" FontSize="12"/>
+                                                </StackPanel>
+                                            </Border>
+                                            <Border Grid.Column="2" Background="#1d2023" CornerRadius="8"
+                                                    Padding="16,12" Margin="4,0,4,0">
+                                                <StackPanel>
+                                                    <TextBlock Text="VIBRANCE" FontSize="10" Foreground="#aaabad"
+                                                               LetterSpacing="1" Margin="0,0,0,6"/>
+                                                    <CheckBox IsChecked="{Binding VibranceEnabled}"
+                                                              Content="Aktiv" Foreground="#eeeef0" FontSize="12"/>
+                                                </StackPanel>
+                                            </Border>
+                                            <Border Grid.Column="3" Background="#1d2023" CornerRadius="8"
+                                                    Padding="16,12" Margin="8,0,0,0">
+                                                <StackPanel>
+                                                    <TextBlock Text="TONEMAP" FontSize="10" Foreground="#aaabad"
+                                                               LetterSpacing="1" Margin="0,0,0,6"/>
+                                                    <CheckBox IsChecked="{Binding TonemapEnabled}"
+                                                              Content="Aktiv" Foreground="#eeeef0" FontSize="12"/>
+                                                </StackPanel>
+                                            </Border>
+                                        </Grid>
+
+                                        <!-- Shader sliders -->
+                                        <StackPanel Spacing="20">
+                                            <!-- Sharpen -->
+                                            <StackPanel>
+                                                <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,4">
+                                                    <TextBlock Text="Sharpen Strength" FontSize="13"
+                                                               Foreground="#aaabad"/>
+                                                    <TextBlock Grid.Column="1" FontSize="13" Foreground="#69daff"
+                                                               FontWeight="SemiBold"
+                                                               Text="{Binding SharpenStrength, Converter={StaticResource PercentConverter}}"/>
+                                                </Grid>
+                                                <Slider Value="{Binding SharpenStrength}" Minimum="0" Maximum="1"
+                                                        Foreground="#69daff"/>
+                                            </StackPanel>
+                                            <!-- Bloom -->
+                                            <StackPanel>
+                                                <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,4">
+                                                    <TextBlock Text="Bloom Intensity" FontSize="13"
+                                                               Foreground="#aaabad"/>
+                                                    <TextBlock Grid.Column="1" FontSize="13" Foreground="#69daff"
+                                                               FontWeight="SemiBold"
+                                                               Text="{Binding BloomStrength, Converter={StaticResource PercentConverter}}"/>
+                                                </Grid>
+                                                <Slider Value="{Binding BloomStrength}" Minimum="0" Maximum="1"
+                                                        Foreground="#69daff"/>
+                                            </StackPanel>
+                                            <!-- Vibrance -->
+                                            <StackPanel>
+                                                <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,4">
+                                                    <TextBlock Text="Vibrance Strength" FontSize="13"
+                                                               Foreground="#aaabad"/>
+                                                    <TextBlock Grid.Column="1" FontSize="13" Foreground="#69daff"
+                                                               FontWeight="SemiBold"
+                                                               Text="{Binding VibranceStrength, Converter={StaticResource PercentConverter}}"/>
+                                                </Grid>
+                                                <Slider Value="{Binding VibranceStrength}" Minimum="0" Maximum="1"
+                                                        Foreground="#69daff"/>
+                                            </StackPanel>
+                                            <!-- Contrast -->
+                                            <StackPanel>
+                                                <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,4">
+                                                    <TextBlock Text="Contrast" FontSize="13"
+                                                               Foreground="#aaabad"/>
+                                                    <TextBlock Grid.Column="1" FontSize="13" Foreground="#69daff"
+                                                               FontWeight="SemiBold"
+                                                               Text="{Binding Contrast, Converter={StaticResource PercentConverter}}"/>
+                                                </Grid>
+                                                <Slider Value="{Binding Contrast}" Minimum="0" Maximum="1"
+                                                        Foreground="#69daff"/>
+                                            </StackPanel>
+                                            <!-- Brightness -->
+                                            <StackPanel>
+                                                <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,4">
+                                                    <TextBlock Text="Brightness" FontSize="13"
+                                                               Foreground="#aaabad"/>
+                                                    <TextBlock Grid.Column="1" FontSize="13" Foreground="#69daff"
+                                                               FontWeight="SemiBold"
+                                                               Text="{Binding Brightness, Converter={StaticResource PercentConverter}}"/>
+                                                </Grid>
+                                                <Slider Value="{Binding Brightness}" Minimum="0" Maximum="1"
+                                                        Foreground="#69daff"/>
+                                            </StackPanel>
+                                        </StackPanel>
+
+                                        <!-- Bottom actions -->
+                                        <Grid ColumnDefinitions="*,Auto" Margin="0,28,0,0">
+                                            <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                                                <Ellipse Width="8" Height="8" Fill="#00FF88"/>
+                                                <TextBlock Text="{Binding StatusMessage}" FontSize="12"
+                                                           Foreground="#aaabad"/>
+                                            </StackPanel>
+                                            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="10">
+                                                <Button Content="Importieren" Padding="16,8"
+                                                        Background="#1d2023" Foreground="#aaabad"
+                                                        CornerRadius="8" FontSize="12"
+                                                        Click="OnImportClick"/>
+                                                <Button Content="Exportieren" Padding="16,8"
+                                                        Background="#1d2023" Foreground="#aaabad"
+                                                        CornerRadius="8" FontSize="12"
+                                                        Click="OnExportClick"/>
+                                                <Button Content="Zuruecksetzen" Padding="16,8"
+                                                        Background="#1d2023" Foreground="#aaabad"
+                                                        CornerRadius="8" FontSize="12"
+                                                        Command="{Binding ResetPresetCommand}"/>
+                                            </StackPanel>
+                                        </Grid>
+                                    </StackPanel>
+                                </Border>
+
+                                <!-- ── Telemetry Footer (asymmetric: log left, metrics right) ── -->
+                                <Grid ColumnDefinitions="*,300" Margin="0,40,0,0">
+                                    <!-- System Log -->
+                                    <StackPanel Grid.Column="0" Margin="0,0,24,0">
+                                        <StackPanel Orientation="Horizontal" Spacing="8" Margin="0,0,0,16">
+                                            <Ellipse Width="8" Height="8" Fill="#69daff"/>
+                                            <TextBlock Text="SYSTEM LOG - RESHADE" FontSize="10"
+                                                       Foreground="#69daff" LetterSpacing="2"/>
+                                        </StackPanel>
+                                        <StackPanel Spacing="6">
+                                            <StackPanel Orientation="Horizontal" Spacing="16">
+                                                <TextBlock Text="MSFS" FontSize="11" Foreground="#46484a" Width="50"/>
+                                                <TextBlock Text="{Binding MsfsPath}" FontSize="11"
+                                                           Foreground="#aaabad" TextTrimming="CharacterEllipsis"/>
+                                            </StackPanel>
+                                            <StackPanel Orientation="Horizontal" Spacing="16">
+                                                <TextBlock Text="RSHD" FontSize="11" Foreground="#46484a" Width="50"/>
+                                                <TextBlock Text="{Binding ReshadePath}" FontSize="11"
+                                                           Foreground="#aaabad" TextTrimming="CharacterEllipsis"/>
+                                            </StackPanel>
+                                            <StackPanel Orientation="Horizontal" Spacing="16">
+                                                <TextBlock Text="AKTIV" FontSize="11" Foreground="#46484a" Width="50"/>
+                                                <TextBlock Text="{Binding ActivePresetName}" FontSize="11"
+                                                           Foreground="#69daff"/>
+                                            </StackPanel>
+                                        </StackPanel>
+                                    </StackPanel>
+
+                                    <!-- Storage Metrics card -->
+                                    <Border Grid.Column="1" Background="#1d2023" CornerRadius="12"
+                                            Padding="24,20">
+                                        <StackPanel>
+                                            <TextBlock Text="RESHADE STATUS" FontSize="10" Foreground="#eeeef0"
+                                                       LetterSpacing="2" Margin="0,0,0,16"/>
+                                            <StackPanel Orientation="Horizontal" Spacing="4" Margin="0,0,0,8">
+                                                <TextBlock FontSize="28" FontWeight="Bold" Foreground="#eeeef0">
+                                                    <TextBlock.Text>
+                                                        <Binding Path="Presets.Count" StringFormat="{}{0}"/>
+                                                    </TextBlock.Text>
+                                                </TextBlock>
+                                                <TextBlock Text="Presets" FontSize="13" Foreground="#aaabad"
+                                                           VerticalAlignment="Bottom" Margin="4,0,0,4"/>
+                                            </StackPanel>
+                                            <Border Height="6" CornerRadius="3" Background="#232629"
+                                                    Margin="0,0,0,12">
+                                                <Border Height="6" CornerRadius="3" Background="#17c0fd"
+                                                        HorizontalAlignment="Left" Width="60"/>
+                                            </Border>
+                                            <TextBlock Text="ReShade-Presets werden direkt aus dem MSFS-Spielverzeichnis gelesen und koennen hier bearbeitet werden."
+                                                       FontSize="11" Foreground="#aaabad"
+                                                       TextWrapping="Wrap" FontStyle="Italic"
+                                                       LineHeight="18"/>
+                                        </StackPanel>
+                                    </Border>
+                                </Grid>
+
+                            </StackPanel>
+                        </ScrollViewer>
+                    </Panel>
+
+
+                    <!-- ===== AI CHAT PAGE ===== -->
+                    <Panel IsVisible="{Binding CurrentPage, Converter={x:Static conv:PageVisibleConverter.Instance}, ConverterParameter=AiChat}">
+                        <Grid RowDefinitions="54,*,Auto">
+
+                            <!-- ══ Top Bar ══ -->
+                            <Border Grid.Row="0"
+                                    Background="#080a0c"
+                                    BorderThickness="0,0,0,1" BorderBrush="#14171a"
+                                    IsVisible="{Binding !ShowModelPicker}">
+                                <Grid ColumnDefinitions="*,Auto,*" Margin="28,0">
+                                    <!-- Left: live model indicator -->
+                                    <StackPanel Grid.Column="0" Orientation="Horizontal"
+                                                Spacing="8" VerticalAlignment="Center">
+                                        <Ellipse Width="7" Height="7" Fill="#4ade80"/>
+                                        <TextBlock Text="{Binding SelectedChatModel.Label}"
+                                                   FontSize="13" Foreground="#eeeef0"
+                                                   FontWeight="SemiBold" VerticalAlignment="Center"/>
+                                        <TextBlock Text="{Binding SelectedChatModel.Size}"
+                                                   FontSize="11" Foreground="#3a3d40"
+                                                   VerticalAlignment="Center"/>
+                                    </StackPanel>
+                                    <!-- Center: wordmark -->
+                                    <TextBlock Grid.Column="1" Text="PILOT AI"
+                                               FontSize="11" FontWeight="Bold"
+                                               Foreground="#2a2d30" LetterSpacing="5"
+                                               VerticalAlignment="Center" HorizontalAlignment="Center"/>
+                                    <!-- Right: MCP + switch -->
+                                    <StackPanel Grid.Column="2" Orientation="Horizontal"
+                                                HorizontalAlignment="Right" VerticalAlignment="Center"
+                                                Spacing="16">
+                                        <TextBlock Text="{Binding McpStatus}" FontSize="10"
+                                                   Foreground="#69daff" VerticalAlignment="Center"/>
+                                        <Button Content="Modell wechseln"
+                                                FontSize="10" FontWeight="SemiBold"
+                                                Padding="14,6" CornerRadius="6"
+                                                Background="Transparent" Foreground="#aaabad"
+                                                BorderThickness="1" BorderBrush="#1d2023"
+                                                Cursor="Hand"
+                                                Command="{Binding ShowModelSelectorCommand}"/>
+                                    </StackPanel>
+                                </Grid>
+                            </Border>
+
+                            <!-- ══ Model Picker Overlay ══ -->
+                            <Border Grid.Row="0" Grid.RowSpan="3"
+                                    Background="#08090b" ZIndex="10"
+                                    IsVisible="{Binding ShowModelPicker}">
+                                <ScrollViewer HorizontalScrollBarVisibility="Disabled">
+                                    <StackPanel MaxWidth="580" Margin="40,64"
+                                                HorizontalAlignment="Center">
+
+                                        <!-- Setup progress -->
+                                        <Border IsVisible="{Binding IsInstallingOllama}"
+                                                Background="#111416" CornerRadius="14"
+                                                Padding="24,20" Margin="0,0,0,24">
+                                            <StackPanel Spacing="8">
+                                                <TextBlock Text="System wird vorbereitet..."
+                                                           FontSize="14" Foreground="#eeeef0" FontWeight="Bold"/>
+                                                <TextBlock Text="{Binding ChatModelStatus}"
+                                                           FontSize="12" Foreground="#aaabad"/>
+                                                <TextBlock Text="{Binding PullProgressText}"
+                                                           FontSize="11" Foreground="#69daff"/>
+                                            </StackPanel>
+                                        </Border>
+
+                                        <!-- Header -->
+                                        <TextBlock Text="KI-Modell auswaehlen"
+                                                   FontSize="34" FontWeight="Bold"
+                                                   Foreground="#eeeef0"
+                                                   HorizontalAlignment="Center" Margin="0,0,0,10"/>
+                                        <TextBlock Text="Waehle ein lokales Modell. Groessere Modelle sind praeziser, brauchen mehr VRAM."
+                                                   FontSize="13" Foreground="#aaabad"
+                                                   TextWrapping="Wrap"
+                                                   HorizontalAlignment="Center" TextAlignment="Center"
+                                                   Margin="0,0,0,40"/>
+
+                                        <!-- Ollama offline -->
+                                        <Border IsVisible="{Binding IsOllamaOffline}"
+                                                Background="#160c0c" CornerRadius="12"
+                                                BorderBrush="#2e1414" BorderThickness="1"
+                                                Padding="20,18" Margin="0,0,0,20">
+                                            <StackPanel Spacing="10" HorizontalAlignment="Center">
+                                                <TextBlock Text="Ollama nicht erreichbar"
+                                                           FontSize="14" FontWeight="Bold"
+                                                           Foreground="#ff6b6b"
+                                                           HorizontalAlignment="Center"/>
+                                                <TextBlock Text="{Binding ChatModelStatus}"
+                                                           FontSize="12" Foreground="#aaabad"
+                                                           HorizontalAlignment="Center"
+                                                           TextWrapping="Wrap" TextAlignment="Center"/>
+                                                <Button Content="Erneut verbinden"
+                                                        Command="{Binding RetryOllamaConnectionCommand}"
+                                                        HorizontalAlignment="Center"
+                                                        Padding="22,10"
+                                                        FontSize="13" FontWeight="SemiBold"
+                                                        Foreground="#eeeef0"
+                                                        Background="#1a3a8f" CornerRadius="8"/>
+                                            </StackPanel>
+                                        </Border>
+
+                                        <!-- Model cards -->
+                                        <ItemsControl ItemsSource="{Binding ChatModelList}">
+                                            <ItemsControl.ItemTemplate>
+                                                <DataTemplate x:DataType="models:ChatModelItem">
+                                                    <Border Background="#0f1214" CornerRadius="14"
+                                                            Padding="22,18" Margin="0,0,0,8"
+                                                            BorderThickness="1" BorderBrush="#1a1d20">
+                                                        <Grid ColumnDefinitions="*,Auto">
+                                                            <StackPanel Grid.Column="0" Spacing="5">
+                                                                <StackPanel Orientation="Horizontal" Spacing="8">
+                                                                    <TextBlock Text="{Binding Label}"
+                                                                               FontSize="15" Foreground="#eeeef0"
+                                                                               FontWeight="Bold"/>
+                                                                    <Border Background="#1d2023" CornerRadius="5"
+                                                                            Padding="8,3">
+                                                                        <TextBlock Text="{Binding Size}"
+                                                                                   FontSize="10" Foreground="#69daff"/>
+                                                                    </Border>
+                                                                    <Border Background="#0b1f12" CornerRadius="5"
+                                                                            Padding="8,3"
+                                                                            IsVisible="{Binding IsInstalled}">
+                                                                        <TextBlock Text="Installiert"
+                                                                                   FontSize="10" Foreground="#4ade80"/>
+                                                                    </Border>
+                                                                </StackPanel>
+                                                                <TextBlock Text="{Binding Description}"
+                                                                           FontSize="12" Foreground="#aaabad"/>
+                                                                <StackPanel IsVisible="{Binding IsDownloading}"
+                                                                            Margin="0,8,0,0" Spacing="6">
+                                                                    <Grid ColumnDefinitions="*,Auto">
+                                                                        <TextBlock Grid.Column="0"
+                                                                                   Text="{Binding DownloadProgress}"
+                                                                                   FontSize="11" Foreground="#69daff"
+                                                                                   FontWeight="SemiBold"/>
+                                                                        <TextBlock Grid.Column="1"
+                                                                                   Text="{Binding DownloadSizeText}"
+                                                                                   FontSize="11" Foreground="#aaabad"/>
+                                                                    </Grid>
+                                                                    <Border Height="4" CornerRadius="2"
+                                                                            Background="#1a1d20">
+                                                                        <Border Height="4" CornerRadius="2"
+                                                                                Background="#69daff"
+                                                                                HorizontalAlignment="Left"
+                                                                                Width="{Binding DownloadPercent, Converter={x:Static conv:BarWidthConverter.Instance}, ConverterParameter=340}">
+                                                                            <Border.Transitions>
+                                                                                <Transitions>
+                                                                                    <DoubleTransition Property="Width" Duration="0:0:0.3" Easing="CubicEaseOut"/>
+                                                                                </Transitions>
+                                                                            </Border.Transitions>
+                                                                        </Border>
+                                                                    </Border>
+                                                                </StackPanel>
+                                                            </StackPanel>
+                                                            <Panel Grid.Column="1" VerticalAlignment="Center">
+                                                                <Button Content="Installieren"
+                                                                        FontSize="12" FontWeight="Bold"
+                                                                        Padding="20,9" CornerRadius="8"
+                                                                        Cursor="Hand"
+                                                                        Background="#69daff" Foreground="#003a4d"
+                                                                        BorderThickness="0"
+                                                                        IsVisible="{Binding IsNotInstalled}"
+                                                                        IsEnabled="{Binding !IsDownloading}"
+                                                                        Command="{Binding $parent[Window].DataContext.InstallModelCommand}"
+                                                                        CommandParameter="{Binding}"/>
+                                                                <Button Content="Auswaehlen"
+                                                                        FontSize="12" FontWeight="Bold"
+                                                                        Padding="20,9" CornerRadius="8"
+                                                                        Cursor="Hand"
+                                                                        Background="#0b1f12" Foreground="#4ade80"
+                                                                        BorderThickness="1" BorderBrush="#1a4a28"
+                                                                        IsVisible="{Binding IsInstalled}"
+                                                                        Command="{Binding $parent[Window].DataContext.SelectInstalledModelCommand}"
+                                                                        CommandParameter="{Binding}"/>
+                                                            </Panel>
+                                                        </Grid>
+                                                    </Border>
+                                                </DataTemplate>
+                                            </ItemsControl.ItemTemplate>
+                                        </ItemsControl>
+
+                                    </StackPanel>
+                                </ScrollViewer>
+                            </Border>
+
+                            <!-- ══ Messages ══ -->
+                            <ScrollViewer Grid.Row="1"
+                                          HorizontalScrollBarVisibility="Disabled"
+                                          x:Name="ChatScrollViewer">
+                                <StackPanel MaxWidth="760" HorizontalAlignment="Center"
+                                            Margin="0,28,0,16">
+                                    <ItemsControl ItemsSource="{Binding ChatMessages}">
+                                        <ItemsControl.DataTemplates>
+
+                                            <DataTemplate DataType="models:ChatMessage" x:DataType="models:ChatMessage">
+                                                <Panel>
+
+                                                    <!-- ── User bubble ── -->
+                                                    <StackPanel IsVisible="{Binding IsUser}"
+                                                                HorizontalAlignment="Right"
+                                                                Margin="160,0,28,20">
+                                                        <Border Background="#1a1d20"
+                                                                CornerRadius="20,20,4,20"
+                                                                Padding="18,13" MaxWidth="520">
+                                                            <Border.Transitions>
+                                                                <Transitions>
+                                                                    <DoubleTransition Property="Opacity" Duration="0:0:0.2" Easing="CubicEaseOut"/>
+                                                                </Transitions>
+                                                            </Border.Transitions>
+                                                            <TextBlock Text="{Binding Content}"
+                                                                       FontSize="14" Foreground="#eeeef0"
+                                                                       TextWrapping="Wrap" LineHeight="22"/>
+                                                        </Border>
+                                                        <TextBlock Text="{Binding Timestamp}"
+                                                                   FontSize="10" Foreground="#2e3133"
+                                                                   HorizontalAlignment="Right"
+                                                                   Margin="0,5,6,0"/>
+                                                    </StackPanel>
+
+                                                    <!-- ── AI message ── -->
+                                                    <Grid IsVisible="{Binding IsAssistant}"
+                                                          ColumnDefinitions="48,*"
+                                                          Margin="24,0,28,28">
+                                                        <Grid.Transitions>
+                                                            <Transitions>
+                                                                <DoubleTransition Property="Opacity" Duration="0:0:0.25" Easing="CubicEaseOut"/>
+                                                            </Transitions>
+                                                        </Grid.Transitions>
+
+                                                        <!-- Avatar -->
+                                                        <Panel Grid.Column="0" VerticalAlignment="Top"
+                                                               Width="36" Height="36" Margin="0,2,0,0">
+                                                            <Border Width="36" Height="36" CornerRadius="18"
+                                                                    Background="#1269daff"/>
+                                                            <Border Width="32" Height="32" CornerRadius="16"
+                                                                    ClipToBounds="True"
+                                                                    HorizontalAlignment="Center"
+                                                                    VerticalAlignment="Center">
+                                                                <ctrl:GifImage SourceUri="avares://GameCopilot/Assets/copilot-avatar.gif"
+                                                                       Width="32" Height="32"
+                                                                       Stretch="UniformToFill"/>
+                                                            </Border>
+                                                        </Panel>
+
+                                                        <!-- Content -->
+                                                        <StackPanel Grid.Column="1" Spacing="0" Margin="4,0,0,0">
+
+                                                            <!-- Tool steps — compact badge row -->
+                                                            <Border IsVisible="{Binding HasAgentSteps}"
+                                                                    Background="#0b0d10" CornerRadius="10"
+                                                                    Padding="14,10" Margin="0,0,0,12"
+                                                                    BorderThickness="1" BorderBrush="#161a22">
+                                                                <ItemsControl ItemsSource="{Binding AgentSteps}">
+                                                                    <ItemsControl.ItemTemplate>
+                                                                        <DataTemplate x:DataType="models:AgentStep">
+                                                                            <Grid ColumnDefinitions="Auto,*"
+                                                                                  Margin="0,0,0,5">
+                                                                                <Border Grid.Column="0"
+                                                                                        Background="#111416"
+                                                                                        CornerRadius="5"
+                                                                                        Padding="8,4" Margin="0,0,10,0">
+                                                                                    <StackPanel Orientation="Horizontal" Spacing="5">
+                                                                                        <TextBlock Text="{Binding Icon}" FontSize="11"/>
+                                                                                        <TextBlock Text="{Binding StatusText}"
+                                                                                                   FontSize="11" Foreground="#aaabad"/>
+                                                                                    </StackPanel>
+                                                                                </Border>
+                                                                                <TextBlock Grid.Column="1"
+                                                                                           Text="{Binding ResultSummary}"
+                                                                                           FontSize="11" Foreground="#69daff"
+                                                                                           IsVisible="{Binding HasResult}"
+                                                                                           VerticalAlignment="Center"
+                                                                                           TextWrapping="Wrap"/>
+                                                                            </Grid>
+                                                                        </DataTemplate>
+                                                                    </ItemsControl.ItemTemplate>
+                                                                </ItemsControl>
+                                                            </Border>
+
+                                                            <!-- Response text -->
+                                                            <TextBlock Text="{Binding Content}"
+                                                                       FontSize="14" Foreground="#dde0e4"
+                                                                       TextWrapping="Wrap" LineHeight="24"/>
+
+                                                            <!-- Streaming cursor -->
+                                                            <TextBlock Text="▋" FontSize="14"
+                                                                       Classes="streaming-cursor"
+                                                                       Foreground="#69daff"
+                                                                       IsVisible="{Binding IsStreaming}"
+                                                                       Margin="0,2,0,0"/>
+
+                                                            <!-- Recommendation Cards -->
+                                                            <ItemsControl ItemsSource="{Binding Cards}"
+                                                                          IsVisible="{Binding HasCards}"
+                                                                          Margin="0,18,0,0">
+                                                                <ItemsControl.ItemsPanel>
+                                                                    <ItemsPanelTemplate>
+                                                                        <WrapPanel Orientation="Horizontal"/>
+                                                                    </ItemsPanelTemplate>
+                                                                </ItemsControl.ItemsPanel>
+                                                                <ItemsControl.ItemTemplate>
+                                                                    <DataTemplate x:DataType="models:RecommendationCard">
+                                                                        <Border Width="256" Background="#0f1214"
+                                                                                BorderThickness="0,0,0,2"
+                                                                                BorderBrush="#69daff"
+                                                                                CornerRadius="10"
+                                                                                Margin="0,0,10,10"
+                                                                                Padding="16,14">
+                                                                            <StackPanel>
+                                                                                <TextBlock Text="{Binding Title}"
+                                                                                           FontSize="9" FontWeight="Bold"
+                                                                                           Foreground="#69daff"
+                                                                                           LetterSpacing="2"/>
+                                                                                <ItemsControl ItemsSource="{Binding Items}"
+                                                                                              Margin="0,10,0,0">
+                                                                                    <ItemsControl.ItemTemplate>
+                                                                                        <DataTemplate x:DataType="models:RecommendationItem">
+                                                                                            <Grid ColumnDefinitions="*,Auto"
+                                                                                                  Margin="0,6,0,0">
+                                                                                                <TextBlock Text="{Binding Label}"
+                                                                                                           FontSize="12"
+                                                                                                           Foreground="#aaabad"/>
+                                                                                                <TextBlock Grid.Column="1"
+                                                                                                           Text="{Binding Value}"
+                                                                                                           FontSize="12"
+                                                                                                           FontWeight="Bold"
+                                                                                                           Foreground="#eeeef0"/>
+                                                                                            </Grid>
+                                                                                        </DataTemplate>
+                                                                                    </ItemsControl.ItemTemplate>
+                                                                                </ItemsControl>
+                                                                            </StackPanel>
+                                                                        </Border>
+                                                                    </DataTemplate>
+                                                                </ItemsControl.ItemTemplate>
+                                                            </ItemsControl>
+
+                                                            <!-- Action Buttons -->
+                                                            <ItemsControl ItemsSource="{Binding ActionButtons}"
+                                                                          IsVisible="{Binding HasActions}"
+                                                                          Margin="0,14,0,0">
+                                                                <ItemsControl.ItemsPanel>
+                                                                    <ItemsPanelTemplate>
+                                                                        <StackPanel Orientation="Horizontal" Spacing="8"/>
+                                                                    </ItemsPanelTemplate>
+                                                                </ItemsControl.ItemsPanel>
+                                                                <ItemsControl.ItemTemplate>
+                                                                    <DataTemplate x:DataType="models:ActionButton">
+                                                                        <Button Content="{Binding Text}"
+                                                                                FontSize="12" FontWeight="SemiBold"
+                                                                                Padding="20,10" CornerRadius="8"
+                                                                                Cursor="Hand"
+                                                                                Background="{Binding IsPrimary, Converter={x:Static conv:ActionBtnBgConverter.Instance}}"
+                                                                                Foreground="{Binding IsPrimary, Converter={x:Static conv:ActionBtnFgConverter.Instance}}"
+                                                                                BorderBrush="#69daff"
+                                                                                BorderThickness="{Binding IsPrimary, Converter={x:Static conv:ActionBtnBorderConverter.Instance}}"
+                                                                                HorizontalContentAlignment="Center"
+                                                                                VerticalContentAlignment="Center"
+                                                                                Command="{Binding $parent[Window].DataContext.ChatActionCommand}"
+                                                                                CommandParameter="{Binding Text}"/>
+                                                                    </DataTemplate>
+                                                                </ItemsControl.ItemTemplate>
+                                                            </ItemsControl>
+
+                                                            <!-- Timestamp -->
+                                                            <TextBlock Text="{Binding Timestamp}"
+                                                                       FontSize="10" Foreground="#252830"
+                                                                       Margin="0,10,0,0"/>
+                                                        </StackPanel>
+                                                    </Grid>
+
+                                                </Panel>
+                                            </DataTemplate>
+
+                                        </ItemsControl.DataTemplates>
+                                    </ItemsControl>
+                                </StackPanel>
+                            </ScrollViewer>
+
+                            <!-- ══ Thinking indicator ══ -->
+                            <Border Grid.Row="1" IsVisible="{Binding IsChatLoading}"
+                                    VerticalAlignment="Bottom" HorizontalAlignment="Left"
+                                    Margin="28,0,0,14">
+                                <Border.Transitions>
+                                    <Transitions>
+                                        <DoubleTransition Property="Opacity" Duration="0:0:0.3" Easing="CubicEaseOut"/>
+                                    </Transitions>
+                                </Border.Transitions>
+                                <StackPanel Orientation="Horizontal" Spacing="10">
+                                    <!-- Avatar -->
+                                    <Panel>
+                                        <Border Width="38" Height="38" CornerRadius="19"
+                                                BorderBrush="#1f69daff" BorderThickness="1.5"
+                                                HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                x:Name="ThinkingGlow"/>
+                                        <Border Width="34" Height="34" CornerRadius="17"
+                                                ClipToBounds="True"
+                                                HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                x:Name="ThinkingAvatar">
+                                            <ctrl:GifImage SourceUri="avares://GameCopilot/Assets/copilot-avatar.gif"
+                                                   Width="34" Height="34" Stretch="UniformToFill"/>
+                                        </Border>
+                                    </Panel>
+                                    <!-- Bubble -->
+                                    <Border Background="#0f1214" CornerRadius="16,16,16,4"
+                                            Padding="16,11" BorderThickness="1" BorderBrush="#161920">
+                                        <StackPanel Spacing="5">
+                                            <TextBlock Text="{Binding ThinkingStatusText}"
+                                                       FontSize="12" Foreground="#69daff"
+                                                       FontWeight="SemiBold"/>
+                                            <StackPanel Orientation="Horizontal" Spacing="5" Margin="0,1,0,0">
+                                                <Border Width="6" Height="6" CornerRadius="3"
+                                                        Background="#69daff" x:Name="Dot1">
+                                                    <Border.Transitions>
+                                                        <Transitions>
+                                                            <DoubleTransition Property="Opacity" Duration="0:0:0.5" Easing="SineEaseInOut"/>
+                                                        </Transitions>
+                                                    </Border.Transitions>
+                                                </Border>
+                                                <Border Width="6" Height="6" CornerRadius="3"
+                                                        Background="#69daff" x:Name="Dot2" Opacity="0.5">
+                                                    <Border.Transitions>
+                                                        <Transitions>
+                                                            <DoubleTransition Property="Opacity" Duration="0:0:0.5" Easing="SineEaseInOut"/>
+                                                        </Transitions>
+                                                    </Border.Transitions>
+                                                </Border>
+                                                <Border Width="6" Height="6" CornerRadius="3"
+                                                        Background="#69daff" x:Name="Dot3" Opacity="0.25">
+                                                    <Border.Transitions>
+                                                        <Transitions>
+                                                            <DoubleTransition Property="Opacity" Duration="0:0:0.5" Easing="SineEaseInOut"/>
+                                                        </Transitions>
+                                                    </Border.Transitions>
+                                                </Border>
+                                                <Border IsVisible="{Binding IsToolRunning}"
+                                                        Width="56" Height="4" CornerRadius="2"
+                                                        Background="#0c69daff" Margin="8,1,0,0"
+                                                        ClipToBounds="True">
+                                                    <Border Width="28" Height="4" CornerRadius="2"
+                                                            Background="#69daff" HorizontalAlignment="Left"
+                                                            x:Name="ShimmerBar">
+                                                        <Border.Transitions>
+                                                            <Transitions>
+                                                                <ThicknessTransition Property="Margin" Duration="0:0:1.5" Easing="SineEaseInOut"/>
+                                                            </Transitions>
+                                                        </Border.Transitions>
+                                                    </Border>
+                                                </Border>
+                                            </StackPanel>
+                                        </StackPanel>
+                                    </Border>
+                                </StackPanel>
+                            </Border>
+
+                            <!-- ══ Input Area ══ -->
+                            <Border Grid.Row="2" Padding="20,8,20,22">
+                                <StackPanel MaxWidth="760" HorizontalAlignment="Center">
+
+                                    <!-- Suggestion chips -->
+                                    <WrapPanel HorizontalAlignment="Center"
+                                               Margin="0,0,0,10"
+                                               IsVisible="{Binding !IsChatLoading}">
+                                        <Button Background="#0f1214" Foreground="#aaabad"
+                                                FontSize="11" Padding="14,8" CornerRadius="16"
+                                                BorderThickness="1" BorderBrush="#1a1d22"
+                                                Cursor="Hand" Margin="0,0,6,6"
+                                                Content="&#x26A1; PS5 Foveated Rendering"
+                                                Command="{Binding SendSuggestionCommand}"
+                                                CommandParameter="Fuehre die komplette PS5 Foveated Rendering Optimierung durch! Scanne zuerst mein gesamtes System (GPU, CPU, MSFS, Pimax, OpenXR, ReShade), dann optimiere ALLE 5 Bereiche: MSFS Grafik, Pimax VR, OpenXR VRS Foveated, OpenXR Upscaling, ReShade Schaerfe. Setze alle Werte aktiv!"/>
+                                        <Button Background="#0f1214" Foreground="#aaabad"
+                                                FontSize="11" Padding="14,8" CornerRadius="16"
+                                                BorderThickness="1" BorderBrush="#1a1d22"
+                                                Cursor="Hand" Margin="0,0,6,6"
+                                                Content="&#x1F50D; System analysieren"
+                                                Command="{Binding SendSuggestionCommand}"
+                                                CommandParameter="Scanne mein komplettes System mit allen verfuegbaren Tools: GPU Status, System Info, MSFS Config und Grafik, Pimax Headset und Settings, OpenXR Runtime und VRS Status, ReShade Effekte. Zeige mir einen detaillierten Statusbericht mit konkreten Werten."/>
+                                        <Button Background="#0f1214" Foreground="#aaabad"
+                                                FontSize="11" Padding="14,8" CornerRadius="16"
+                                                BorderThickness="1" BorderBrush="#1a1d22"
+                                                Cursor="Hand" Margin="0,0,6,6"
+                                                Content="&#x1F97D; VR optimieren"
+                                                Command="{Binding SendSuggestionCommand}"
+                                                CommandParameter="Analysiere meine aktuelle Pimax und OpenXR Konfiguration und optimiere alles fuer MSFS 2024 VR. Setze Pimax MSFS_VR_Optimized Preset, konfiguriere OpenXR VRS Foveated Rendering und aktiviere ReShade CAS Schaerfe. Fuehre alle Aenderungen aktiv durch!"/>
+                                        <Button Background="#0f1214" Foreground="#aaabad"
+                                                FontSize="11" Padding="14,8" CornerRadius="16"
+                                                BorderThickness="1" BorderBrush="#1a1d22"
+                                                Cursor="Hand" Margin="0,0,0,6"
+                                                Content="&#x1F3AE; Ruckler beheben"
+                                                Command="{Binding SendSuggestionCommand}"
+                                                CommandParameter="Ich habe Ruckler in MSFS 2024 VR. Scanne GPU Status, MSFS Grafik, Pimax Settings und OpenXR. Finde die Ursache und behebe sie indem du die Einstellungen aktiv anpasst fuer fluessiges VR mit gutem Bild."/>
+                                    </WrapPanel>
+
+                                    <!-- Input pill (ChatGPT-style) -->
+                                    <Border Background="#0f1214" CornerRadius="26"
+                                            BorderThickness="1" BorderBrush="#1a1d22"
+                                            Padding="20,4,6,4"
+                                            BoxShadow="0 4 24 0 #28000000">
+                                        <Grid ColumnDefinitions="*,Auto" VerticalAlignment="Center">
+                                            <TextBox Grid.Column="0"
+                                                     Text="{Binding ChatInput}"
+                                                     PlaceholderText="Schreib eine Nachricht..."
+                                                     MinHeight="50"
+                                                     FontSize="14"
+                                                     Background="Transparent"
+                                                     Foreground="#eeeef0"
+                                                     CaretBrush="#69daff"
+                                                     BorderThickness="0"
+                                                     VerticalContentAlignment="Center"/>
+                                            <Button Grid.Column="1"
+                                                    Width="42" Height="42"
+                                                    CornerRadius="21"
+                                                    Background="#69daff" Foreground="#003040"
+                                                    BorderThickness="0" Cursor="Hand" Padding="0"
+                                                    HorizontalContentAlignment="Center"
+                                                    VerticalContentAlignment="Center"
+                                                    Command="{Binding SendChatMessageCommand}">
+                                                <TextBlock Text="&#x2191;" FontSize="22" FontWeight="Bold"
+                                                           HorizontalAlignment="Center"
+                                                           VerticalAlignment="Center"/>
+                                            </Button>
+                                        </Grid>
+                                    </Border>
+
+                                    <!-- Footer -->
+                                    <TextBlock Text="Game Copilot  ·  Ollama lokal  ·  Keine Cloud"
+                                               FontSize="10" Foreground="#1e2124"
+                                               HorizontalAlignment="Center"
+                                               Margin="0,8,0,0" LetterSpacing="1"/>
+                                </StackPanel>
+                            </Border>
+
+                        </Grid>
+                    </Panel>
+
+
+                    <!-- ===== UPDATES PAGE =====
+                         Real GitHub release data from Bennidesign2003/GodotRenderingAI
+                    -->
+                    <Panel IsVisible="{Binding CurrentPage, Converter={x:Static conv:PageVisibleConverter.Instance}, ConverterParameter=Updates}">
+                        <Grid RowDefinitions="Auto,*">
+                            <!-- Row 0: Page Header -->
+                            <Grid Grid.Row="0" ColumnDefinitions="*,Auto" Margin="40,20,40,0">
+                                <StackPanel Grid.Column="0">
+                                    <TextBlock Text="SYSTEM UPDATES" FontSize="38" FontWeight="Bold"
+                                               Foreground="#eeeef0" Margin="0,0,0,8"/>
+                                    <Border Background="#111416" CornerRadius="12" Padding="10,6"
+                                            HorizontalAlignment="Left"
+                                            BorderBrush="#2069daff" BorderThickness="1">
+                                        <StackPanel Orientation="Horizontal" Spacing="8">
+                                            <Ellipse Width="8" Height="8" Fill="#69daff"/>
+                                            <TextBlock Text="{Binding CurrentVersionDisplay}" FontSize="11"
+                                                       Foreground="#69daff" VerticalAlignment="Center"/>
+                                            <TextBlock Text=" - " FontSize="11" Foreground="#aaabad"
+                                                       VerticalAlignment="Center"/>
+                                            <TextBlock Text="{Binding UpdateStatusText}" FontSize="11"
+                                                       Foreground="#69daff" VerticalAlignment="Center"
+                                                       LetterSpacing="1"/>
+                                        </StackPanel>
+                                    </Border>
+                                </StackPanel>
+                                <!-- Buttons -->
+                                <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="12"
+                                            VerticalAlignment="Top">
+                                    <!-- Download button (only when update available) -->
+                                    <Button Classes="modern" Height="44" FontSize="12"
+                                            Padding="24,0"
+                                            Content="DOWNLOAD UPDATE"
+                                            Command="{Binding DownloadUpdateCommand}"
+                                            IsVisible="{Binding IsUpdateAvailable}"
+                                            IsEnabled="{Binding !IsDownloading}"/>
+                                    <Button Classes="modern" Height="44" FontSize="12"
+                                            Padding="24,0"
+                                            Content="CHECK FOR UPDATES"
+                                            Command="{Binding CheckForUpdatesCommand}"
+                                            IsEnabled="{Binding !IsCheckingUpdates}"/>
+                                </StackPanel>
+                            </Grid>
+
+                            <!-- Row 1: Scrollable Content -->
+                            <ScrollViewer Grid.Row="1" Padding="40,20,40,40">
+                                <StackPanel>
+
+                                    <!-- ── Status Canvas (Asymmetric) ── -->
+                                    <Grid ColumnDefinitions="8*,4*" Margin="0,0,0,32">
+
+                                        <!-- Hero Update Card -->
+                                        <Border Grid.Column="0" Background="#111416" CornerRadius="12"
+                                                Margin="0,0,16,0" ClipToBounds="True">
+                                            <Panel>
+                                                <Border CornerRadius="12" IsHitTestVisible="False">
+                                                    <Border.Background>
+                                                        <LinearGradientBrush StartPoint="0%,0%" EndPoint="100%,0%">
+                                                            <GradientStop Color="#111416" Offset="0.0"/>
+                                                            <GradientStop Color="#00111416" Offset="1.0"/>
+                                                        </LinearGradientBrush>
+                                                    </Border.Background>
+                                                </Border>
+                                                <StackPanel Margin="32,28" MaxWidth="460">
+                                                    <TextBlock Text="CURRENT STATUS" FontSize="10" FontWeight="Bold"
+                                                               Foreground="#69daff" LetterSpacing="3"
+                                                               Margin="0,0,0,12"/>
+                                                    <TextBlock Text="Your Copilot is running the latest architecture."
+                                                               FontSize="26" FontWeight="Bold" Foreground="#eeeef0"
+                                                               TextWrapping="Wrap" LineHeight="34"
+                                                               Margin="0,0,0,12"/>
+                                                    <TextBlock Text="All performance algorithms and hardware drivers for the Pimax Crystal series are fully optimized and operational."
+                                                               FontSize="13" Foreground="#aaabad" TextWrapping="Wrap"
+                                                               LineHeight="20" Margin="0,0,0,20"/>
+
+                                                    <!-- Download progress bar (visible during download) -->
+                                                    <StackPanel IsVisible="{Binding IsDownloading}" Margin="0,0,0,16">
+                                                        <TextBlock Text="{Binding DownloadStatusText}" FontSize="10"
+                                                                   Foreground="#69daff" LetterSpacing="1"
+                                                                   Margin="0,0,0,6"/>
+                                                        <Border Height="4" CornerRadius="2" Background="#232629">
+                                                            <Border Height="4" CornerRadius="2" Background="#69daff"
+                                                                    HorizontalAlignment="Left"
+                                                                    Width="{Binding DownloadProgress, Converter={x:Static conv:BarWidthConverter.Instance}, ConverterParameter=400}"/>
+                                                        </Border>
+                                                    </StackPanel>
+
+                                                    <!-- Info row -->
+                                                    <StackPanel Orientation="Horizontal" Spacing="24">
+                                                        <StackPanel>
+                                                            <TextBlock Text="LAST CHECK" FontSize="9"
+                                                                       Foreground="#aaabad" LetterSpacing="1"
+                                                                       Margin="0,0,0,4"/>
+                                                            <TextBlock Text="{Binding LastUpdateCheck}" FontSize="13"
+                                                                       Foreground="#eeeef0"/>
+                                                        </StackPanel>
+                                                        <Border Width="1" Height="32" Background="#2046484a"/>
+                                                        <StackPanel>
+                                                            <TextBlock Text="LATEST" FontSize="9"
+                                                                       Foreground="#aaabad" LetterSpacing="1"
+                                                                       Margin="0,0,0,4"/>
+                                                            <TextBlock Text="{Binding LatestVersionDisplay}" FontSize="13"
+                                                                       Foreground="#eeeef0"/>
+                                                        </StackPanel>
+                                                        <Border Width="1" Height="32" Background="#2046484a"/>
+                                                        <StackPanel>
+                                                            <TextBlock Text="INSTALLED" FontSize="9"
+                                                                       Foreground="#aaabad" LetterSpacing="1"
+                                                                       Margin="0,0,0,4"/>
+                                                            <TextBlock Text="{Binding CurrentVersionDisplay}" FontSize="13"
+                                                                       Foreground="#eeeef0"/>
+                                                        </StackPanel>
+                                                    </StackPanel>
+                                                </StackPanel>
+                                            </Panel>
+                                        </Border>
+
+                                        <!-- Side Info Panels -->
+                                        <StackPanel Grid.Column="1" Spacing="16">
+                                            <Border Background="#1d2023" Padding="20,16"
+                                                    BorderThickness="2,0,0,0" BorderBrush="#69daff">
+                                                <StackPanel>
+                                                    <TextBlock Text="SYSTEM INTEGRITY" FontSize="11" FontWeight="Bold"
+                                                               Foreground="#eeeef0" LetterSpacing="1"
+                                                               Margin="0,0,0,8"/>
+                                                    <TextBlock Text="All modules verified against checksum. No anomalies detected."
+                                                               FontSize="11" Foreground="#aaabad" TextWrapping="Wrap"
+                                                               LineHeight="18"/>
+                                                </StackPanel>
+                                            </Border>
+                                            <Border Background="#111416" CornerRadius="8" Padding="20,16"
+                                                    BorderBrush="#1046484a" BorderThickness="1">
+                                                <StackPanel>
+                                                    <TextBlock Text="UPDATE SOURCE" FontSize="9" FontWeight="Bold"
+                                                               Foreground="#eeeef0" LetterSpacing="3"
+                                                               Margin="0,0,0,14"/>
+                                                    <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,10">
+                                                        <TextBlock Text="Repository" FontSize="11"
+                                                                   Foreground="#aaabad"/>
+                                                        <TextBlock Grid.Column="1" Text="GitHub" FontSize="11"
+                                                                   FontWeight="Bold" Foreground="#69daff"/>
+                                                    </Grid>
+                                                    <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,10">
+                                                        <TextBlock Text="Channel" FontSize="11"
+                                                                   Foreground="#aaabad"/>
+                                                        <TextBlock Grid.Column="1" Text="MSFS24" FontSize="11"
+                                                                   FontWeight="Bold" Foreground="#69daff"/>
+                                                    </Grid>
+                                                    <Grid ColumnDefinitions="*,Auto">
+                                                        <TextBlock Text="Asset" FontSize="11"
+                                                                   Foreground="#aaabad"/>
+                                                        <TextBlock Grid.Column="1" Text="update.json" FontSize="11"
+                                                                   FontWeight="Bold" Foreground="#69daff"/>
+                                                    </Grid>
+                                                </StackPanel>
+                                            </Border>
+                                        </StackPanel>
+                                    </Grid>
+
+                                    <!-- ── CHRONOLOGY Section (dynamic from GitHub releases) ── -->
+                                    <Grid ColumnDefinitions="Auto,*,Auto" Margin="0,0,0,24">
+                                        <TextBlock Grid.Column="0" Text="CHRONOLOGY" FontSize="20" FontWeight="Bold"
+                                                   Foreground="#eeeef0" LetterSpacing="3"/>
+                                        <Border Grid.Column="1" Height="1" Background="#1046484a"
+                                                Margin="20,0" VerticalAlignment="Center"/>
+                                        <TextBlock Grid.Column="2" Text="GITHUB RELEASES" FontSize="9"
+                                                   Foreground="#aaabad" LetterSpacing="3"
+                                                   VerticalAlignment="Center"/>
+                                    </Grid>
+
+                                    <!-- Dynamic release entries from GitHub API -->
+                                    <ItemsControl ItemsSource="{Binding Releases}">
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate>
+                                                <Border Background="#111416" CornerRadius="4" Padding="28,24"
+                                                        Margin="0,0,0,6">
+                                                    <Grid ColumnDefinitions="160,*">
+                                                        <StackPanel Grid.Column="0">
+                                                            <TextBlock Text="{Binding TagName}" FontSize="22"
+                                                                       FontWeight="Bold" Foreground="#69daff"/>
+                                                            <TextBlock Text="{Binding Label}" FontSize="9"
+                                                                       Foreground="#aaabad" LetterSpacing="2"
+                                                                       Margin="0,4,0,0"/>
+                                                            <TextBlock Text="{Binding Date}" FontSize="11"
+                                                                       Foreground="#55aaabad" Margin="0,12,0,0"
+                                                                       FontStyle="Italic"/>
+                                                        </StackPanel>
+                                                        <StackPanel Grid.Column="1">
+                                                            <TextBlock Text="{Binding Title}" FontSize="15"
+                                                                       FontWeight="Bold" Foreground="#eeeef0"
+                                                                       LetterSpacing="0.5" Margin="0,0,0,14"/>
+                                                            <!-- Changelog items -->
+                                                            <ItemsControl ItemsSource="{Binding Changes}">
+                                                                <ItemsControl.ItemTemplate>
+                                                                    <DataTemplate>
+                                                                        <StackPanel Orientation="Horizontal"
+                                                                                    Margin="0,0,0,8">
+                                                                            <Ellipse Width="5" Height="5"
+                                                                                     Fill="#69daff"
+                                                                                     Margin="0,5,10,0"
+                                                                                     VerticalAlignment="Top"/>
+                                                                            <TextBlock Text="{Binding}"
+                                                                                       FontSize="12"
+                                                                                       Foreground="#aaabad"
+                                                                                       TextWrapping="Wrap"/>
+                                                                        </StackPanel>
+                                                                    </DataTemplate>
+                                                                </ItemsControl.ItemTemplate>
+                                                            </ItemsControl>
+                                                            <!-- Show body as fallback when no bullet changes -->
+                                                            <TextBlock Text="{Binding Body}" FontSize="12"
+                                                                       Foreground="#80aaabad" TextWrapping="Wrap"
+                                                                       LineHeight="20"
+                                                                       IsVisible="{Binding !Changes.Count}"/>
+                                                        </StackPanel>
+                                                    </Grid>
+                                                </Border>
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
+
+                                    <!-- Empty state when no releases loaded yet -->
+                                    <Border Background="#111416" CornerRadius="8" Padding="40,32"
+                                            HorizontalAlignment="Center"
+                                            IsVisible="{Binding !Releases.Count}">
+                                        <StackPanel HorizontalAlignment="Center">
+                                            <TextBlock Text="Click CHECK FOR UPDATES to load release history"
+                                                       FontSize="13" Foreground="#aaabad"
+                                                       HorizontalAlignment="Center"/>
+                                        </StackPanel>
+                                    </Border>
+
+                                </StackPanel>
+                            </ScrollViewer>
+                        </Grid>
+
+                        <!-- Toast Notification (bottom-right overlay) -->
+                        <Border IsVisible="{Binding ToastVisible}"
+                                HorizontalAlignment="Right" VerticalAlignment="Bottom"
+                                Margin="0,0,32,24" Background="#1d2023"
+                                CornerRadius="8" Padding="16,12"
+                                BorderBrush="#3069daff" BorderThickness="1">
+                            <StackPanel Orientation="Horizontal" Spacing="12">
+                                <TextBlock Text="&#10004;" FontSize="20" Foreground="#69daff"
+                                           VerticalAlignment="Center"/>
+                                <StackPanel VerticalAlignment="Center">
+                                    <TextBlock Text="{Binding ToastTitle}" FontSize="11" FontWeight="Bold"
+                                               Foreground="#eeeef0" LetterSpacing="1"/>
+                                    <TextBlock Text="{Binding ToastMessage}" FontSize="10"
+                                               Foreground="#aaabad"/>
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+                    </Panel>
+
+
+
+                    </Panel>
+                </Grid>
+            </Grid>
+
+        </Panel>
+    </Border>
+</Window>

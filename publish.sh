@@ -14,7 +14,7 @@ set -e
 # ============================================================
 
 REPO="Bennidesign2003/GodotRenderingAI"
-VERSION="3.5.3"
+VERSION="3.5.4"
 TAG="v${VERSION}"
 PROJECT_DIR="$(cd "$(dirname "$0")/GameCopilot" && pwd)"
 PUBLISH_DIR="${PROJECT_DIR}/bin/publish"
@@ -90,12 +90,12 @@ cat > "${UPDATE_JSON}" <<EOF
   "LatestVersion": "${VERSION}",
   "DownloadUrl": "${DOWNLOAD_URL}",
   "Changelog": [
-    "MCP-Server wird beim App-Start vorgewaermt - erste Tool-Antwort ist sofort schnell",
-    "Halluzinationen behoben: Kontext-Fenster auf 16k erhoeht (war 8k zu klein bei 14 Tools - Modell verlor Historie und erfand Werte)",
-    "Tool-Auswahl deterministischer (temperature 0.1), finale Antwort natuerlicher (temperature 0.65)",
-    "Erweiterte Tool-Hinweise im System-Prompt: diagnose_msfs_config, set_msfs_setting, fix_msfs, check_and_install_driver",
-    "Klare Fehlermeldung statt leerer Bubble wenn der Agent nach 15 Tool-Runden ohne Antwort endet",
-    "Live-Streaming Indikator (typing dots) waehrend die Antwort eintrifft",
+    "HOTFIX: App-Crash beim Start in 3.5.3 behoben (FormatException 'Easing Linear was not found')",
+    "(aus 3.5.3) MCP-Server wird beim App-Start vorgewaermt",
+    "(aus 3.5.3) Halluzinationen behoben durch groesseres Kontext-Fenster (16k)",
+    "(aus 3.5.3) Tool-Auswahl deterministischer (temperature 0.1), finale Antwort natuerlicher (0.65)",
+    "(aus 3.5.3) Klare Fehlermeldung wenn der Agent nach 15 Tool-Runden ohne Antwort endet",
+    "(aus 3.5.3) Live-Streaming Indikator (typing dots) waehrend die Antwort eintrifft",
     "(aus 3.5.2) Neue Modelle: Qwen 3, Qwen 2.5 Coder, GPT-OSS, Llama 3.3, Gemma 3",
     "(aus 3.5.2) Auto-Modellwahl basierend auf erkanntem VRAM",
     "(aus 3.5.2) Modell bleibt 30 Min im VRAM zwischen Fragen (keep_alive)",
@@ -138,27 +138,25 @@ else
         "${UPDATE_JSON}" \
         --repo "${REPO}" \
         --title "GameCopilot ${VERSION}" \
-        --notes "## GameCopilot ${VERSION}
+        --notes "## GameCopilot ${VERSION} — Hotfix
 
-Stabilitaet, Geschwindigkeit und Antwort-Qualitaet weiter verbessert auf Basis von 3.5.2.
+**3.5.3 stuerzt beim Start ab** (\`FormatException: Easing 'Linear' was not found\`). Bitte direkt auf 3.5.4 updaten.
 
-### Bugfixes
-- **Halluzinationen weg**: Kontext-Fenster bei aktivierten Tools von 8192 auf 16384 Tokens erhoeht. Mit 14 Tool-Schemas (~5000 Tokens) lief das Fenster im Tool-Modus still ueber - das Modell verlor Historie und erfand Werte
-- **Klare Fehlermeldung** statt leerer Bubble wenn der Agent alle 15 Tool-Runden braucht ohne fertig zu werden
+### Hotfix
+- Streaming-Cursor-Animation in MainWindow.axaml verwendete \`Easing=\"Linear\"\` - Avalonia erwartet aber \`LinearEasing\` (Suffix). Der XAML-Compiler hat das durchgelassen, weil \`Easing.Parse\` erst zur Laufzeit aufgeloest wird, und die App ist daher in 3.5.3 sofort beim Window-Init gecrasht.
 
-### Schneller
-- **MCP-Server vorgewaermt**: Wird waehrend des Splash-Screens schon im Hintergrund gestartet. Erste Tool-Anfrage ist sofort schnell statt nach 5-10s Cold-Start
-- **Streaming-Indikator**: Typing-Dots erscheinen ab dem ersten Token
-
-### Professioneller
-- **Tool-Auswahl mit temperature 0.1** (deterministisch, gleiche Frage liefert gleiche Tools)
-- **Finale Antwort mit temperature 0.65** (natuerlicher Sprachfluss)
-- **System-Prompt erweitert** mit Hinweisen auf \`diagnose_msfs_config\`, \`set_msfs_setting\`, \`fix_msfs\`, \`check_and_install_driver\`
+### Aus 3.5.3 (jetzt nutzbar)
+- MCP-Server wird waehrend des Splash-Screens vorgewaermt (erste Tool-Anfrage sofort schnell)
+- Halluzinationen behoben durch groesseres Kontext-Fenster (\`num_ctx\` 8192 → 16384) im Tool-Modus
+- Tool-Auswahl deterministischer (temperature 0.1), finale Antwort natuerlicher (temperature 0.65)
+- System-Prompt erweitert um \`diagnose_msfs_config\`, \`set_msfs_setting\`, \`fix_msfs\`, \`check_and_install_driver\`
+- Klare Fehlermeldung wenn der Agent alle 15 Tool-Runden braucht ohne fertig zu werden
+- Streaming-Indikator (typing dots) ab dem ersten Token
 
 ### Aus 3.5.2
 - Neue Modelle: Qwen 3 (4B/8B/14B/30B-MoE/32B), Qwen 2.5 Coder (7B/14B/32B), GPT-OSS 20B/120B, Llama 3.3 70B, Gemma 3 12B/27B
 - Auto-Modellwahl basierend auf erkanntem VRAM
-- keep_alive 30m haelt Modell zwischen Fragen im VRAM
+- \`keep_alive 30m\` haelt Modell zwischen Fragen im VRAM
 - Streaming auch im Tool-Modus, finale Antwort Wort-fuer-Wort statt 30s Spinner
 - Komplett neu geschriebener System-Prompt (Identitaet / Stil / Ehrlichkeit / Tools)"
 fi
