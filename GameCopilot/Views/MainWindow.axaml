@@ -10,7 +10,7 @@
         x:Class="GameCopilot.Views.MainWindow"
         x:DataType="vm:MainWindowViewModel"
         Icon="/Assets/app-icon.ico"
-        Title="MSFS24 Game Copilot"
+        Title="{Binding WindowTitle}"
         Width="1600" Height="900"
         MinWidth="1200" MinHeight="700"
         Background="Transparent"
@@ -203,6 +203,66 @@
                     </KeyFrame>
                     <KeyFrame Cue="100%">
                         <Setter Property="Opacity" Value="0"/>
+                    </KeyFrame>
+                </Animation>
+            </Style.Animations>
+        </Style>
+
+        <!-- Agent step entrance: slide up + fade in -->
+        <Style Selector="Border.agent-step-row">
+            <Style.Animations>
+                <Animation Duration="0:0:0.3" FillMode="Both" Easing="CubicEaseOut">
+                    <KeyFrame Cue="0%">
+                        <Setter Property="Opacity" Value="0"/>
+                        <Setter Property="TranslateTransform.Y" Value="6"/>
+                    </KeyFrame>
+                    <KeyFrame Cue="100%">
+                        <Setter Property="Opacity" Value="1"/>
+                        <Setter Property="TranslateTransform.Y" Value="0"/>
+                    </KeyFrame>
+                </Animation>
+            </Style.Animations>
+        </Style>
+
+        <!-- Spinning ring for active (not-yet-complete) step -->
+        <Style Selector="Border.step-spinner">
+            <Style.Animations>
+                <Animation Duration="0:0:1.1" IterationCount="INFINITE" Easing="Linear">
+                    <KeyFrame Cue="0%">
+                        <Setter Property="RotateTransform.Angle" Value="0"/>
+                    </KeyFrame>
+                    <KeyFrame Cue="100%">
+                        <Setter Property="RotateTransform.Angle" Value="360"/>
+                    </KeyFrame>
+                </Animation>
+            </Style.Animations>
+        </Style>
+
+        <!-- Inner dot pulse for active step -->
+        <Style Selector="Border.step-dot-pulse">
+            <Style.Animations>
+                <Animation Duration="0:0:0.75" IterationCount="INFINITE" PlaybackDirection="Alternate" Easing="SineEaseInOut">
+                    <KeyFrame Cue="0%">
+                        <Setter Property="Opacity" Value="1"/>
+                    </KeyFrame>
+                    <KeyFrame Cue="100%">
+                        <Setter Property="Opacity" Value="0.25"/>
+                    </KeyFrame>
+                </Animation>
+            </Style.Animations>
+        </Style>
+
+        <!-- Green check pop-in when step completes -->
+        <Style Selector="Border.step-done">
+            <Style.Animations>
+                <Animation Duration="0:0:0.25" FillMode="Both" Easing="BackEaseOut">
+                    <KeyFrame Cue="0%">
+                        <Setter Property="ScaleTransform.ScaleX" Value="0"/>
+                        <Setter Property="ScaleTransform.ScaleY" Value="0"/>
+                    </KeyFrame>
+                    <KeyFrame Cue="100%">
+                        <Setter Property="ScaleTransform.ScaleX" Value="1"/>
+                        <Setter Property="ScaleTransform.ScaleY" Value="1"/>
                     </KeyFrame>
                 </Animation>
             </Style.Animations>
@@ -432,6 +492,19 @@
                                 </StackPanel>
                             </Button>
 
+                            <!-- Einstellungen -->
+                            <Button Classes="nav" HorizontalAlignment="Stretch"
+                                    Command="{Binding NavigateSettingsCommand}"
+                                    Background="{Binding IsSettingsActive, Converter={x:Static conv:NavBgConverter.Instance}}"
+                                    Foreground="{Binding IsSettingsActive, Converter={x:Static conv:NavFgConverter.Instance}}"
+                                    BorderBrush="{Binding IsSettingsActive, Converter={x:Static conv:NavBgConverter.Instance}}"
+                                    BorderThickness="0,0,2,0">
+                                <StackPanel Orientation="Horizontal" Spacing="12">
+                                    <TextBlock Text="&#9881;" FontSize="18" VerticalAlignment="Center"/>
+                                    <TextBlock Text="Einstellungen" FontSize="13" VerticalAlignment="Center"/>
+                                </StackPanel>
+                            </Button>
+
                             <!-- AI Chat -->
                             <Button Classes="nav" HorizontalAlignment="Stretch"
                                     Command="{Binding NavigateAiChatCommand}"
@@ -500,10 +573,12 @@
                                         </StackPanel>
                                         <Border Width="1" Height="12" Background="#46484a"/>
                                         <StackPanel Orientation="Horizontal" Spacing="4">
-                                            <TextBlock Text="&#9670;" FontSize="11" Foreground="#17c0fd"
+                                            <!-- Ollama live status dot: green=connected, red=offline, yellow=checking -->
+                                            <Ellipse Width="7" Height="7" VerticalAlignment="Center"
+                                                     Fill="{Binding OllamaConnDotColor}"/>
+                                            <TextBlock Text="{Binding OllamaConnDisplayText}"
+                                                       FontSize="11" Foreground="#eeeef0"
                                                        VerticalAlignment="Center"/>
-                                            <TextBlock Text="{Binding OllamaStatus}" FontSize="11"
-                                                       Foreground="#eeeef0" VerticalAlignment="Center"/>
                                         </StackPanel>
                                     </StackPanel>
                                 </Border>
@@ -1462,7 +1537,7 @@
 
                     <!-- ===== AI CHAT PAGE ===== -->
                     <Panel IsVisible="{Binding CurrentPage, Converter={x:Static conv:PageVisibleConverter.Instance}, ConverterParameter=AiChat}">
-                        <Grid RowDefinitions="54,*,Auto">
+                        <Grid RowDefinitions="54,Auto,*,Auto">
 
                             <!-- ══ Top Bar ══ -->
                             <Border Grid.Row="0"
@@ -1474,10 +1549,22 @@
                                     <StackPanel Grid.Column="0" Orientation="Horizontal"
                                                 Spacing="8" VerticalAlignment="Center">
                                         <Ellipse Width="7" Height="7" Fill="#4ade80"/>
-                                        <TextBlock Text="{Binding SelectedChatModel.Label}"
+                                        <!-- Ollama model info (local) -->
+                                        <TextBlock IsVisible="{Binding !IsCodexSelected}"
+                                                   Text="{Binding SelectedChatModel.Label}"
                                                    FontSize="13" Foreground="#eeeef0"
                                                    FontWeight="SemiBold" VerticalAlignment="Center"/>
-                                        <TextBlock Text="{Binding SelectedChatModel.Size}"
+                                        <TextBlock IsVisible="{Binding !IsCodexSelected}"
+                                                   Text="{Binding SelectedChatModel.Size}"
+                                                   FontSize="11" Foreground="#3a3d40"
+                                                   VerticalAlignment="Center"/>
+                                        <!-- Codex model info (cloud) -->
+                                        <TextBlock IsVisible="{Binding IsCodexSelected}"
+                                                   Text="{Binding SelectedCodexModel}"
+                                                   FontSize="13" Foreground="#69daff"
+                                                   FontWeight="SemiBold" VerticalAlignment="Center"/>
+                                        <TextBlock IsVisible="{Binding IsCodexSelected}"
+                                                   Text="Cloud"
                                                    FontSize="11" Foreground="#3a3d40"
                                                    VerticalAlignment="Center"/>
                                     </StackPanel>
@@ -1486,12 +1573,40 @@
                                                FontSize="11" FontWeight="Bold"
                                                Foreground="#2a2d30" LetterSpacing="5"
                                                VerticalAlignment="Center" HorizontalAlignment="Center"/>
-                                    <!-- Right: MCP + switch -->
+                                    <!-- Right: provider toggle + MCP status + model switch -->
                                     <StackPanel Grid.Column="2" Orientation="Horizontal"
                                                 HorizontalAlignment="Right" VerticalAlignment="Center"
-                                                Spacing="16">
+                                                Spacing="12">
+                                        <!-- Provider pills (active pill uses NavBgConverter/NavFgConverter pattern) -->
+                                        <Border Background="#0c0e11" CornerRadius="8"
+                                                BorderThickness="1" BorderBrush="#1a1d22"
+                                                Padding="3,3">
+                                            <StackPanel Orientation="Horizontal" Spacing="2">
+                                                <!-- Local pill — active when !IsCodexSelected -->
+                                                <Button Content="🖥 Lokal"
+                                                        FontSize="10" FontWeight="SemiBold"
+                                                        Padding="10,5" CornerRadius="6"
+                                                        BorderThickness="1"
+                                                        Cursor="Hand"
+                                                        Command="{Binding SetProviderLocalCommand}"
+                                                        Background="{Binding !IsCodexSelected, Converter={x:Static conv:NavBgConverter.Instance}}"
+                                                        Foreground="{Binding !IsCodexSelected, Converter={x:Static conv:NavFgConverter.Instance}}"
+                                                        BorderBrush="{Binding !IsCodexSelected, Converter={x:Static conv:NavBgConverter.Instance}}"/>
+                                                <!-- Codex pill — active when IsCodexSelected -->
+                                                <Button Content="⚡ Codex"
+                                                        FontSize="10" FontWeight="SemiBold"
+                                                        Padding="10,5" CornerRadius="6"
+                                                        BorderThickness="1"
+                                                        Cursor="Hand"
+                                                        Command="{Binding SetProviderCodexCommand}"
+                                                        Background="{Binding IsCodexSelected, Converter={x:Static conv:NavBgConverter.Instance}}"
+                                                        Foreground="{Binding IsCodexSelected, Converter={x:Static conv:NavFgConverter.Instance}}"
+                                                        BorderBrush="{Binding IsCodexSelected, Converter={x:Static conv:NavBgConverter.Instance}}"/>
+                                            </StackPanel>
+                                        </Border>
                                         <TextBlock Text="{Binding McpStatus}" FontSize="10"
-                                                   Foreground="#69daff" VerticalAlignment="Center"/>
+                                                   Foreground="#69daff" VerticalAlignment="Center"
+                                                   IsVisible="{Binding !IsCodexSelected}"/>
                                         <Button Content="Modell wechseln"
                                                 FontSize="10" FontWeight="SemiBold"
                                                 Padding="14,6" CornerRadius="6"
@@ -1499,12 +1614,21 @@
                                                 BorderThickness="1" BorderBrush="#1d2023"
                                                 Cursor="Hand"
                                                 Command="{Binding ShowModelSelectorCommand}"/>
+                                        <!-- Clear chat -->
+                                        <Button Content="🗑"
+                                                FontSize="14"
+                                                Width="30" Height="30" CornerRadius="6"
+                                                Background="Transparent" Foreground="#3a3d40"
+                                                BorderThickness="0" Cursor="Hand" Padding="0"
+                                                ToolTip.Tip="Chat leeren"
+                                                Command="{Binding ClearChatCommand}"
+                                                IsVisible="{Binding !NoMessages}"/>
                                     </StackPanel>
                                 </Grid>
                             </Border>
 
                             <!-- ══ Model Picker Overlay ══ -->
-                            <Border Grid.Row="0" Grid.RowSpan="3"
+                            <Border Grid.Row="0" Grid.RowSpan="4"
                                     Background="#08090b" ZIndex="10"
                                     IsVisible="{Binding ShowModelPicker}">
                                 <ScrollViewer HorizontalScrollBarVisibility="Disabled">
@@ -1644,12 +1768,148 @@
                                 </ScrollViewer>
                             </Border>
 
+                            <!-- ══ Codex API Key Panel (Row 1, hidden when key set or local selected) ══ -->
+                            <Border Grid.Row="1"
+                                    Background="#080d10"
+                                    BorderThickness="0,0,0,1" BorderBrush="#0f1a1f"
+                                    Padding="24,10"
+                                    IsVisible="{Binding IsCodexSelected}">
+                                <Grid ColumnDefinitions="*,Auto,Auto" RowDefinitions="Auto,Auto">
+                                    <!-- API key input row -->
+                                    <StackPanel Grid.Row="0" Grid.Column="0"
+                                                Orientation="Horizontal" Spacing="10"
+                                                VerticalAlignment="Center">
+                                        <TextBlock Text="OpenAI API Key:"
+                                                   FontSize="11" Foreground="#5a6268"
+                                                   VerticalAlignment="Center"/>
+                                        <Border Background="#0c1014" CornerRadius="8"
+                                                BorderThickness="1"
+                                                BorderBrush="{Binding CodexApiKeyMissing, Converter={x:Static conv:BoolToShaderColorConverter.Instance}}"
+                                                Padding="4,2">
+                                            <StackPanel Orientation="Horizontal">
+                                                <TextBox Text="{Binding CodexApiKey}"
+                                                         PlaceholderText="sk-..."
+                                                         PasswordChar="{Binding ShowApiKeyText, Converter={x:Static conv:PasswordCharConverter.Instance}}"
+                                                         Width="220"
+                                                         FontSize="12"
+                                                         Background="Transparent"
+                                                         Foreground="#ccced0"
+                                                         CaretBrush="#69daff"
+                                                         BorderThickness="0"
+                                                         Padding="8,4"
+                                                         VerticalContentAlignment="Center"/>
+                                                <!-- Show/Hide toggle -->
+                                                <Button Width="30" Height="30" Padding="0"
+                                                        Background="Transparent" BorderThickness="0"
+                                                        Cursor="Hand" VerticalAlignment="Center"
+                                                        ToolTip.Tip="Key anzeigen/verbergen"
+                                                        Command="{Binding ToggleApiKeyVisibilityCommand}">
+                                                    <TextBlock FontSize="14" VerticalAlignment="Center"
+                                                               HorizontalAlignment="Center"
+                                                               Text="{Binding ShowApiKeyText, Converter={x:Static conv:EyeIconConverter.Instance}}"/>
+                                                </Button>
+                                                <!-- Save confirmation button -->
+                                                <Button Padding="8,4" Margin="4,0" CornerRadius="6"
+                                                        Background="#1a2a1a" BorderThickness="0"
+                                                        Cursor="Hand" VerticalAlignment="Center"
+                                                        Command="{Binding SaveCodexKeyWithConfirmationCommand}">
+                                                    <StackPanel Orientation="Horizontal" Spacing="4">
+                                                        <TextBlock Text="Speichern" FontSize="11"
+                                                                   Foreground="#aaabad" VerticalAlignment="Center"/>
+                                                        <TextBlock Text="✓ Gespeichert" FontSize="11"
+                                                                   Foreground="#4ade80"
+                                                                   IsVisible="{Binding CodexKeySaved}"
+                                                                   VerticalAlignment="Center"/>
+                                                    </StackPanel>
+                                                </Button>
+                                            </StackPanel>
+                                        </Border>
+                                        <TextBlock Text="⚠ API-Key fehlt"
+                                                   FontSize="11" Foreground="#fbbf24"
+                                                   VerticalAlignment="Center"
+                                                   IsVisible="{Binding CodexApiKeyMissing}"/>
+                                    </StackPanel>
+                                    <!-- Model ComboBox -->
+                                    <StackPanel Grid.Row="0" Grid.Column="1"
+                                                Orientation="Horizontal" Spacing="8"
+                                                Margin="16,0" VerticalAlignment="Center">
+                                        <TextBlock Text="Modell:"
+                                                   FontSize="11" Foreground="#5a6268"
+                                                   VerticalAlignment="Center"/>
+                                        <ComboBox ItemsSource="{Binding CodexModelList}"
+                                                  SelectedItem="{Binding SelectedCodexModelItem}"
+                                                  Background="#0c1014"
+                                                  Foreground="#ccced0"
+                                                  BorderThickness="1" BorderBrush="#1a1d22"
+                                                  FontSize="12" Padding="10,5" MinWidth="160">
+                                            <ComboBox.ItemTemplate>
+                                                <DataTemplate>
+                                                    <StackPanel Orientation="Vertical" Spacing="2">
+                                                        <TextBlock Text="{Binding Label}"
+                                                                   FontSize="12" Foreground="#eeeef0"
+                                                                   FontWeight="SemiBold"/>
+                                                        <TextBlock Text="{Binding Description}"
+                                                                   FontSize="10" Foreground="#5a6268"
+                                                                   TextWrapping="Wrap" MaxWidth="280"/>
+                                                    </StackPanel>
+                                                </DataTemplate>
+                                            </ComboBox.ItemTemplate>
+                                        </ComboBox>
+                                    </StackPanel>
+                                </Grid>
+                            </Border>
+
+                            <!-- ══ MCP Disconnect Banner ══ -->
+                            <Border Grid.Row="2"
+                                    VerticalAlignment="Top"
+                                    ZIndex="5"
+                                    IsVisible="{Binding McpDisconnected}"
+                                    Background="#1a1200"
+                                    BorderBrush="#b45309" BorderThickness="0,0,0,1"
+                                    Padding="20,8">
+                                <Grid ColumnDefinitions="*,Auto">
+                                    <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="8"
+                                                VerticalAlignment="Center">
+                                        <TextBlock Text="⚠" FontSize="14" Foreground="#f59e0b"
+                                                   VerticalAlignment="Center"/>
+                                        <TextBlock Text="MCP Server getrennt — Echtzeit-Tools nicht verfügbar"
+                                                   FontSize="12" Foreground="#f59e0b"
+                                                   VerticalAlignment="Center"/>
+                                    </StackPanel>
+                                    <Button Grid.Column="1"
+                                            Content="Neu verbinden"
+                                            FontSize="11" FontWeight="SemiBold"
+                                            Padding="12,5" CornerRadius="6"
+                                            Background="#b45309" Foreground="White"
+                                            BorderThickness="0" Cursor="Hand"
+                                            Command="{Binding ReconnectMcpCommand}"/>
+                                </Grid>
+                            </Border>
+
                             <!-- ══ Messages ══ -->
-                            <ScrollViewer Grid.Row="1"
+                            <ScrollViewer Grid.Row="2"
                                           HorizontalScrollBarVisibility="Disabled"
                                           x:Name="ChatScrollViewer">
                                 <StackPanel MaxWidth="760" HorizontalAlignment="Center"
                                             Margin="0,28,0,16">
+
+                                    <!-- ── Empty state ── -->
+                                    <StackPanel IsVisible="{Binding NoMessages}"
+                                                HorizontalAlignment="Center"
+                                                VerticalAlignment="Center"
+                                                Spacing="12"
+                                                Margin="0,80,0,0"
+                                                Opacity="0.45">
+                                        <TextBlock Text="✈" FontSize="48"
+                                                   HorizontalAlignment="Center"
+                                                   Foreground="#69daff"/>
+                                        <TextBlock Text="Stelle eine Frage oder beschreibe ein Problem..."
+                                                   FontSize="14" Foreground="#aaabad"
+                                                   HorizontalAlignment="Center"
+                                                   TextAlignment="Center"
+                                                   TextWrapping="Wrap" MaxWidth="340"/>
+                                    </StackPanel>
+
                                     <ItemsControl ItemsSource="{Binding ChatMessages}">
                                         <ItemsControl.DataTemplates>
 
@@ -1706,42 +1966,100 @@
                                                         <!-- Content -->
                                                         <StackPanel Grid.Column="1" Spacing="0" Margin="4,0,0,0">
 
-                                                            <!-- Tool steps — compact badge row -->
+                                                            <!-- Tool steps — animated -->
                                                             <Border IsVisible="{Binding HasAgentSteps}"
-                                                                    Background="#0b0d10" CornerRadius="10"
-                                                                    Padding="14,10" Margin="0,0,0,12"
-                                                                    BorderThickness="1" BorderBrush="#161a22">
+                                                                    Margin="0,0,0,14" Padding="0,2,0,0">
                                                                 <ItemsControl ItemsSource="{Binding AgentSteps}">
                                                                     <ItemsControl.ItemTemplate>
                                                                         <DataTemplate x:DataType="models:AgentStep">
-                                                                            <Grid ColumnDefinitions="Auto,*"
-                                                                                  Margin="0,0,0,5">
-                                                                                <Border Grid.Column="0"
-                                                                                        Background="#111416"
-                                                                                        CornerRadius="5"
-                                                                                        Padding="8,4" Margin="0,0,10,0">
-                                                                                    <StackPanel Orientation="Horizontal" Spacing="5">
-                                                                                        <TextBlock Text="{Binding Icon}" FontSize="11"/>
+                                                                            <!-- Entrance: slide-up fade-in per step -->
+                                                                            <Border Classes="agent-step-row" Margin="0,0,0,6" Opacity="0">
+                                                                                <Grid ColumnDefinitions="28,*">
+
+                                                                                    <!-- Step indicator -->
+                                                                                    <Panel Grid.Column="0" Width="20" Height="20"
+                                                                                           HorizontalAlignment="Center" VerticalAlignment="Top"
+                                                                                           Margin="0,1,0,0">
+
+                                                                                        <!-- Spinning outer ring: shown while working -->
+                                                                                        <Border Classes="step-spinner"
+                                                                                                Width="18" Height="18" CornerRadius="9"
+                                                                                                BorderThickness="1.5"
+                                                                                                BorderBrush="#5569daff"
+                                                                                                IsVisible="{Binding IsWorking}">
+                                                                                            <Border.RenderTransform>
+                                                                                                <RotateTransform/>
+                                                                                            </Border.RenderTransform>
+                                                                                        </Border>
+
+                                                                                        <!-- Inner pulsing dot: shown while working -->
+                                                                                        <Border Classes="step-dot-pulse"
+                                                                                                Width="7" Height="7" CornerRadius="3.5"
+                                                                                                Background="#69daff"
+                                                                                                IsVisible="{Binding IsWorking}"/>
+
+                                                                                        <!-- Green check circle: shown when done -->
+                                                                                        <Border Classes="step-done"
+                                                                                                Width="18" Height="18" CornerRadius="9"
+                                                                                                Background="#0a2e1c"
+                                                                                                BorderBrush="#00c06e" BorderThickness="1.5"
+                                                                                                IsVisible="{Binding IsComplete}">
+                                                                                            <Border.RenderTransform>
+                                                                                                <ScaleTransform/>
+                                                                                            </Border.RenderTransform>
+                                                                                            <TextBlock Text="✓" FontSize="10" FontWeight="Bold"
+                                                                                                       Foreground="#00c06e"
+                                                                                                       HorizontalAlignment="Center"
+                                                                                                       VerticalAlignment="Center"/>
+                                                                                        </Border>
+                                                                                    </Panel>
+
+                                                                                    <!-- Text content -->
+                                                                                    <StackPanel Grid.Column="1" Margin="8,0,0,0" Spacing="3"
+                                                                                                VerticalAlignment="Center">
                                                                                         <TextBlock Text="{Binding StatusText}"
-                                                                                                   FontSize="11" Foreground="#aaabad"/>
+                                                                                                   FontSize="12" Foreground="#b0b6be"
+                                                                                                   TextWrapping="Wrap">
+                                                                                            <TextBlock.Transitions>
+                                                                                                <Transitions>
+                                                                                                    <DoubleTransition Property="Opacity" Duration="0:0:0.4"/>
+                                                                                                </Transitions>
+                                                                                            </TextBlock.Transitions>
+                                                                                        </TextBlock>
+                                                                                        <TextBlock Text="{Binding ResultSummary}"
+                                                                                                   FontSize="11" Foreground="#52aad4"
+                                                                                                   IsVisible="{Binding HasResult}"
+                                                                                                   TextWrapping="Wrap"
+                                                                                                   Opacity="0.9"/>
                                                                                     </StackPanel>
-                                                                                </Border>
-                                                                                <TextBlock Grid.Column="1"
-                                                                                           Text="{Binding ResultSummary}"
-                                                                                           FontSize="11" Foreground="#69daff"
-                                                                                           IsVisible="{Binding HasResult}"
-                                                                                           VerticalAlignment="Center"
-                                                                                           TextWrapping="Wrap"/>
-                                                                            </Grid>
+
+                                                                                </Grid>
+                                                                            </Border>
                                                                         </DataTemplate>
                                                                     </ItemsControl.ItemTemplate>
                                                                 </ItemsControl>
                                                             </Border>
 
-                                                            <!-- Response text -->
-                                                            <TextBlock Text="{Binding Content}"
-                                                                       FontSize="14" Foreground="#dde0e4"
-                                                                       TextWrapping="Wrap" LineHeight="24"/>
+                                                            <!-- Response text + copy button -->
+                                                            <Grid>
+                                                                <TextBlock Text="{Binding Content}"
+                                                                           FontSize="14" Foreground="#dde0e4"
+                                                                           TextWrapping="Wrap" LineHeight="24"
+                                                                           Margin="0,0,32,0"/>
+                                                                <!-- Copy button — top-right corner of bubble -->
+                                                                <Button Content="⧉"
+                                                                        FontSize="12"
+                                                                        Width="26" Height="26" CornerRadius="6"
+                                                                        Background="#1a1d20" Foreground="#aaabad"
+                                                                        BorderThickness="0" Cursor="Hand"
+                                                                        Padding="0"
+                                                                        HorizontalAlignment="Right"
+                                                                        VerticalAlignment="Top"
+                                                                        Margin="0,2,0,0"
+                                                                        ToolTip.Tip="Kopieren"
+                                                                        IsVisible="{Binding !IsStreaming}"
+                                                                        Click="OnCopyMessageClick"/>
+                                                            </Grid>
 
                                                             <!-- Streaming cursor -->
                                                             <TextBlock Text="▋" FontSize="14"
@@ -1749,6 +2067,31 @@
                                                                        Foreground="#69daff"
                                                                        IsVisible="{Binding IsStreaming}"
                                                                        Margin="0,2,0,0"/>
+
+                                                            <!-- MCP Update Prompt Card -->
+                                                            <Border IsVisible="{Binding IsUpdatePrompt}"
+                                                                    Background="#0d2540" BorderBrush="#2563EB" BorderThickness="1"
+                                                                    CornerRadius="12" Padding="4,10,4,4" Margin="0,8,0,0">
+                                                                <StackPanel Orientation="Horizontal" Spacing="8"
+                                                                            IsVisible="{Binding !UpdateDismissed}">
+                                                                    <Button Content="✅ Ja, jetzt updaten"
+                                                                            Command="{Binding $parent[Window].DataContext.ConfirmMcpUpdateCommand}"
+                                                                            CommandParameter="{Binding}"
+                                                                            Background="#2563EB" Foreground="White"
+                                                                            CornerRadius="8" Padding="12,8"
+                                                                            Cursor="Hand"
+                                                                            FontSize="13" FontWeight="SemiBold"
+                                                                            BorderThickness="0"/>
+                                                                    <Button Content="✖ Nein, danke"
+                                                                            Command="{Binding $parent[Window].DataContext.DismissMcpUpdateCommand}"
+                                                                            CommandParameter="{Binding}"
+                                                                            Background="#374151" Foreground="#9CA3AF"
+                                                                            CornerRadius="8" Padding="12,8"
+                                                                            Cursor="Hand"
+                                                                            FontSize="13"
+                                                                            BorderThickness="0"/>
+                                                                </StackPanel>
+                                                            </Border>
 
                                                             <!-- Recommendation Cards -->
                                                             <ItemsControl ItemsSource="{Binding Cards}"
@@ -1823,10 +2166,14 @@
                                                                 </ItemsControl.ItemTemplate>
                                                             </ItemsControl>
 
-                                                            <!-- Timestamp -->
-                                                            <TextBlock Text="{Binding Timestamp}"
-                                                                       FontSize="10" Foreground="#252830"
-                                                                       Margin="0,10,0,0"/>
+                                                            <!-- Timestamp + token usage -->
+                                                            <StackPanel Orientation="Horizontal" Spacing="10"
+                                                                        Margin="0,10,0,0">
+                                                                <TextBlock Text="{Binding Timestamp}"
+                                                                           FontSize="10" Foreground="#252830"/>
+                                                                <TextBlock Text="{Binding TokenLabel}"
+                                                                           FontSize="10" Foreground="#252830"/>
+                                                            </StackPanel>
                                                         </StackPanel>
                                                     </Grid>
 
@@ -1839,7 +2186,7 @@
                             </ScrollViewer>
 
                             <!-- ══ Thinking indicator ══ -->
-                            <Border Grid.Row="1" IsVisible="{Binding IsChatLoading}"
+                            <Border Grid.Row="2" IsVisible="{Binding IsChatLoading}"
                                     VerticalAlignment="Bottom" HorizontalAlignment="Left"
                                     Margin="28,0,0,14">
                                 <Border.Transitions>
@@ -1915,7 +2262,7 @@
                             </Border>
 
                             <!-- ══ Input Area ══ -->
-                            <Border Grid.Row="2" Padding="20,8,20,22">
+                            <Border Grid.Row="3" Padding="20,8,20,22">
                                 <StackPanel MaxWidth="760" HorizontalAlignment="Center">
 
                                     <!-- Suggestion chips -->
@@ -1957,24 +2304,47 @@
                                             BorderThickness="1" BorderBrush="#1a1d22"
                                             Padding="20,4,6,4"
                                             BoxShadow="0 4 24 0 #28000000">
-                                        <Grid ColumnDefinitions="*,Auto" VerticalAlignment="Center">
+                                        <Grid ColumnDefinitions="*,Auto,Auto" VerticalAlignment="Center">
                                             <TextBox Grid.Column="0"
+                                                     Name="ChatInputBox"
                                                      Text="{Binding ChatInput}"
-                                                     PlaceholderText="Schreib eine Nachricht..."
+                                                     PlaceholderText="Schreib eine Nachricht... (Enter = Senden, Shift+Enter = Neue Zeile)"
                                                      MinHeight="50"
+                                                     MaxHeight="140"
+                                                     AcceptsReturn="True"
+                                                     TextWrapping="Wrap"
                                                      FontSize="14"
                                                      Background="Transparent"
                                                      Foreground="#eeeef0"
                                                      CaretBrush="#69daff"
                                                      BorderThickness="0"
-                                                     VerticalContentAlignment="Center"/>
+                                                     VerticalContentAlignment="Center"
+                                                     KeyDown="OnChatInputKeyDown"/>
+                                            <!-- Cancel button: only visible while generating -->
                                             <Button Grid.Column="1"
+                                                    IsVisible="{Binding IsGenerating}"
+                                                    Width="42" Height="42" Margin="4,0"
+                                                    CornerRadius="21"
+                                                    Background="#ff4444" Foreground="White"
+                                                    BorderThickness="0" Cursor="Hand" Padding="0"
+                                                    HorizontalContentAlignment="Center"
+                                                    VerticalContentAlignment="Center"
+                                                    ToolTip.Tip="Generierung abbrechen (Escape)"
+                                                    Command="{Binding CancelGenerationCommand}">
+                                                <TextBlock Text="&#x2715;" FontSize="16" FontWeight="Bold"
+                                                           HorizontalAlignment="Center"
+                                                           VerticalAlignment="Center"/>
+                                            </Button>
+                                            <!-- Send button -->
+                                            <Button Grid.Column="2"
+                                                    IsVisible="{Binding !IsGenerating}"
                                                     Width="42" Height="42"
                                                     CornerRadius="21"
                                                     Background="#69daff" Foreground="#003040"
                                                     BorderThickness="0" Cursor="Hand" Padding="0"
                                                     HorizontalContentAlignment="Center"
                                                     VerticalContentAlignment="Center"
+                                                    ToolTip.Tip="Senden (Enter)"
                                                     Command="{Binding SendChatMessageCommand}">
                                                 <TextBlock Text="&#x2191;" FontSize="22" FontWeight="Bold"
                                                            HorizontalAlignment="Center"
@@ -1984,7 +2354,13 @@
                                     </Border>
 
                                     <!-- Footer -->
-                                    <TextBlock Text="Game Copilot  ·  Ollama lokal  ·  Keine Cloud"
+                                    <TextBlock IsVisible="{Binding !IsCodexSelected}"
+                                               Text="Game Copilot  ·  Ollama lokal  ·  Keine Cloud"
+                                               FontSize="10" Foreground="#1e2124"
+                                               HorizontalAlignment="Center"
+                                               Margin="0,8,0,0" LetterSpacing="1"/>
+                                    <TextBlock IsVisible="{Binding IsCodexSelected}"
+                                               Text="Game Copilot  ·  OpenAI Codex  ·  Cloud"
                                                FontSize="10" Foreground="#1e2124"
                                                HorizontalAlignment="Center"
                                                Margin="0,8,0,0" LetterSpacing="1"/>
@@ -2218,7 +2594,7 @@
                                     <!-- Empty state when no releases loaded yet -->
                                     <Border Background="#111416" CornerRadius="8" Padding="40,32"
                                             HorizontalAlignment="Center"
-                                            IsVisible="{Binding !Releases.Count}">
+                                            IsVisible="{Binding NoReleasesYet}">
                                         <StackPanel HorizontalAlignment="Center">
                                             <TextBlock Text="Click CHECK FOR UPDATES to load release history"
                                                        FontSize="13" Foreground="#aaabad"
@@ -2229,6 +2605,134 @@
                                 </StackPanel>
                             </ScrollViewer>
                         </Grid>
+
+                    <!-- ===== SETTINGS PAGE ===== -->
+                    <Panel IsVisible="{Binding CurrentPage, Converter={x:Static conv:PageVisibleConverter.Instance}, ConverterParameter=Settings}">
+                        <ScrollViewer Padding="40,20,50,40" HorizontalScrollBarVisibility="Disabled">
+                            <StackPanel Spacing="28">
+
+                                <!-- Title -->
+                                <StackPanel>
+                                    <TextBlock Text="EINSTELLUNGEN" FontSize="38" FontWeight="Bold"
+                                               Foreground="#eeeef0" Margin="0,0,0,4"/>
+                                    <TextBlock Text="Konfiguration, Pfade, KI-Provider und Darstellung."
+                                               FontSize="13" Foreground="#aaabad"/>
+                                </StackPanel>
+
+                                <!-- ── Allgemein ── -->
+                                <Border Classes="card">
+                                    <StackPanel Spacing="16">
+                                        <TextBlock Text="ALLGEMEIN" Classes="section-header"/>
+                                        <Grid ColumnDefinitions="200,*" RowDefinitions="Auto,Auto,Auto,Auto" RowSpacing="10">
+                                            <TextBlock Grid.Row="0" Grid.Column="0" Text="App-Version" Classes="label" VerticalAlignment="Center"/>
+                                            <TextBlock Grid.Row="0" Grid.Column="1" Text="{Binding CurrentVersionDisplay}" Classes="value" VerticalAlignment="Center"/>
+
+                                            <TextBlock Grid.Row="1" Grid.Column="0" Text="MCP-Server-Version" Classes="label" VerticalAlignment="Center"/>
+                                            <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding McpVersionDisplay}" Classes="value" VerticalAlignment="Center"/>
+
+                                            <TextBlock Grid.Row="2" Grid.Column="0" Text="MCP-Server-Pfad" Classes="label" VerticalAlignment="Center"/>
+                                            <TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding McpServerPath}"
+                                                       FontSize="11" Foreground="#aaabad"
+                                                       TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
+
+                                            <TextBlock Grid.Row="3" Grid.Column="0" Text="Crash-Log" Classes="label" VerticalAlignment="Center"/>
+                                            <TextBlock Grid.Row="3" Grid.Column="1"
+                                                       Text="%AppData%\GameCopilot\crash.log"
+                                                       FontSize="11" Foreground="#aaabad" VerticalAlignment="Center"/>
+                                        </Grid>
+                                    </StackPanel>
+                                </Border>
+
+                                <!-- ── MCP Server ── -->
+                                <Border Classes="card">
+                                    <StackPanel Spacing="16">
+                                        <TextBlock Text="MCP SERVER" Classes="section-header"/>
+                                        <Grid ColumnDefinitions="200,*,Auto,Auto" RowDefinitions="Auto" ColumnSpacing="12">
+                                            <TextBlock Grid.Column="0" Text="Server-Version" Classes="label" VerticalAlignment="Center"/>
+                                            <TextBlock Grid.Column="1" Text="{Binding McpVersionDisplay}" Classes="value" VerticalAlignment="Center"/>
+                                            <Button Grid.Column="2" Classes="outline" Height="36" Padding="16,0" FontSize="12"
+                                                    Content="MCP neustarten"
+                                                    Command="{Binding RestartMcpCommand}"/>
+                                            <Button Grid.Column="3" Classes="outline" Height="36" Padding="16,0" FontSize="12"
+                                                    Content="Update prüfen"
+                                                    Command="{Binding ReconnectMcpCommand}"/>
+                                        </Grid>
+                                        <TextBlock Text="{Binding McpStatus}" FontSize="12" Foreground="#aaabad"/>
+                                    </StackPanel>
+                                </Border>
+
+                                <!-- ── Ollama ── -->
+                                <Border Classes="card">
+                                    <StackPanel Spacing="16">
+                                        <TextBlock Text="OLLAMA" Classes="section-header"/>
+                                        <Grid ColumnDefinitions="200,*,Auto" ColumnSpacing="12" RowDefinitions="Auto,Auto" RowSpacing="10">
+                                            <TextBlock Grid.Row="0" Grid.Column="0" Text="Ollama URL" Classes="label" VerticalAlignment="Center"/>
+                                            <TextBox Grid.Row="0" Grid.Column="1"
+                                                     Text="{Binding SettingsOllamaUrl}"
+                                                     Classes="search" FontSize="13" MinHeight="36"/>
+                                            <Button Grid.Row="0" Grid.Column="2" Classes="outline"
+                                                    Height="36" Padding="16,0" FontSize="12"
+                                                    Content="Verbindung testen"
+                                                    Command="{Binding TestOllamaConnectionCommand}"/>
+
+                                            <TextBlock Grid.Row="1" Grid.Column="0" Text="Verbindungsstatus" Classes="label" VerticalAlignment="Center"/>
+                                            <StackPanel Grid.Row="1" Grid.Column="1"
+                                                        Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                                                <Ellipse Width="8" Height="8" Fill="{Binding OllamaConnDotColor}" VerticalAlignment="Center"/>
+                                                <TextBlock Text="{Binding OllamaConnDisplayText}"
+                                                           FontSize="13" Foreground="#eeeef0" VerticalAlignment="Center"/>
+                                            </StackPanel>
+                                        </Grid>
+                                    </StackPanel>
+                                </Border>
+
+                                <!-- ── Pfade ── -->
+                                <Border Classes="card">
+                                    <StackPanel Spacing="14">
+                                        <TextBlock Text="PFADE" Classes="section-header"/>
+                                        <Grid ColumnDefinitions="180,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto" RowSpacing="10">
+                                            <TextBlock Grid.Row="0" Grid.Column="0" Text="Community-Ordner" Classes="label" VerticalAlignment="Center"/>
+                                            <TextBox Grid.Row="0" Grid.Column="1" Text="{Binding SettingsCommunityPath}" Classes="search" FontSize="12" MinHeight="34"/>
+
+                                            <TextBlock Grid.Row="1" Grid.Column="0" Text="MSFS Spielpfad" Classes="label" VerticalAlignment="Center"/>
+                                            <TextBox Grid.Row="1" Grid.Column="1" Text="{Binding SettingsMsfsGamePath}" Classes="search" FontSize="12" MinHeight="34"/>
+
+                                            <TextBlock Grid.Row="2" Grid.Column="0" Text="SteamVR Pfad" Classes="label" VerticalAlignment="Center"/>
+                                            <TextBox Grid.Row="2" Grid.Column="1" Text="{Binding SettingsSteamVrPath}" Classes="search" FontSize="12" MinHeight="34"/>
+
+                                            <TextBlock Grid.Row="3" Grid.Column="0" Text="Steam.exe Pfad" Classes="label" VerticalAlignment="Center"/>
+                                            <TextBox Grid.Row="3" Grid.Column="1" Text="{Binding SettingsSteamExePath}" Classes="search" FontSize="12" MinHeight="34"/>
+
+                                            <TextBlock Grid.Row="4" Grid.Column="0" Text="Pimax Client" Classes="label" VerticalAlignment="Center"/>
+                                            <TextBox Grid.Row="4" Grid.Column="1" Text="{Binding SettingsPimaxClientPath}" Classes="search" FontSize="12" MinHeight="34"/>
+
+                                            <TextBlock Grid.Row="5" Grid.Column="0" Text="MSFS App-ID (Steam)" Classes="label" VerticalAlignment="Center"/>
+                                            <TextBox Grid.Row="5" Grid.Column="1" Text="{Binding SettingsMsfsAppId}" Classes="search" FontSize="12" MinHeight="34"/>
+                                        </Grid>
+                                    </StackPanel>
+                                </Border>
+
+                                <!-- ── Darstellung & Verhalten ── -->
+                                <Border Classes="card">
+                                    <StackPanel Spacing="12">
+                                        <TextBlock Text="DARSTELLUNG &amp; VERHALTEN" Classes="section-header"/>
+                                        <CheckBox IsChecked="{Binding SettingsWarmOnStartup}"
+                                                  Content="Beim Start vorwärmen (Ollama + MCP beim Laden starten — schnellerer erster Chat)"/>
+                                        <CheckBox IsChecked="{Binding SettingsLoadChatHistory}"
+                                                  Content="Chat-Verlauf beim Start laden (letzte Sitzung wiederherstellen)"/>
+                                    </StackPanel>
+                                </Border>
+
+                                <!-- ── Speichern ── -->
+                                <Button Classes="modern" HorizontalAlignment="Left"
+                                        Padding="32,14" FontSize="14"
+                                        Content="Einstellungen speichern"
+                                        Command="{Binding SaveAppSettingsCommand}"/>
+
+                            </StackPanel>
+                        </ScrollViewer>
+                    </Panel>
+
 
                         <!-- Toast Notification (bottom-right overlay) -->
                         <Border IsVisible="{Binding ToastVisible}"

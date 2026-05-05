@@ -20,7 +20,7 @@ public class OllamaService
     private static readonly HttpClient ChatHttp = new() { Timeout = TimeSpan.FromMinutes(2) };
     // Long timeout for model downloads (can take hours for large models)
     private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromMinutes(30) };
-    private const string BaseUrl = "http://localhost:11434";
+    public string BaseUrl { get; set; } = "http://localhost:11434";
     private const string OllamaInstallScript = "https://ollama.com/install.ps1";
 
     public bool IsAvailable { get; private set; }
@@ -157,6 +157,24 @@ public class OllamaService
             return stdout;
         }
         catch { return ""; }
+    }
+
+    /// <summary>
+    /// Fast 3-second ping to Ollama. Returns true if the server responds.
+    /// Use this for UI status indicators where responsiveness matters more than detail.
+    /// </summary>
+    public async Task<bool> TestConnectionAsync()
+    {
+        try
+        {
+            using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromSeconds(3));
+            var resp = await PingHttp.GetAsync($"{BaseUrl}/api/tags", cts.Token);
+            return resp.IsSuccessStatusCode;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     /// <summary>
@@ -736,6 +754,7 @@ public class OllamaService
         // Build the assistant message we have to echo back next round (so
         // Ollama can correlate tool results with their tool_calls).
         var collectedToolCalls = new List<JsonElement>();
+        bool sawDoneToken = false;   // track whether we received the final done:true chunk
 
         while (!reader.EndOfStream)
         {
@@ -747,6 +766,11 @@ public class OllamaService
             {
                 using var doc = JsonDocument.Parse(line);
                 var root = doc.RootElement;
+
+                // Detect the final "done: true" chunk to confirm clean completion
+                if (root.TryGetProperty("done", out var doneEl) && doneEl.GetBoolean())
+                    sawDoneToken = true;
+
                 if (!root.TryGetProperty("message", out var msg)) continue;
 
                 if (msg.TryGetProperty("content", out var content))
@@ -778,6 +802,15 @@ public class OllamaService
                 }
             }
             catch { /* skip malformed chunk */ }
+        }
+
+        // If the stream ended without a done=true and no tool calls were produced,
+        // the connection was dropped mid-response — surface a visible error token.
+        if (!sawDoneToken && !result.ToolCalls.Any() && contentBuffer.Length == 0)
+        {
+            var errorToken = "\n\n⚠ Verbindung unterbrochen — bitte erneut senden.";
+            onToken(errorToken);
+            contentBuffer.Append(errorToken);
         }
 
         result.Content = contentBuffer.ToString();
@@ -889,10 +922,17 @@ public class OllamaStreamWithToolsResult
     public List<OllamaToolCall> ToolCalls { get; } = new();
     public bool HasToolCalls => ToolCalls.Count > 0;
     public string RawMessageJson { get; set; } = "";
+    /// <summary>Total tokens used (OpenAI Codex only — 0 for Ollama responses).</summary>
+    public int TotalTokens { get; set; }
 }
 
 public class OllamaToolCall
 {
+    /// <summary>
+    /// OpenAI tool-call id (e.g. "call_abc123"). Empty for Ollama responses.
+    /// Required when posting tool results back to the OpenAI API.
+    /// </summary>
+    public string Id { get; set; } = "";
     public string Name { get; set; } = "";
     public string ArgumentsJson { get; set; } = "{}";
 }

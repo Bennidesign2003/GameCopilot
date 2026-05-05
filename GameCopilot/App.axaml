@@ -1,0 +1,33 @@
+<Application xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="GameCopilot.App"
+             xmlns:local="using:GameCopilot"
+             RequestedThemeVariant="Dark">
+
+    <Application.DataTemplates>
+        <local:ViewLocator/>
+    </Application.DataTemplates>
+
+    <Application.Styles>
+        <FluentTheme />
+    </Application.Styles>
+
+    <!--
+        Global Resources: Migrated from WPF MainWindow.xaml "Pimax Style" Dark Mode palette.
+        WPF→Avalonia: SolidColorBrush resources work identically.
+    -->
+    <!-- Kinetic Cockpit palette -->
+    <Application.Resources>
+        <SolidColorBrush x:Key="PrimaryAccent" Color="#69daff"/>
+        <SolidColorBrush x:Key="HoverAccent" Color="#89e4ff"/>
+        <SolidColorBrush x:Key="DarkBackground" Color="#0c0e10"/>
+        <SolidColorBrush x:Key="CardBackground" Color="#111416"/>
+        <SolidColorBrush x:Key="HoverCard" Color="#1d2023"/>
+        <SolidColorBrush x:Key="BorderColor" Color="#46484a"/>
+        <SolidColorBrush x:Key="LightText" Color="#eeeef0"/>
+        <SolidColorBrush x:Key="SecondaryText" Color="#aaabad"/>
+        <SolidColorBrush x:Key="AccentGreen" Color="#00FF88"/>
+        <SolidColorBrush x:Key="AccentRed" Color="#ff716c"/>
+        <SolidColorBrush x:Key="AccentOrange" Color="#FF9500"/>
+    </Application.Resources>
+</Application>
