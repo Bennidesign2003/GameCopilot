@@ -14,7 +14,7 @@ set -e
 # ============================================================
 
 REPO="Bennidesign2003/GodotRenderingAI"
-VERSION="5.2.0"
+VERSION="5.3.3"
 TAG="v${VERSION}"
 PROJECT_DIR="$(cd "$(dirname "$0")/GameCopilot" && pwd)"
 PUBLISH_DIR="${PROJECT_DIR}/bin/publish"
