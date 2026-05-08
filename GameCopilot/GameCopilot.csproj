@@ -6,9 +6,9 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
-    <Version>5.1.0</Version>
-    <AssemblyVersion>5.1.0.0</AssemblyVersion>
-    <FileVersion>5.1.0.0</FileVersion>
+    <Version>5.2.0</Version>
+    <AssemblyVersion>5.2.0.0</AssemblyVersion>
+    <FileVersion>5.2.0.0</FileVersion>
     <AssemblyName>GameCopilot</AssemblyName>
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>

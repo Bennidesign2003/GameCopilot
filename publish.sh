@@ -14,7 +14,7 @@ set -e
 # ============================================================
 
 REPO="Bennidesign2003/GodotRenderingAI"
-VERSION="5.1.0"
+VERSION="5.2.0"
 TAG="v${VERSION}"
 PROJECT_DIR="$(cd "$(dirname "$0")/GameCopilot" && pwd)"
 PUBLISH_DIR="${PROJECT_DIR}/bin/publish"
@@ -90,11 +90,11 @@ cat > "${UPDATE_JSON}" <<EOF
   "LatestVersion": "${VERSION}",
   "DownloadUrl": "${DOWNLOAD_URL}",
   "Changelog": [
-    "Neu: nvidia-mcp Server aktualisiert sich jetzt automatisch beim App-Start ueber GitHub-Releases (Bennidesign2003/nvidia-mcp). Eigenes Repo, eigener Release-Channel, SHA256-verifiziert.",
-    "Embedded MCP-Server auf v3.7.0 angehoben — neue Tool-Namen check_nvidia_mcp_server_update / install_nvidia_mcp_server_update / get_nvidia_mcp_server_version, damit Codex sie nicht mehr mit NVIDIA-Treiber-Updates verwechselt",
-    "Versionssprung 3.5.4 → 5.1.0 — Avalonia-Easing-Bugfix (3.5.3 Crash), neue Build-Konfiguration mit ImplicitUsings",
-    "Build-Fix: ImplicitUsings im csproj aktiviert, fehlende using-Direktiven (Threading.Tasks, Input.Platform) ergaenzt",
-    "Hotfix: Avalonia-Easing 'Linear' → 'LinearEasing' in MainWindow.axaml (App crashte beim Start mit FormatException)"
+    "Neu: MCP-Server-Ordner ist jetzt in den Einstellungen frei waehlbar. Standard wechselt von %APPDATA%\\\\GameCopilot\\\\mcp-server auf %USERPROFILE%\\\\Documents\\\\Game Copilot\\\\mcp-server — sichtbar im Datei-Explorer ohne versteckte Ordner.",
+    "Aenderung wird beim naechsten MCP-Neustart wirksam (Button 'MCP neustarten' direkt darunter).",
+    "(aus 5.1.0) nvidia-mcp Server aktualisiert sich automatisch beim App-Start ueber GitHub-Releases (Bennidesign2003/nvidia-mcp), SHA256-verifiziert.",
+    "(aus 5.1.0) Embedded MCP-Server auf v3.7.0 angehoben mit neuen Tool-Namen (check/install/get_nvidia_mcp_server_*), damit Codex sie nicht mehr mit NVIDIA-Treiber-Updates verwechselt.",
+    "(aus 5.1.0) Build: ImplicitUsings, Avalonia-Easing-Hotfix"
   ]
 }
 EOF
@@ -135,19 +135,18 @@ else
         --title "GameCopilot ${VERSION}" \
         --notes "## GameCopilot ${VERSION}
 
-### Highlight: nvidia-mcp Auto-Update via separates GitHub-Repo
-- Der eingebaute MCP-Server lebt jetzt in seinem eigenen, oeffentlichen Repo: [Bennidesign2003/nvidia-mcp](https://github.com/Bennidesign2003/nvidia-mcp).
-- Beim App-Start prueft GameCopilot jetzt zusaetzlich \`Bennidesign2003/nvidia-mcp/releases/latest\` und ersetzt die AppData-Kopie von \`server.py\` durch eine neuere Version (mit SHA256-Verifikation) — vollautomatisch, ohne neuen GameCopilot-Build.
-- Der embedded \`mcp-server.py\` in der App ist v3.7.0 als Offline-Fallback. Online-Update hat Vorrang.
-- Drei neue MCP-Tools fuer Codex: \`check_nvidia_mcp_server_update\`, \`install_nvidia_mcp_server_update\`, \`get_nvidia_mcp_server_version\`. Frueher hiessen die generisch (\`check_for_updates\`) und Codex hat sie staendig mit \`check_and_install_driver\` (NVIDIA-Treiber) verwechselt.
+### Highlight: MCP-Server-Ordner frei waehlbar
+- In **Einstellungen → Pfade → MCP-Server Ordner** kann der Pfad jetzt geaendert werden.
+- **Neuer Standard**: \`%USERPROFILE%\\Documents\\Game Copilot\\mcp-server\` (vorher: \`%APPDATA%\\GameCopilot\\mcp-server\`). Damit ist \`server.py\` ohne versteckte Ordner direkt im Explorer sichtbar.
+- Aenderung wird beim naechsten MCP-Neustart wirksam — Button **'MCP neustarten'** auf derselben Seite.
+- Persistiert in \`appconfig.json\`. Auto-Updater (UpdateService) und Embedded-Extraktion (McpClientService) lesen den Pfad aus der Config.
 
-### Build / Plattform
-- Versionssprung 3.5.4 → 5.1.0
-- \`ImplicitUsings=enable\` im csproj — beseitigt fehlende using-Direktiven in MainWindowViewModel/CodexService/App.axaml.cs
-- \`using Avalonia.Input.Platform\` fuer \`IClipboard.SetTextAsync\` ergaenzt
-
-### Hotfix (aus 3.5.4 uebernommen, falls jemand noch 3.5.3 hat)
-- \`Easing=\"Linear\"\` → \`Easing=\"LinearEasing\"\` in MainWindow.axaml — Avalonia kennt das Suffix, WPF-Style \"Linear\" crasht beim Window-Init mit \`FormatException\`."
+### Aus 5.1.0 (jetzt aktiv)
+- nvidia-mcp Server aktualisiert sich automatisch beim App-Start ueber [Bennidesign2003/nvidia-mcp](https://github.com/Bennidesign2003/nvidia-mcp) Releases. SHA256-verifiziert, Backup als \`server.py.bak\`.
+- Embedded MCP-Server v3.7.0 als Offline-Fallback. Online-Update hat Vorrang.
+- Neue MCP-Tools fuer Codex (verwechselt sie nicht mehr mit Treiber-Updates): \`check_nvidia_mcp_server_update\`, \`install_nvidia_mcp_server_update\`, \`get_nvidia_mcp_server_version\`.
+- Build: \`ImplicitUsings=enable\`, fehlende using-Direktiven ergaenzt.
+- Hotfix: \`Easing=\"Linear\"\` → \`Easing=\"LinearEasing\"\` (FormatException beim Window-Init)."
 fi
 
 echo ""

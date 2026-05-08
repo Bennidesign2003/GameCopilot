@@ -193,6 +193,7 @@ public partial class MainWindowViewModel : ViewModelBase
     [ObservableProperty] private string _settingsSteamExePath = "";
     [ObservableProperty] private string _settingsPimaxClientPath = "";
     [ObservableProperty] private string _settingsMsfsAppId = "";
+    [ObservableProperty] private string _settingsMcpServerDir = "";
 
     // -- Updates Page --
     [ObservableProperty] private string _currentVersionDisplay = "v1.0.0";
@@ -250,6 +251,8 @@ public partial class MainWindowViewModel : ViewModelBase
         SettingsSteamExePath = _configService.SteamExePath;
         SettingsPimaxClientPath = _configService.PimaxClientPath;
         SettingsMsfsAppId = _configService.MsfsAppId;
+        SettingsMcpServerDir = _configService.McpServerDir;
+        _mcpService.McpServerDir = _configService.McpServerDir;
 
         CurrentVersionDisplay = $"v{_configService.CurrentVersion}";
         WindowTitle = $"Game Copilot v{_configService.CurrentVersion}";
@@ -271,10 +274,8 @@ public partial class MainWindowViewModel : ViewModelBase
         _settingsWarmOnStartup   = _configService.WarmOnStartup;
         _settingsLoadChatHistory = _configService.LoadChatHistory;
 
-        // ── MCP server path display ───────────────────────────────────────────
-        _mcpServerPath = System.IO.Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-            "GameCopilot", "mcp-server.py");
+        // ── MCP server path display (tracks the configured McpServerDir) ─────
+        _mcpServerPath = System.IO.Path.Combine(_configService.McpServerDir, "server.py");
 
         // ── Start Ollama connection-status polling (every 30 s) ───────────────
         _ollamaStatusTimer = new Timer(
@@ -427,8 +428,19 @@ public partial class MainWindowViewModel : ViewModelBase
         _ollamaService.BaseUrl          = SettingsOllamaUrl;
         _configService.WarmOnStartup    = SettingsWarmOnStartup;
         _configService.LoadChatHistory  = SettingsLoadChatHistory;
+
+        // Apply MCP server path: takes effect on next MCP restart. The user can
+        // trigger that immediately via the "MCP neustarten" button on this page.
+        var newMcpDir = string.IsNullOrWhiteSpace(SettingsMcpServerDir)
+            ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                           "Game Copilot", "mcp-server")
+            : SettingsMcpServerDir.Trim();
+        _configService.McpServerDir = newMcpDir;
+        _mcpService.McpServerDir    = newMcpDir;
+        McpServerPath               = Path.Combine(newMcpDir, "server.py");
+
         _configService.Save();
-        ShowToast("Einstellungen gespeichert", "Alle Einstellungen wurden gespeichert.");
+        ShowToast("Einstellungen gespeichert", "Alle Einstellungen wurden gespeichert. MCP-Pfad-Wechsel wird beim nächsten MCP-Neustart wirksam.");
 
         // Reload mods / paths
         LoadAllMods();
@@ -2760,6 +2772,13 @@ public partial class MainWindowViewModel : ViewModelBase
         _configService.SteamExePath = SettingsSteamExePath;
         _configService.PimaxClientPath = SettingsPimaxClientPath;
         _configService.MsfsAppId = SettingsMsfsAppId;
+        var newMcpDir = string.IsNullOrWhiteSpace(SettingsMcpServerDir)
+            ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                           "Game Copilot", "mcp-server")
+            : SettingsMcpServerDir.Trim();
+        _configService.McpServerDir = newMcpDir;
+        _mcpService.McpServerDir    = newMcpDir;
+        McpServerPath               = Path.Combine(newMcpDir, "server.py");
         _configService.Save();
         StatusMessage = "Einstellungen gespeichert";
 

@@ -29,14 +29,21 @@ public class McpClientService : IDisposable
     public List<McpToolDef> Tools { get; } = new();
 
     /// <summary>
-    /// Extract the bundled MCP server.py from embedded resources to AppData.
-    /// Version-aware: keeps the AppData copy if it has a newer __mcp_version__ than the embedded one.
+    /// Directory where <c>server.py</c> lives. Settable from the Settings UI;
+    /// falls back to <c>%APPDATA%\GameCopilot\mcp-server</c> if the user has
+    /// not configured anything yet (legacy installs).
     /// </summary>
-    private static string ExtractBundledServer()
+    public string McpServerDir { get; set; } = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        "GameCopilot", "mcp-server");
+
+    /// <summary>
+    /// Extract the bundled MCP server.py from embedded resources to <see cref="McpServerDir"/>.
+    /// Version-aware: keeps the on-disk copy if it has a newer __mcp_version__ than the embedded one.
+    /// </summary>
+    private string ExtractBundledServer()
     {
-        var mcpDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-            "GameCopilot", "mcp-server");
+        var mcpDir = McpServerDir;
         Directory.CreateDirectory(mcpDir);
 
         var serverPath = Path.Combine(mcpDir, "server.py");

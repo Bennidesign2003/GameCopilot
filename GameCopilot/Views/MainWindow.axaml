@@ -2690,7 +2690,7 @@
                                 <Border Classes="card">
                                     <StackPanel Spacing="14">
                                         <TextBlock Text="PFADE" Classes="section-header"/>
-                                        <Grid ColumnDefinitions="180,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto" RowSpacing="10">
+                                        <Grid ColumnDefinitions="180,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto,Auto,Auto" RowSpacing="10">
                                             <TextBlock Grid.Row="0" Grid.Column="0" Text="Community-Ordner" Classes="label" VerticalAlignment="Center"/>
                                             <TextBox Grid.Row="0" Grid.Column="1" Text="{Binding SettingsCommunityPath}" Classes="search" FontSize="12" MinHeight="34"/>
 
@@ -2708,6 +2708,14 @@
 
                                             <TextBlock Grid.Row="5" Grid.Column="0" Text="MSFS App-ID (Steam)" Classes="label" VerticalAlignment="Center"/>
                                             <TextBox Grid.Row="5" Grid.Column="1" Text="{Binding SettingsMsfsAppId}" Classes="search" FontSize="12" MinHeight="34"/>
+
+                                            <TextBlock Grid.Row="6" Grid.Column="0" Text="MCP-Server Ordner" Classes="label" VerticalAlignment="Center"/>
+                                            <TextBox Grid.Row="6" Grid.Column="1" Text="{Binding SettingsMcpServerDir}" Classes="search" FontSize="12" MinHeight="34"
+                                                     PlaceholderText="Standard: %USERPROFILE%\Documents\Game Copilot\mcp-server"/>
+
+                                            <TextBlock Grid.Row="7" Grid.Column="1" FontSize="11" Foreground="#888889"
+                                                       Text="Wo server.py extrahiert und durch den Auto-Updater frisch gehalten wird. Wechsel wird beim nächsten MCP-Neustart wirksam."
+                                                       TextWrapping="Wrap"/>
                                         </Grid>
                                     </StackPanel>
                                 </Border>

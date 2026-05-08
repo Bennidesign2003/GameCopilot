@@ -29,6 +29,16 @@ public class AppConfigService
     public string PimaxOpenXrJson { get; set; } = @"C:\Program Files (x86)\Steam\steamapps\common\SteamVR\steamxr_win64.json";
     public string MsfsAppId { get; set; } = "2537590";
 
+    /// <summary>
+    /// Directory where the bundled MCP server (server.py) is extracted to and
+    /// kept up-to-date by UpdateService. Default lives under
+    /// <c>%USERPROFILE%\Documents\Game Copilot\mcp-server</c> so users can
+    /// inspect / replace the file without diving into AppData.
+    /// </summary>
+    public string McpServerDir { get; set; } = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+        "Game Copilot", "mcp-server");
+
     // ── AI Provider settings ──────────────────────────────────────────────────
     /// <summary>OpenAI API key for the Codex/GPT cloud provider.</summary>
     public string CodexApiKey { get; set; } = "";
@@ -75,6 +85,7 @@ public class AppConfigService
             PimaxClientPath = data.PimaxClientPath ?? PimaxClientPath;
             PimaxOpenXrJson = data.PimaxOpenXrJson ?? PimaxOpenXrJson;
             MsfsAppId = data.MsfsAppId ?? MsfsAppId;
+            McpServerDir = data.McpServerDir ?? McpServerDir;
             CodexApiKey     = data.CodexApiKey     ?? CodexApiKey;
             CodexModel      = data.CodexModel      ?? CodexModel;
             ChatProvider    = data.ChatProvider    ?? ChatProvider;
@@ -101,6 +112,7 @@ public class AppConfigService
                 PimaxClientPath = PimaxClientPath,
                 PimaxOpenXrJson = PimaxOpenXrJson,
                 MsfsAppId = MsfsAppId,
+                McpServerDir = McpServerDir,
                 CodexApiKey     = CodexApiKey,
                 CodexModel      = CodexModel,
                 ChatProvider    = ChatProvider,
@@ -136,6 +148,7 @@ public class AppConfigService
         public string? PimaxClientPath { get; set; }
         public string? PimaxOpenXrJson { get; set; }
         public string? MsfsAppId { get; set; }
+        public string? McpServerDir { get; set; }
         public string? CodexApiKey     { get; set; }
         public string? CodexModel      { get; set; }
         public string? ChatProvider    { get; set; }
