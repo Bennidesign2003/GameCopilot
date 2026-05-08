@@ -4,8 +4,12 @@ using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Json;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 using GameCopilot.Models;
 
@@ -18,6 +22,11 @@ public class UpdateService
 
     private const string ReleasesApiUrl =
         "https://api.github.com/repos/Bennidesign2003/GodotRenderingAI/releases";
+
+    // nvidia-mcp release channel — kept in its own GitHub repo, fetched at app start
+    // so the MCP server upgrades independently of GameCopilot's own release cadence.
+    private const string McpUpdateJsonUrl =
+        "https://github.com/Bennidesign2003/nvidia-mcp/releases/latest/download/update.json";
 
     private static readonly HttpClient Http = new()
     {
@@ -156,11 +165,93 @@ public class UpdateService
         System.IO.Compression.ZipFile.ExtractToDirectory(zipPath, targetDir, overwriteFiles: true);
     }
 
+    /// <summary>
+    /// Fetches nvidia-mcp's release manifest, compares against the local
+    /// <c># __mcp_version__</c> marker, and (if newer + SHA256 matches) writes
+    /// the downloaded server.py to <paramref name="serverPath"/>. Network and
+    /// disk errors are swallowed — a failed online update is non-fatal because
+    /// the embedded fallback already provides a working server.
+    /// </summary>
+    /// <returns>
+    /// <c>true</c> if the file on disk was replaced, <c>false</c> if it was
+    /// already current or any step failed.
+    /// </returns>
+    public static async Task<bool> TryUpdateMcpServerAsync(string serverPath)
+    {
+        try
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            var manifestJson = await Http.GetStringAsync(McpUpdateJsonUrl, cts.Token).ConfigureAwait(false);
+            var manifest = JsonSerializer.Deserialize<McpUpdateJson>(manifestJson);
+            if (manifest == null || string.IsNullOrWhiteSpace(manifest.Version)
+                || string.IsNullOrWhiteSpace(manifest.DownloadUrl)
+                || string.IsNullOrWhiteSpace(manifest.Sha256))
+                return false;
+
+            var localVersion = ReadMcpVersionFromFile(serverPath);
+            if (Version.TryParse(localVersion, out var lv) && Version.TryParse(manifest.Version, out var rv))
+            {
+                if (rv <= lv) return false; // already up-to-date
+            }
+
+            var bytes = await Http.GetByteArrayAsync(manifest.DownloadUrl!, cts.Token).ConfigureAwait(false);
+
+            using var sha = SHA256.Create();
+            var hash = Convert.ToHexString(sha.ComputeHash(bytes)).ToLowerInvariant();
+            if (!string.Equals(hash, manifest.Sha256!.Trim().ToLowerInvariant(), StringComparison.Ordinal))
+                return false; // checksum mismatch — refuse to write a tampered file
+
+            var dir = Path.GetDirectoryName(serverPath)!;
+            var backupPath = Path.Combine(dir, "server.py.bak");
+            if (File.Exists(serverPath))
+                File.Copy(serverPath, backupPath, overwrite: true);
+
+            var tmpPath = serverPath + ".new";
+            await File.WriteAllBytesAsync(tmpPath, bytes, cts.Token).ConfigureAwait(false);
+            File.Move(tmpPath, serverPath, overwrite: true);
+
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string ReadMcpVersionFromFile(string path)
+    {
+        try
+        {
+            using var fs = File.OpenRead(path);
+            var buf = new byte[200];
+            var n = fs.Read(buf, 0, buf.Length);
+            var head = Encoding.UTF8.GetString(buf, 0, n);
+            var m = Regex.Match(head, "__mcp_version__\\s*=\\s*\"([^\"]+)\"");
+            return m.Success ? m.Groups[1].Value : "";
+        }
+        catch
+        {
+            return "";
+        }
+    }
+
     private class UpdateJson
     {
         public string? LatestVersion { get; set; }
         public string? DownloadUrl { get; set; }
         public List<string>? Changelog { get; set; }
+    }
+
+    private class McpUpdateJson
+    {
+        [JsonPropertyName("version")]
+        public string? Version { get; set; }
+
+        [JsonPropertyName("download_url")]
+        public string? DownloadUrl { get; set; }
+
+        [JsonPropertyName("sha256")]
+        public string? Sha256 { get; set; }
     }
 
     private class GitHubRelease

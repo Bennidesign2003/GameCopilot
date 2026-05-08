@@ -93,9 +93,16 @@ public class McpClientService : IDisposable
     {
         if (IsRunning) return;
 
-        // Extract bundled server.py to AppData
+        // Extract bundled server.py to AppData (offline-safe baseline)
         onProgress?.Invoke("MCP Server wird extrahiert...");
         var serverPath = ExtractBundledServer();
+
+        // Then check the nvidia-mcp GitHub release channel for a newer server.py.
+        // Failures here are non-fatal — the embedded copy keeps us functional offline.
+        onProgress?.Invoke("MCP Server: prüfe Online-Updates...");
+        var updated = await UpdateService.TryUpdateMcpServerAsync(serverPath).ConfigureAwait(false);
+        if (updated)
+            onProgress?.Invoke("MCP Server wurde auf neueste Version aktualisiert");
 
         // Check if an MCP server update was applied — clear the restart flag
         var mcpDir = Path.GetDirectoryName(serverPath)!;

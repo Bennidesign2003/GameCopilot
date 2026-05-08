@@ -14,7 +14,7 @@ set -e
 # ============================================================
 
 REPO="Bennidesign2003/GodotRenderingAI"
-VERSION="3.5.4"
+VERSION="5.1.0"
 TAG="v${VERSION}"
 PROJECT_DIR="$(cd "$(dirname "$0")/GameCopilot" && pwd)"
 PUBLISH_DIR="${PROJECT_DIR}/bin/publish"
@@ -90,16 +90,11 @@ cat > "${UPDATE_JSON}" <<EOF
   "LatestVersion": "${VERSION}",
   "DownloadUrl": "${DOWNLOAD_URL}",
   "Changelog": [
-    "HOTFIX: App-Crash beim Start in 3.5.3 behoben (FormatException 'Easing Linear was not found')",
-    "(aus 3.5.3) MCP-Server wird beim App-Start vorgewaermt",
-    "(aus 3.5.3) Halluzinationen behoben durch groesseres Kontext-Fenster (16k)",
-    "(aus 3.5.3) Tool-Auswahl deterministischer (temperature 0.1), finale Antwort natuerlicher (0.65)",
-    "(aus 3.5.3) Klare Fehlermeldung wenn der Agent nach 15 Tool-Runden ohne Antwort endet",
-    "(aus 3.5.3) Live-Streaming Indikator (typing dots) waehrend die Antwort eintrifft",
-    "(aus 3.5.2) Neue Modelle: Qwen 3, Qwen 2.5 Coder, GPT-OSS, Llama 3.3, Gemma 3",
-    "(aus 3.5.2) Auto-Modellwahl basierend auf erkanntem VRAM",
-    "(aus 3.5.2) Modell bleibt 30 Min im VRAM zwischen Fragen (keep_alive)",
-    "(aus 3.5.2) Streaming auch im Tool-Modus statt 30s Spinner"
+    "Neu: nvidia-mcp Server aktualisiert sich jetzt automatisch beim App-Start ueber GitHub-Releases (Bennidesign2003/nvidia-mcp). Eigenes Repo, eigener Release-Channel, SHA256-verifiziert.",
+    "Embedded MCP-Server auf v3.7.0 angehoben — neue Tool-Namen check_nvidia_mcp_server_update / install_nvidia_mcp_server_update / get_nvidia_mcp_server_version, damit Codex sie nicht mehr mit NVIDIA-Treiber-Updates verwechselt",
+    "Versionssprung 3.5.4 → 5.1.0 — Avalonia-Easing-Bugfix (3.5.3 Crash), neue Build-Konfiguration mit ImplicitUsings",
+    "Build-Fix: ImplicitUsings im csproj aktiviert, fehlende using-Direktiven (Threading.Tasks, Input.Platform) ergaenzt",
+    "Hotfix: Avalonia-Easing 'Linear' → 'LinearEasing' in MainWindow.axaml (App crashte beim Start mit FormatException)"
   ]
 }
 EOF
@@ -138,27 +133,21 @@ else
         "${UPDATE_JSON}" \
         --repo "${REPO}" \
         --title "GameCopilot ${VERSION}" \
-        --notes "## GameCopilot ${VERSION} — Hotfix
+        --notes "## GameCopilot ${VERSION}
 
-**3.5.3 stuerzt beim Start ab** (\`FormatException: Easing 'Linear' was not found\`). Bitte direkt auf 3.5.4 updaten.
+### Highlight: nvidia-mcp Auto-Update via separates GitHub-Repo
+- Der eingebaute MCP-Server lebt jetzt in seinem eigenen, oeffentlichen Repo: [Bennidesign2003/nvidia-mcp](https://github.com/Bennidesign2003/nvidia-mcp).
+- Beim App-Start prueft GameCopilot jetzt zusaetzlich \`Bennidesign2003/nvidia-mcp/releases/latest\` und ersetzt die AppData-Kopie von \`server.py\` durch eine neuere Version (mit SHA256-Verifikation) — vollautomatisch, ohne neuen GameCopilot-Build.
+- Der embedded \`mcp-server.py\` in der App ist v3.7.0 als Offline-Fallback. Online-Update hat Vorrang.
+- Drei neue MCP-Tools fuer Codex: \`check_nvidia_mcp_server_update\`, \`install_nvidia_mcp_server_update\`, \`get_nvidia_mcp_server_version\`. Frueher hiessen die generisch (\`check_for_updates\`) und Codex hat sie staendig mit \`check_and_install_driver\` (NVIDIA-Treiber) verwechselt.
 
-### Hotfix
-- Streaming-Cursor-Animation in MainWindow.axaml verwendete \`Easing=\"Linear\"\` - Avalonia erwartet aber \`LinearEasing\` (Suffix). Der XAML-Compiler hat das durchgelassen, weil \`Easing.Parse\` erst zur Laufzeit aufgeloest wird, und die App ist daher in 3.5.3 sofort beim Window-Init gecrasht.
+### Build / Plattform
+- Versionssprung 3.5.4 → 5.1.0
+- \`ImplicitUsings=enable\` im csproj — beseitigt fehlende using-Direktiven in MainWindowViewModel/CodexService/App.axaml.cs
+- \`using Avalonia.Input.Platform\` fuer \`IClipboard.SetTextAsync\` ergaenzt
 
-### Aus 3.5.3 (jetzt nutzbar)
-- MCP-Server wird waehrend des Splash-Screens vorgewaermt (erste Tool-Anfrage sofort schnell)
-- Halluzinationen behoben durch groesseres Kontext-Fenster (\`num_ctx\` 8192 → 16384) im Tool-Modus
-- Tool-Auswahl deterministischer (temperature 0.1), finale Antwort natuerlicher (temperature 0.65)
-- System-Prompt erweitert um \`diagnose_msfs_config\`, \`set_msfs_setting\`, \`fix_msfs\`, \`check_and_install_driver\`
-- Klare Fehlermeldung wenn der Agent alle 15 Tool-Runden braucht ohne fertig zu werden
-- Streaming-Indikator (typing dots) ab dem ersten Token
-
-### Aus 3.5.2
-- Neue Modelle: Qwen 3 (4B/8B/14B/30B-MoE/32B), Qwen 2.5 Coder (7B/14B/32B), GPT-OSS 20B/120B, Llama 3.3 70B, Gemma 3 12B/27B
-- Auto-Modellwahl basierend auf erkanntem VRAM
-- \`keep_alive 30m\` haelt Modell zwischen Fragen im VRAM
-- Streaming auch im Tool-Modus, finale Antwort Wort-fuer-Wort statt 30s Spinner
-- Komplett neu geschriebener System-Prompt (Identitaet / Stil / Ehrlichkeit / Tools)"
+### Hotfix (aus 3.5.4 uebernommen, falls jemand noch 3.5.3 hat)
+- \`Easing=\"Linear\"\` → \`Easing=\"LinearEasing\"\` in MainWindow.axaml — Avalonia kennt das Suffix, WPF-Style \"Linear\" crasht beim Window-Init mit \`FormatException\`."
 fi
 
 echo ""

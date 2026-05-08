@@ -1,7 +1,8 @@
-# __mcp_version__ = "3.6.5"
+# __mcp_version__ = "3.7.0"
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json as _json
 import logging
 import logging.handlers
@@ -14,12 +15,141 @@ import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import httpx
 
 from mcp.server.fastmcp import FastMCP
 import pynvml
+
+# ---------------------------------------------------------------------------
+# Self-updater (single-file, read-only check + write apply).
+# When run inside GameCopilot, the host's UpdateService also keeps this file
+# fresh on startup; this code is the standalone fallback so users running
+# `python server.py` directly still benefit from auto-update.
+# ---------------------------------------------------------------------------
+__version__ = "3.7.0"
+_GITHUB_REPO = "Bennidesign2003/nvidia-mcp"
+_RELEASE_API = f"https://api.github.com/repos/{_GITHUB_REPO}/releases/latest"
+_SCRIPT_DIR = Path(__file__).parent.resolve()
+_SERVER_FILE = _SCRIPT_DIR / "server.py"
+_BACKUP_FILE = _SCRIPT_DIR / "server.py.bak"
+
+
+def _updater_parse_version(s: str) -> tuple[int, ...]:
+    s = s.lstrip("v").strip()
+    out: list[int] = []
+    for p in s.split("."):
+        try:
+            out.append(int(p))
+        except ValueError:
+            break
+    return tuple(out)
+
+
+def _updater_is_newer(remote: str, local: str = __version__) -> bool:
+    r = _updater_parse_version(remote)
+    return bool(r) and r > _updater_parse_version(local)
+
+
+def _updater_fetch_latest_release() -> dict[str, Any] | None:
+    headers = {"Accept": "application/vnd.github+json"}
+    token = os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        with httpx.Client(timeout=10.0, follow_redirects=True) as c:
+            r = c.get(_RELEASE_API, headers=headers)
+            r.raise_for_status()
+            return r.json()
+    except Exception:
+        return None
+
+
+def _updater_find_asset_url(release: dict[str, Any], name: str) -> str | None:
+    for a in release.get("assets", []):
+        if a.get("name") == name:
+            return a.get("browser_download_url")
+    return None
+
+
+def _updater_sha256_of(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _updater_check() -> dict[str, Any]:
+    release = _updater_fetch_latest_release()
+    if not release:
+        return {"status": "error", "message": "Could not reach GitHub Releases API"}
+    remote = (release.get("tag_name") or "").lstrip("v")
+    if not remote:
+        return {"status": "error", "message": "Latest release has no tag_name"}
+    if not _updater_is_newer(remote):
+        return {"status": "current", "current_version": __version__, "latest_version": remote}
+    return {
+        "status": "update_available",
+        "current_version": __version__,
+        "latest_version": remote,
+        "release_url": release.get("html_url"),
+        "release_notes": release.get("body", "") or "",
+    }
+
+
+def _updater_apply() -> dict[str, Any]:
+    release = _updater_fetch_latest_release()
+    if not release:
+        return {"status": "error", "message": "Could not reach GitHub Releases API"}
+    remote = (release.get("tag_name") or "").lstrip("v")
+    if not _updater_is_newer(remote):
+        return {"status": "already_current", "version": __version__}
+    server_url = _updater_find_asset_url(release, "server.py")
+    update_json_url = _updater_find_asset_url(release, "update.json")
+    if not server_url:
+        return {"status": "error", "message": "Release is missing server.py asset"}
+
+    expected_sha: str | None = None
+    if update_json_url:
+        try:
+            with httpx.Client(timeout=10.0, follow_redirects=True) as c:
+                r = c.get(update_json_url)
+                r.raise_for_status()
+                expected_sha = r.json().get("sha256")
+        except Exception:
+            pass
+
+    fd, tmp_path_str = tempfile.mkstemp(prefix="server-", suffix=".py.new", dir=_SCRIPT_DIR)
+    os.close(fd)
+    tmp_path = Path(tmp_path_str)
+    try:
+        with httpx.Client(timeout=120.0, follow_redirects=True) as c:
+            with c.stream("GET", server_url) as r:
+                r.raise_for_status()
+                with tmp_path.open("wb") as f:
+                    for chunk in r.iter_bytes(65536):
+                        f.write(chunk)
+        if expected_sha:
+            actual = _updater_sha256_of(tmp_path)
+            if actual.lower() != expected_sha.lower():
+                tmp_path.unlink(missing_ok=True)
+                return {"status": "error", "message": f"SHA256 mismatch (expected {expected_sha}, got {actual})"}
+        if _SERVER_FILE.exists():
+            shutil.copy2(_SERVER_FILE, _BACKUP_FILE)
+        os.replace(tmp_path, _SERVER_FILE)
+        return {
+            "status": "updated",
+            "previous_version": __version__,
+            "new_version": remote,
+            "restart_required": True,
+            "backup": str(_BACKUP_FILE),
+        }
+    except Exception as e:
+        tmp_path.unlink(missing_ok=True)
+        return {"status": "error", "message": str(e)}
+
 
 mcp = FastMCP("nvidia-gpu")
 
@@ -60,12 +190,7 @@ _USERCFG_CANDIDATES_2024 = [
     / "Microsoft.FlightSimulator2024_8wekyb3d8bbwe" / "LocalCache" / "UserCfg.opt",
 ]
 
-_USERCFG_CANDIDATES_2020 = [
-    Path(os.environ.get("APPDATA", "")) / "Microsoft Flight Simulator" / "UserCfg.opt",
-    Path(os.environ.get("LOCALAPPDATA", "")) / "Packages"
-    / "Microsoft.FlightSimulator_8wekyb3d8bbwe" / "LocalCache" / "UserCfg.opt",
-]
-_USERCFG_CANDIDATES = _USERCFG_CANDIDATES_2024 + _USERCFG_CANDIDATES_2020
+_USERCFG_CANDIDATES = _USERCFG_CANDIDATES_2024
 
 # Default: MSFS 2024 path (primary target)
 DEFAULT_USERCFG_PATH = (
@@ -191,22 +316,6 @@ def _find_all_usercfg() -> list[dict]:
     return results
 
 
-# Module-level cache for _find_usercfg (no-custom-path calls only).
-# Avoids repeated filesystem scans when the same function is called many times
-# in a single agent session.  Invalidated by _invalidate_usercfg_cache().
-_USERCFG_CACHE: "Path | None" = None
-_USERCFG_CACHE_VALID: bool = False
-
-
-def _invalidate_usercfg_cache() -> None:
-    """Invalidate the _find_usercfg result cache.
-    Call this after any write that modifies UserCfg.opt so the next read
-    re-discovers the file from disk.
-    """
-    global _USERCFG_CACHE, _USERCFG_CACHE_VALID
-    _USERCFG_CACHE_VALID = False
-
-
 def _find_usercfg(custom_path: str = "") -> Path | None:
     """Find the MSFS 2024 UserCfg.opt.
 
@@ -214,84 +323,27 @@ def _find_usercfg(custom_path: str = "") -> Path | None:
       1. Custom path (if provided and exists)
       2. Known MSFS 2024 candidate paths (first match wins)
       3. Filesystem search for UserCfg.opt with '2024' in the path
-
-    Results for the default (no custom_path) case are cached in
-    _USERCFG_CACHE to avoid repeated filesystem scans.
     """
-    global _USERCFG_CACHE, _USERCFG_CACHE_VALID
-
     if custom_path:
         p = Path(custom_path)
         if p.exists():
             return p
         return None
 
-    # Return cached result when available
-    if _USERCFG_CACHE_VALID:
-        return _USERCFG_CACHE
-
     # 1. Check MSFS 2024 candidates — first existing one wins
-    result: "Path | None" = None
     for c in _USERCFG_CANDIDATES_2024:
         if c.exists() and _is_msfs_usercfg(c):
-            result = c
-            break
+            return c
 
     # 2. Filesystem search as fallback
-    if result is None:
-        all_configs = _find_all_usercfg()
-        if all_configs:
-            for cfg in all_configs:
-                if "2024" in cfg["path"]:
-                    result = Path(cfg["path"])
-                    break
-            if result is None:
-                result = Path(all_configs[0]["path"])
-
-    _USERCFG_CACHE = result
-    _USERCFG_CACHE_VALID = True
-    return result
-
-
-@mcp.tool()
-def find_msfs_config(usercfg_path: str = "") -> dict:
-    """Find and show the MSFS UserCfg.opt file that will be used for settings changes.
-
-    Call this when the user says settings aren't applying, to diagnose which file is being edited.
-    Returns the active config path, all found configs, and key current settings.
-    """
-    active = _find_usercfg(usercfg_path)
     all_configs = _find_all_usercfg()
+    if all_configs:
+        for cfg in all_configs:
+            if "2024" in cfg["path"]:
+                return Path(cfg["path"])
+        return Path(all_configs[0]["path"])
 
-    result: dict = {
-        "aktive_config": str(active) if active else "NICHT GEFUNDEN",
-        "config_exists": active.exists() if active else False,
-        "alle_gefundenen": [c["path"] for c in all_configs],
-        "anzahl_gefunden": len(all_configs),
-    }
-
-    if active and active.exists():
-        settings = _read_current_settings(active)
-        key_settings: dict = {}
-        for key in [
-            "Video.DLSS", "GraphicsVR.CloudsQuality", "GraphicsVR.TerrainLoD",
-            "Graphics.CloudsQuality", "Graphics.TerrainLoD", "Video.RenderScale",
-        ]:
-            if key in settings:
-                defn = SETTING_DEFS.get(key, {})
-                raw = settings[key]
-                display = defn.get("values", {}).get(raw, raw)
-                key_settings[key] = f"{raw} ({display})"
-        result["aktuelle_einstellungen"] = key_settings
-
-    if not active or not active.exists():
-        result["fehler"] = (
-            "UserCfg.opt wurde nicht gefunden! MSFS muss mindestens einmal gestartet worden sein. "
-            "Starte MSFS einmal, ändere eine Einstellung in den Grafikoptionen und beende MSFS. "
-            "Dann kann der Agent Einstellungen direkt ändern."
-        )
-
-    return result
+    return None
 
 
 # Community folder paths (MSFS 2024 only)
@@ -533,31 +585,41 @@ def _version_tuple(v: str) -> tuple[int, ...]:
 
 # Known GPU performance tiers for VR (approximate raster perf relative to 4090=100)
 _GPU_VR_TIER: dict[str, str] = {
-    # RTX 50 Series
-    "RTX 5090": "flagship",
-    "RTX 5080": "high_end",
-    "RTX 5070 Ti": "mid_high",
-    "RTX 5070": "mid_range",
-    "RTX 5060": "entry",
+    # RTX 50 Series (longer/more specific keys first to avoid substring collisions)
+    "RTX 5090":         "flagship",
+    "RTX 5080":         "high_end",
+    "RTX 5070 Ti":      "mid_high",
+    "RTX 5070":         "mid_range",
+    "RTX 5060 Ti":      "mid_range",   # ~RTX 4070-class in VR
+    "RTX 5060":         "entry",
     # RTX 40 Series
-    "RTX 4090": "flagship",
-    "RTX 4080 SUPER": "high_end",
-    "RTX 4080": "high_end",
-    "RTX 4070 Ti SUPER": "mid_high",
-    "RTX 4070 Ti": "mid_high",
-    "RTX 4070 SUPER": "mid_range",
-    "RTX 4070": "mid_range",
-    "RTX 4060 Ti": "entry",
-    "RTX 4060": "entry",
+    "RTX 4090":         "flagship",
+    "RTX 4080 SUPER":   "high_end",
+    "RTX 4080":         "high_end",
+    "RTX 4070 Ti SUPER":"mid_high",
+    "RTX 4070 Ti":      "mid_high",
+    "RTX 4070 SUPER":   "mid_range",
+    "RTX 4070":         "mid_range",
+    "RTX 4060 Ti":      "entry",
+    "RTX 4060":         "entry",
     # RTX 30 Series
-    "RTX 3090 Ti": "high_end",
-    "RTX 3090": "high_end",
-    "RTX 3080 Ti": "mid_high",
-    "RTX 3080": "mid_high",
-    "RTX 3070 Ti": "mid_range",
-    "RTX 3070": "mid_range",
-    "RTX 3060 Ti": "entry",
-    "RTX 3060": "entry",
+    "RTX 3090 Ti":      "high_end",
+    "RTX 3090":         "high_end",
+    "RTX 3080 Ti":      "mid_high",
+    "RTX 3080 12GB":    "mid_high",    # 12 GB variant
+    "RTX 3080":         "mid_high",
+    "RTX 3070 Ti":      "mid_range",
+    "RTX 3070":         "mid_range",
+    "RTX 3060 Ti":      "entry",
+    "RTX 3060":         "entry",
+    # RTX 20 Series (still used in VR)
+    "RTX 2080 Ti":      "mid_range",
+    "RTX 2080 SUPER":   "entry",
+    "RTX 2080":         "entry",
+    "RTX 2070 SUPER":   "entry",
+    "RTX 2070":         "entry",
+    "RTX 2060 SUPER":   "entry",
+    "RTX 2060":         "entry",
 }
 
 
@@ -568,12 +630,10 @@ def _detect_gpu_tier() -> tuple[str, str, int]:
     """
     try:
         pynvml.nvmlInit()
-        try:
-            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-            name = pynvml.nvmlDeviceGetName(handle)
-            mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
-        finally:
-            pynvml.nvmlShutdown()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        name = pynvml.nvmlDeviceGetName(handle)
+        mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        pynvml.nvmlShutdown()
 
         if isinstance(name, bytes):
             name = name.decode()
@@ -796,7 +856,7 @@ def _parse_usercfg(text: str) -> list[tuple[str | None, str]]:
 def _apply_overrides(
     entries: list[tuple[str | None, str]],
     overrides: dict[str, str],
-) -> tuple[list[tuple[str | None, str]], set[str]]:
+) -> list[tuple[str | None, str]]:
     """Return a new entries list with the requested key-value overrides applied."""
     # Build a lookup:  section -> key -> new_value
     lookup: dict[str, dict[str, str]] = {}
@@ -837,17 +897,10 @@ def get_gpu_status(gpu_index: int = 0) -> dict:
     Args:
         gpu_index: Index of the GPU (default 0 for the first GPU).
     """
-    if gpu_index < 0:
-        return {"error": "gpu_index must be 0 or greater."}
-    try:
-        pynvml.nvmlInit()
-    except Exception as exc:
-        return {"error": f"NVML init failed (no NVIDIA GPU or driver issue?): {exc}"}
+    pynvml.nvmlInit()
     try:
         handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_index)
         name = pynvml.nvmlDeviceGetName(handle)
-        if isinstance(name, bytes):
-            name = name.decode()
         temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
         util = pynvml.nvmlDeviceGetUtilizationRates(handle)
         mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
@@ -861,8 +914,6 @@ def get_gpu_status(gpu_index: int = 0) -> dict:
             "vram_used_mb": round(mem.used / 1024 / 1024),
             "vram_free_mb": round(mem.free / 1024 / 1024),
         }
-    except Exception as exc:
-        return {"error": f"GPU query failed (index {gpu_index}): {exc}"}
     finally:
         pynvml.nvmlShutdown()
 
@@ -882,12 +933,7 @@ def _history_path(cfg_path: Path) -> Path:
 def _load_history(cfg_path: Path) -> list[dict]:
     hp = _history_path(cfg_path)
     if hp.exists():
-        try:
-            return _json.loads(hp.read_text(encoding="utf-8"))
-        except Exception:
-            # Corrupted history file — start fresh rather than crashing _snapshot.
-            logger.warning("History file %s is corrupted; resetting.", hp)
-            return []
+        return _json.loads(hp.read_text(encoding="utf-8"))
     return []
 
 
@@ -1141,16 +1187,6 @@ def _build_recommendations(
             elif prefix == "GraphicsVR" and tlod < 1.0:
                 _tip(tlod_key, "1.0 – 2.0",
                      "In VR kann die LoD etwas höher — deine GPU schafft das.")
-        elif tier_name == "mid_high":
-            if prefix == "Graphics" and tlod < 1.5:
-                _tip(tlod_key, "1.5 – 2.5",
-                     f"Deine GPU kann moderate Terrain LoD ({label}) gut handeln.")
-            elif prefix == "GraphicsVR" and tlod < 1.0:
-                _tip(tlod_key, "1.0 – 1.5",
-                     "In VR ist bis LoD 1.5 mit deiner GPU gut machbar.")
-            if tlod > 3.0:
-                _tip(tlod_key, "2.0 – 2.5",
-                     f"Terrain LoD ({label}) über 3.0 kann selbst bei 10–16 GB VRAM zu Rucklern führen.")
         elif tier_name in ("mid", "low_mid"):
             if tlod > 2.0:
                 _tip(tlod_key, "1.0 – 1.5",
@@ -1379,12 +1415,10 @@ def analyze_msfs_graphics(
     gpu_util = 0
     try:
         pynvml.nvmlInit()
-        try:
-            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-            gpu_temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
-            gpu_util = pynvml.nvmlDeviceGetUtilizationRates(handle).gpu
-        finally:
-            pynvml.nvmlShutdown()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        gpu_temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+        gpu_util = pynvml.nvmlDeviceGetUtilizationRates(handle).gpu
+        pynvml.nvmlShutdown()
     except Exception:
         pass
 
@@ -1768,30 +1802,6 @@ _MSFS_VALUE_GROUP: dict[str, str] = {
     "GraphicsVR.AnisotropicFilter": "GraphicsVR.AnisotropicFilter",
     "Graphics.GrassAndBushes": "Graphics.GrassAndBushes",
 }
-
-# Maps VR settings to their desktop counterparts and vice versa
-_VR_DESKTOP_PAIRS: dict[str, str] = {
-    "GraphicsVR.TerrainLoD":        "Graphics.TerrainLoD",
-    "GraphicsVR.ObjectsLoD":        "Graphics.ObjectsLoD",
-    "GraphicsVR.CloudsQuality":     "Graphics.CloudsQuality",
-    "GraphicsVR.AnisotropicFilter": "Graphics.AnisotropicFilter",
-    "GraphicsVR.SSContact":         "Graphics.SSContact",
-    "GraphicsVR.Reflections":       "Graphics.Reflections",
-    "GraphicsVR.TextureResolution": "Graphics.TextureResolution",
-    "GraphicsVR.MotionBlur":        "Graphics.MotionBlur",
-    "GraphicsVR.ShadowQuality":     "Graphics.ShadowQuality",
-    # reverse mappings
-    "Graphics.TerrainLoD":          "GraphicsVR.TerrainLoD",
-    "Graphics.ObjectsLoD":          "GraphicsVR.ObjectsLoD",
-    "Graphics.CloudsQuality":       "GraphicsVR.CloudsQuality",
-    "Graphics.AnisotropicFilter":   "GraphicsVR.AnisotropicFilter",
-    "Graphics.SSContact":           "GraphicsVR.SSContact",
-    "Graphics.Reflections":         "GraphicsVR.Reflections",
-    "Graphics.TextureResolution":   "GraphicsVR.TextureResolution",
-    "Graphics.MotionBlur":          "GraphicsVR.MotionBlur",
-    "Graphics.ShadowQuality":       "GraphicsVR.ShadowQuality",
-}
-
 # Default group for quality-type settings (Clouds, Texture, Shadows, etc.)
 _QUALITY_KEYS = {
     "Graphics.CloudsQuality", "GraphicsVR.CloudsQuality",
@@ -1808,8 +1818,7 @@ def set_msfs_setting(
     value: str,
     usercfg_path: str = "",
     auto_restart: bool = True,
-    restart_in_vr: bool = False,
-    apply_to_both: bool = True,
+    restart_in_vr: bool = True,
 ) -> dict:
     """Change a single MSFS 2024 graphics setting and restart so it takes effect.
 
@@ -1835,16 +1844,14 @@ def set_msfs_setting(
                or a number ("2", "1.5", "0"). For LoD values use decimals (e.g. "2.0").
         usercfg_path: Path to UserCfg.opt (auto-detected if empty).
         auto_restart: Restart MSFS automatically so the change is visible (default True).
-        restart_in_vr: If restarting, use VR startup sequence (default False).
-        apply_to_both: Also apply the change to the desktop/VR counterpart setting (default True).
-                       Ensures the setting is active regardless of whether MSFS runs in VR or desktop mode.
+        restart_in_vr: If restarting, use VR startup sequence (default True).
     """
     import time
 
     cfg_path = _find_usercfg(usercfg_path) or DEFAULT_USERCFG_PATH
     if not cfg_path.exists():
-        # Report which paths were checked (all candidates, not just missing ones)
-        searched = [str(p) for p in _USERCFG_CANDIDATES]
+        # Report which paths were checked
+        searched = [str(p) for p in _USERCFG_CANDIDATES if not p.exists()]
         return {
             "error": f"UserCfg.opt nicht gefunden: {cfg_path}",
             "gesucht": searched[:6],
@@ -1909,10 +1916,9 @@ def set_msfs_setting(
 
     msfs_was_running = _is_msfs_running()
     if msfs_was_running:
-        _kill_msfs(timeout_s=35)
-        # Wait for MSFS to fully flush UserCfg.opt to disk before we write
-        _wait_for_file_unlocked(cfg_path, timeout_s=25)
-        time.sleep(1.5)  # Extra OS flush buffer
+        _kill_msfs(timeout_s=30)
+        # Wait for MSFS to release the file lock instead of blind sleep
+        _wait_for_file_unlocked(cfg_path, timeout_s=10)
 
     # Re-read the file AFTER kill (MSFS may have written to it during shutdown)
     current_settings = _read_current_settings(cfg_path)
@@ -1928,7 +1934,6 @@ def set_msfs_setting(
     new_entries, not_applied = _apply_overrides(entries, {config_key: resolved_value})
     new_text = _entries_to_text(new_entries)
     cfg_path.write_text(new_text, encoding="utf-8")
-    _invalidate_usercfg_cache()
 
     if config_key in not_applied:
         return {
@@ -1940,23 +1945,12 @@ def set_msfs_setting(
             "saved_version": saved_version,
         }
 
-    # Also apply to desktop/VR counterpart so both modes see the change
-    twin_key_applied: str | None = None
-    if apply_to_both and config_key in _VR_DESKTOP_PAIRS:
-        twin_key = _VR_DESKTOP_PAIRS[config_key]
-        twin_entries, twin_not_applied = _apply_overrides(new_entries, {twin_key: resolved_value})
-        if twin_key not in twin_not_applied:
-            new_entries = twin_entries
-            cfg_path.write_text(_entries_to_text(new_entries), encoding="utf-8")
-            _invalidate_usercfg_cache()
-            twin_key_applied = twin_key
-
     # Verify the write actually stuck
     verify_settings = _read_current_settings(cfg_path)
     verified = verify_settings.get(config_key) == resolved_value
 
     result = {
-        "status": "ok" if verified else "verifizierung_fehlgeschlagen",
+        "status": "ok",
         "einstellung": label,
         "key": config_key,
         "vorher": old_display,
@@ -1967,15 +1961,10 @@ def set_msfs_setting(
         "verifiziert": verified,
     }
 
-    if twin_key_applied:
-        result["auch_angewendet_auf"] = twin_key_applied
-
     if not verified:
         result["warnung"] = (
-            f"FEHLER: Wert wurde NICHT korrekt gespeichert! "
-            f"Datei zeigt: {verify_settings.get(config_key, '?')} "
-            f"(erwartet: {resolved_value}). "
-            f"Bitte prüfe ob UserCfg.opt schreibgeschützt ist oder ein anderer Prozess sie blockiert."
+            f"Wert in Datei nach Schreiben: {verify_settings.get(config_key, '?')} "
+            f"(erwartet: {resolved_value}). Datei wurde möglicherweise nicht korrekt geschrieben."
         )
 
     # Restart MSFS so changes become visible
@@ -2579,29 +2568,50 @@ PIMAX_SETTING_DEFS: dict[str, dict] = {
         "values": {"true": "An", "false": "Aus", "0": "Aus", "1": "An"},
     },
     # ── Pimax Play echte Config-Keys (Device Settings → Games → Color Options) ──
+    # Pimax Play Hardware-Farbeinstellungen (Device Settings → Games → Color Options)
+    # Schieberegler-Bereich: 0–100, Neutralwert = 50 (kein Effekt)
+    # ACHTUNG: saturation=0 → Graustufen (B&W)!  brightness=0 → schwarzes Bild!
     "piplay_color_brightness_0": {
-        "label": "Brightness Left Eye",
-        "description": "Pimax Play Device Settings Brightness linkes Auge. Slider-Wert (Ganzzahl).",
+        "label": "Helligkeit Linkes Auge",
+        "min": 0, "max": 100, "default": 50,
+        "unit": "slider",
+        "hint": "0=sehr dunkel, 50=neutral (kein Effekt), 100=sehr hell",
+        "description": "Pimax Play Display-Helligkeit (Hardware-Ebene, kein GPU-Aufwand).",
     },
     "piplay_color_brightness_1": {
-        "label": "Brightness Right Eye",
-        "description": "Pimax Play Device Settings Brightness rechtes Auge. Slider-Wert (Ganzzahl).",
+        "label": "Helligkeit Rechtes Auge",
+        "min": 0, "max": 100, "default": 50,
+        "unit": "slider",
+        "hint": "0=sehr dunkel, 50=neutral (kein Effekt), 100=sehr hell",
+        "description": "Pimax Play Display-Helligkeit rechtes Auge.",
     },
     "piplay_color_contrast_0": {
-        "label": "Contrast Left Eye",
-        "description": "Pimax Play Device Settings Contrast linkes Auge. Slider-Wert (Ganzzahl).",
+        "label": "Kontrast Linkes Auge",
+        "min": 0, "max": 100, "default": 50,
+        "unit": "slider",
+        "hint": "0=kein Kontrast, 50=neutral, 100=max Kontrast",
+        "description": "Pimax Play Display-Kontrast (Hardware-Ebene).",
     },
     "piplay_color_contrast_1": {
-        "label": "Contrast Right Eye",
-        "description": "Pimax Play Device Settings Contrast rechtes Auge. Slider-Wert (Ganzzahl).",
+        "label": "Kontrast Rechtes Auge",
+        "min": 0, "max": 100, "default": 50,
+        "unit": "slider",
+        "hint": "0=kein Kontrast, 50=neutral, 100=max Kontrast",
+        "description": "Pimax Play Display-Kontrast rechtes Auge.",
     },
     "piplay_color_saturation_0": {
-        "label": "Saturation Left Eye",
-        "description": "Pimax Play Device Settings Saturation linkes Auge. Slider-Wert.",
+        "label": "Sättigung Linkes Auge",
+        "min": 0, "max": 100, "default": 50,
+        "unit": "slider",
+        "hint": "0=GRAUSTUFEN (B&W!), 50=neutral, 100=maximal gesättigt",
+        "description": "Pimax Play Display-Sättigung (Hardware-Ebene).",
     },
     "piplay_color_saturation_1": {
-        "label": "Saturation Right Eye",
-        "description": "Pimax Play Device Settings Saturation rechtes Auge. Slider-Wert.",
+        "label": "Sättigung Rechtes Auge",
+        "min": 0, "max": 100, "default": 50,
+        "unit": "slider",
+        "hint": "0=GRAUSTUFEN (B&W!), 50=neutral, 100=maximal gesättigt",
+        "description": "Pimax Play Display-Sättigung rechtes Auge.",
     },
     "piplay_refreshrate": {
         "label": "Refresh Rate (Hz)",
@@ -2966,14 +2976,12 @@ def analyze_pimax_settings(
     vram_mb = 0
     try:
         pynvml.nvmlInit()
-        try:
-            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-            gpu_name = pynvml.nvmlDeviceGetName(handle)
-            if isinstance(gpu_name, bytes):
-                gpu_name = gpu_name.decode()
-            vram_mb = round(pynvml.nvmlDeviceGetMemoryInfo(handle).total / 1024 / 1024)
-        finally:
-            pynvml.nvmlShutdown()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        gpu_name = pynvml.nvmlDeviceGetName(handle)
+        if isinstance(gpu_name, bytes):
+            gpu_name = gpu_name.decode()
+        vram_mb = round(pynvml.nvmlDeviceGetMemoryInfo(handle).total / 1024 / 1024)
+        pynvml.nvmlShutdown()
     except Exception:
         pass
 
@@ -3790,16 +3798,44 @@ def set_pimax_setting(
             new_val = type(old_val)(old_val + delta)
         else:
             new_val = parsed_value
-        # Don't clamp — the actual range depends on Pimax version/setting
-        new_values[mk] = new_val
         defn = PIMAX_SETTING_DEFS.get(mk, {})
+
+        # Clamp to defined range if available
+        if defn.get("unit") == "slider" and isinstance(new_val, (int, float)):
+            s_min = defn.get("min", 0)
+            s_max = defn.get("max", 100)
+            new_val = max(s_min, min(s_max, int(new_val)))
+
+        new_values[mk] = new_val
+
         applied[mk] = {
             "label": defn.get("label", mk),
             "old": _pimax_human_value(mk, old_val),
             "new": _pimax_human_value(mk, new_val),
             "old_raw": old_val,
             "new_raw": new_val,
+            "hint": defn.get("hint", ""),
         }
+
+    # Safety warnings for color keys
+    color_warnings: list[str] = []
+    for mk, info in applied.items():
+        nv = info["new_raw"]
+        if "saturation" in mk and isinstance(nv, (int, float)) and nv == 0:
+            color_warnings.append(
+                f"⚠️ {info['label']} = 0 → Bild wird GRAUSTUFEN (schwarz-weiß)! "
+                "Neutral = 50."
+            )
+        elif "saturation" in mk and isinstance(nv, (int, float)) and nv < 20:
+            color_warnings.append(
+                f"⚠️ {info['label']} = {nv} ist sehr niedrig — Farben wirken fast grau. "
+                "Neutral = 50."
+            )
+        elif "brightness" in mk and isinstance(nv, (int, float)) and nv < 10:
+            color_warnings.append(
+                f"⚠️ {info['label']} = {nv} ist sehr niedrig — Bild fast schwarz! "
+                "Neutral = 50."
+            )
 
     if dry_run:
         logger.info("set_pimax_setting DRY RUN setting=%r value=%r → %s", setting, value, applied)
@@ -3845,6 +3881,7 @@ def set_pimax_setting(
     # Build result
     if len(applied) == 1:
         info = applied[actual_key]
+        defn_main = PIMAX_SETTING_DEFS.get(actual_key, {})
         result = {
             "status": "ok",
             "setting": info["label"],
@@ -3855,6 +3892,8 @@ def set_pimax_setting(
             "backup": str(backup_file),
             "registry_audit": registry_audit,
         }
+        if defn_main.get("hint"):
+            result["wertebereich"] = defn_main["hint"]
     else:
         result = {
             "status": "ok",
@@ -3866,6 +3905,9 @@ def set_pimax_setting(
             "backup": str(backup_file),
             "registry_audit": registry_audit,
         }
+
+    if color_warnings:
+        result["warnungen"] = color_warnings
 
     _pimax_apply_restart(result, restart_service, force_restart)
     return result
@@ -4416,7 +4458,7 @@ def revert_last_change(
 
 @mcp.tool()
 def adjust_pimax_brightness(
-    direction: Literal["up", "down", "set", "get"] = "up",
+    direction: Literal["up", "down", "set"] = "up",
     amount: int = 10,
     target_value: int | None = None,
     config_path: str = "",
@@ -4430,1255 +4472,23 @@ def adjust_pimax_brightness(
     values seem wrong — Pimax stores settings in multiple places.
 
     Args:
-        direction: "up" to increase, "down" to decrease, "set" for absolute
-                   value, "get" to read the current brightness without changing.
-        amount: How much to change (default 10). Ignored if direction is "set" or "get".
-        target_value: Absolute value when direction is "set". Must be 0–255.
+        direction: "up" to increase, "down" to decrease, "set" for absolute value.
+        amount: How much to change (default 10). Ignored if direction is "set".
+        target_value: Absolute value when direction is "set".
         config_path: Path to Pimax config (auto-detected if empty).
     """
-    if direction == "get":
-        cfg = _find_pimax_config(config_path)
-        if cfg is None:
-            return _pimax_not_found_error()
-        try:
-            settings = _read_pimax_settings(cfg)
-            brightness_l = settings.get("piplay_color_brightness_0",
-                            settings.get("brightness", None))
-            brightness_r = settings.get("piplay_color_brightness_1", brightness_l)
-            return {
-                "status": "ok",
-                "brightness_left": brightness_l,
-                "brightness_right": brightness_r,
-                "config_file": str(cfg),
-            }
-        except Exception as e:
-            return {"error": str(e)}
-
-    if direction == "set":
-        if target_value is None:
-            return {"error": "target_value is required when direction='set'."}
-        if not (0 <= target_value <= 255):
-            return {
-                "error": (
-                    f"target_value must be between 0 and 255, got {target_value}. "
-                    "Pimax brightness range is 0 (darkest) to 255 (brightest)."
-                )
-            }
+    if direction == "set" and target_value is not None:
         val_str = str(target_value)
     elif direction == "up":
         val_str = f"+{amount}"
     else:
         val_str = f"-{amount}"
 
-    result = set_pimax_setting(
+    return set_pimax_setting(
         setting="brightness",
         value=val_str,
         config_path=config_path,
     )
-    # Enrich result with confirmed new value for easy verification
-    if isinstance(result, dict) and result.get("status") == "ok":
-        new_raw = result.get("new_value")
-        if new_raw is None:
-            new_raw = (result.get("changed_keys", {})
-                       .get("piplay_color_brightness_0", {})
-                       .get("new"))
-        if new_raw is not None:
-            result["confirmed_brightness"] = new_raw
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Pimax — extended headset info, comprehensive settings, MSFS optimizer
-# ---------------------------------------------------------------------------
-
-# ── Per-model capability database ─────────────────────────────────────────
-# Keys are lowercase fragments of the model name string.
-# Entries are ordered longest-first so Crystal Super matches before Crystal.
-
-_PIMAX_MODEL_DB: dict[str, dict] = {
-    "crystal super": {
-        "display_name": "Pimax Crystal Super",
-        "resolution_per_eye": (3840, 2160),
-        "max_refresh_hz": [72, 90, 120],
-        "eye_tracking": True,
-        "foveated_rendering": True,
-        "brightness_control": True,
-        "pitool_compatible": False,
-        "pimax_play_compatible": True,
-    },
-    "crystal light": {
-        "display_name": "Pimax Crystal Light",
-        "resolution_per_eye": (2880, 2880),
-        "max_refresh_hz": [72, 90, 120],
-        "eye_tracking": True,
-        "foveated_rendering": True,
-        "brightness_control": True,
-        "pitool_compatible": False,
-        "pimax_play_compatible": True,
-    },
-    "crystal": {
-        "display_name": "Pimax Crystal",
-        "resolution_per_eye": (2880, 2880),
-        "max_refresh_hz": [72, 90, 120],
-        "eye_tracking": True,
-        "foveated_rendering": True,
-        "brightness_control": True,
-        "pitool_compatible": False,
-        "pimax_play_compatible": True,
-    },
-    "8kx": {
-        "display_name": "Pimax 8KX",
-        "resolution_per_eye": (3840, 2160),
-        "max_refresh_hz": [72, 90, 120],
-        "eye_tracking": False,
-        "foveated_rendering": False,
-        "brightness_control": True,
-        "pitool_compatible": True,
-        "pimax_play_compatible": True,
-    },
-    "8k+": {
-        "display_name": "Pimax 8K+",
-        "resolution_per_eye": (3840, 2160),
-        "max_refresh_hz": [72, 90, 110],
-        "eye_tracking": False,
-        "foveated_rendering": False,
-        "brightness_control": True,
-        "pitool_compatible": True,
-        "pimax_play_compatible": True,
-    },
-    "5k super": {
-        "display_name": "Pimax 5K Super",
-        "resolution_per_eye": (2560, 1440),
-        "max_refresh_hz": [72, 90, 120, 144, 180],
-        "eye_tracking": False,
-        "foveated_rendering": False,
-        "brightness_control": True,
-        "pitool_compatible": True,
-        "pimax_play_compatible": False,
-    },
-    "5k+": {
-        "display_name": "Pimax 5K+",
-        "resolution_per_eye": (2560, 1440),
-        "max_refresh_hz": [72, 90, 110],
-        "eye_tracking": False,
-        "foveated_rendering": False,
-        "brightness_control": True,
-        "pitool_compatible": True,
-        "pimax_play_compatible": False,
-    },
-    "5k": {
-        "display_name": "Pimax 5K",
-        "resolution_per_eye": (2560, 1440),
-        "max_refresh_hz": [72, 90],
-        "eye_tracking": False,
-        "foveated_rendering": False,
-        "brightness_control": True,
-        "pitool_compatible": True,
-        "pimax_play_compatible": False,
-    },
-}
-
-
-def _match_pimax_model(model_str: str) -> dict:
-    """Match a raw model string to a known Pimax model capability entry.
-
-    Tries longest model-name keys first to avoid 'crystal' matching before
-    'crystal super' / 'crystal light'.
-    """
-    if not model_str:
-        return {}
-    ml = model_str.lower()
-    for key in sorted(_PIMAX_MODEL_DB, key=len, reverse=True):
-        if key in ml:
-            return dict(_PIMAX_MODEL_DB[key])
-    return {
-        "display_name": model_str,
-        "eye_tracking": False,
-        "foveated_rendering": False,
-        "brightness_control": True,
-        "max_refresh_hz": [72, 90],
-    }
-
-
-def _find_pitool_config() -> Path | None:
-    """Find PiTool legacy configuration JSON.
-
-    Searches:
-    - %APPDATA%\\Pimax\\PiTool\\pitool.json
-    - %LOCALAPPDATA%\\Pimax\\PiTool\\pitool.json
-    - Common Program Files install directories
-    - Registry HKCU\\SOFTWARE\\Pimax\\PiTool → InstallPath
-    """
-    appdata = os.environ.get("APPDATA", "")
-    localappdata = os.environ.get("LOCALAPPDATA", "")
-    candidates = [
-        Path(appdata) / "Pimax" / "PiTool" / "pitool.json",
-        Path(localappdata) / "Pimax" / "PiTool" / "pitool.json",
-        Path(appdata) / "Pimax" / "pitool.json",
-        Path(localappdata) / "Pimax" / "pitool.json",
-        Path(r"C:\Program Files\Pimax\PiTool\pitool.json"),
-        Path(r"C:\Program Files (x86)\Pimax\PiTool\pitool.json"),
-        Path(r"C:\Program Files\PiTool\pitool.json"),
-        Path(r"C:\Program Files (x86)\PiTool\pitool.json"),
-        Path(r"D:\Program Files\Pimax\PiTool\pitool.json"),
-        Path(r"D:\PiTool\pitool.json"),
-    ]
-    for p in candidates:
-        if p.exists():
-            return p
-    # Registry fallback
-    try:
-        r = _reg(["query", r"HKCU\SOFTWARE\Pimax\PiTool", "/v", "InstallPath"], timeout=5)
-        if r.returncode == 0:
-            for line in r.stdout.splitlines():
-                if "InstallPath" in line:
-                    parts = line.strip().split(None, 2)
-                    if len(parts) >= 3:
-                        install_path = Path(parts[-1].strip())
-                        candidate = install_path / "pitool.json"
-                        if candidate.exists():
-                            return candidate
-    except Exception:
-        pass
-    return None
-
-
-def _find_pimax_play_config() -> Path | None:
-    """Find Pimax Play / Pimax Client configuration JSON.
-
-    Searches:
-    - %APPDATA%\\Pimax\\runtime\\default.vrsettings
-    - %LOCALAPPDATA%\\Pimax\\PimaxPlay\\settings.json
-    - C:\\Program Files\\Pimax\\runtime\\
-    """
-    appdata = os.environ.get("APPDATA", "")
-    localappdata = os.environ.get("LOCALAPPDATA", "")
-    candidates = [
-        Path(appdata) / "Pimax" / "runtime" / "default.vrsettings",
-        Path(appdata) / "Pimax" / "runtime" / "settings.json",
-        Path(localappdata) / "Pimax" / "PimaxPlay" / "settings.json",
-        Path(localappdata) / "Pimax" / "PimaxPlay" / "config.json",
-        Path(localappdata) / "Pimax" / "Pimax Play" / "settings.json",
-        Path(localappdata) / "Pimax" / "PimaxClient" / "settings.json",
-        Path(appdata) / "Pimax" / "PimaxPlay" / "settings.json",
-        Path(r"C:\Program Files\Pimax\runtime\default.vrsettings"),
-        Path(r"C:\Program Files\Pimax\runtime\settings.json"),
-        Path(r"C:\Program Files\Pimax\PimaxPlay\settings.json"),
-        Path(r"C:\Program Files\Pimax\PimaxPlay\config.json"),
-        Path(r"C:\Program Files (x86)\Pimax\runtime\default.vrsettings"),
-    ]
-    for p in candidates:
-        if p.exists():
-            return p
-    return None
-
-
-def _find_pimax_openxr_config() -> Path | None:
-    """Find the Pimax Play OpenXR layer JSON configuration file.
-
-    When Pimax Play is the active OpenXR runtime, rendering overrides
-    (supersampling, foveated rendering) live in this file.
-    """
-    appdata = os.environ.get("APPDATA", "")
-    candidates = [
-        Path(appdata) / "Pimax" / "runtime" / "openxr_default.json",
-        Path(appdata) / "Pimax" / "runtime" / "openxr.json",
-        Path(r"C:\Program Files\Pimax\runtime\openxr_default.json"),
-        Path(r"C:\Program Files\Pimax\runtime\openxr.json"),
-        Path(r"C:\Program Files (x86)\Pimax\runtime\openxr_default.json"),
-    ]
-    for p in candidates:
-        if p.exists():
-            return p
-    return None
-
-
-def _get_hw_for_tier() -> tuple[float, str, int, float]:
-    """Return (vram_gb, gpu_name, cpu_cores, ram_gb) for VR tier classification.
-
-    Used by optimize_pimax_for_msfs and get_pimax_recommended_settings.
-    Falls back to conservative defaults if hardware queries fail.
-    """
-    vram_gb: float = 8.0
-    gpu_name: str = ""
-    cpu_cores: int = 8
-    ram_gb: float = 16.0
-    try:
-        pynvml.nvmlInit()
-        try:
-            h = pynvml.nvmlDeviceGetHandleByIndex(0)
-            name = pynvml.nvmlDeviceGetName(h)
-            if isinstance(name, bytes):
-                name = name.decode()
-            mem = pynvml.nvmlDeviceGetMemoryInfo(h)
-            gpu_name = name
-            vram_gb = round(mem.total / 1024 ** 3, 1)
-        finally:
-            pynvml.nvmlShutdown()
-    except Exception:
-        pass
-    try:
-        cpu_raw = _ps_json(
-            "Get-CimInstance Win32_Processor | Select-Object NumberOfCores"
-        )
-        cpu_cores = int(cpu_raw[0].get("NumberOfCores", 8)) if cpu_raw else 8
-    except Exception:
-        pass
-    try:
-        ram_raw = _ps_json(
-            "Get-CimInstance Win32_PhysicalMemory | Select-Object Capacity"
-        )
-        total_bytes = sum(int(r.get("Capacity", 0) or 0) for r in ram_raw)
-        ram_gb = round(total_bytes / 1024 ** 3, 1) if total_bytes > 0 else 16.0
-    except Exception:
-        pass
-    return vram_gb, gpu_name, cpu_cores, ram_gb
-
-
-@mcp.tool()
-def get_pimax_headset_info() -> dict:
-    """Detect the connected Pimax headset model, firmware, refresh rate, and feature set.
-
-    Returns:
-    - model name and per-eye resolution
-    - maximum supported refresh rates for this model
-    - feature flags: eye_tracking, foveated_rendering, brightness_control
-    - which software stack is active: pitool vs pimax_play
-    - paths to detected config files (PiTool, Pimax Play, OpenXR layer)
-    - current refresh rate (if readable from config/registry)
-    - serial number and firmware version (if available via registry)
-
-    Call this first before optimizing Pimax settings so the AI knows which
-    features are available and which config files to target.
-    """
-    try:
-        result: dict = {
-            "model": "unknown",
-            "software_stack": "unknown",
-            "pitool_installed": False,
-            "pimax_play_installed": False,
-            "pimax_running": False,
-            "pitool_running": False,
-            "pitool_config": None,
-            "pimax_play_config": None,
-            "openxr_config": None,
-            "features": {
-                "eye_tracking": False,
-                "foveated_rendering": False,
-                "brightness_control": True,
-            },
-            "max_refresh_hz": [72, 90],
-            "resolution_per_eye": None,
-        }
-
-        # Detect running processes
-        pimax_running = any(_is_running(name) for name in _PIMAX_EXE_NAMES)
-        pitool_running = _is_running("PiTool.exe") or _is_running("PiServer.exe")
-        result["pimax_running"] = pimax_running
-        result["pitool_running"] = pitool_running
-
-        # Config file detection
-        pitool_cfg = _find_pitool_config()
-        piplay_cfg = _find_pimax_play_config()
-        openxr_cfg = _find_pimax_openxr_config()
-        result["pitool_installed"] = pitool_cfg is not None
-        result["pimax_play_installed"] = piplay_cfg is not None
-        result["pitool_config"] = str(pitool_cfg) if pitool_cfg else None
-        result["pimax_play_config"] = str(piplay_cfg) if piplay_cfg else None
-        result["openxr_config"] = str(openxr_cfg) if openxr_cfg else None
-
-        # Determine active software stack
-        if piplay_cfg and (pimax_running or not pitool_running):
-            result["software_stack"] = "pimax_play"
-        elif pitool_cfg or pitool_running:
-            result["software_stack"] = "pitool"
-        elif pimax_running:
-            result["software_stack"] = "pimax_play"
-
-        # Model / serial / firmware detection via registry
-        model_str = ""
-        serial = ""
-        firmware = ""
-        current_refresh: int | None = None
-        for reg_path in [
-            r"HKCU\SOFTWARE\Pimax",
-            r"HKCU\SOFTWARE\Pimax\PimaxPlay",
-            r"HKLM\SOFTWARE\Pimax",
-            r"HKLM\SOFTWARE\Pimax\PimaxPlay",
-        ]:
-            try:
-                r = _reg(["query", reg_path], timeout=5)
-                if r.returncode != 0:
-                    continue
-                for line in r.stdout.splitlines():
-                    ll = line.strip().lower()
-                    parts = line.strip().split(None, 2)
-                    val = parts[-1].strip() if len(parts) >= 3 else ""
-                    if not model_str and any(
-                        kw in ll for kw in ("devicename", "headsetmodel", "productname")
-                    ):
-                        model_str = val
-                    if not serial and "serial" in ll:
-                        serial = val
-                    if not firmware and "firmware" in ll:
-                        firmware = val
-                    if current_refresh is None and "refreshrate" in ll:
-                        try:
-                            current_refresh = int(val)
-                        except ValueError:
-                            pass
-            except Exception:
-                pass
-
-        # WMI USB device fallback
-        if not model_str:
-            try:
-                usb_raw = _ps_json(
-                    "Get-PnpDevice | Where-Object { $_.FriendlyName -match 'Pimax' } | "
-                    "Select-Object FriendlyName, InstanceId, Status"
-                )
-                for dev in usb_raw:
-                    fname = dev.get("FriendlyName", "") or ""
-                    if fname:
-                        model_str = fname
-                        break
-            except Exception:
-                pass
-
-        # Config-file fallback for model name
-        if not model_str:
-            for cfg_path in [piplay_cfg, pitool_cfg]:
-                if cfg_path and cfg_path.exists():
-                    try:
-                        data = _json.loads(cfg_path.read_text(encoding="utf-8"))
-                        for key in (
-                            "deviceName", "headsetModel", "model", "productName",
-                            "DeviceName", "HeadsetModel", "Model",
-                        ):
-                            v = data.get(key, "")
-                            if v and isinstance(v, str):
-                                model_str = v
-                                break
-                    except Exception:
-                        pass
-                if model_str:
-                    break
-
-        # Current refresh rate from config files
-        if current_refresh is None:
-            for cfg_path in [piplay_cfg, pitool_cfg]:
-                if cfg_path and cfg_path.exists():
-                    try:
-                        data = _json.loads(cfg_path.read_text(encoding="utf-8"))
-                        for key in (
-                            "refreshRate", "refresh_rate", "piplay_refreshrate",
-                            "RefreshRate", "displayHz",
-                        ):
-                            v = data.get(key)
-                            if v is not None:
-                                try:
-                                    current_refresh = int(v)
-                                    break
-                                except (ValueError, TypeError):
-                                    pass
-                    except Exception:
-                        pass
-                if current_refresh is not None:
-                    break
-
-        if serial:
-            result["serial_number"] = serial
-        if firmware:
-            result["firmware_version"] = firmware
-        if current_refresh:
-            result["current_refresh_hz"] = current_refresh
-
-        # Map to capability record
-        model_info = _match_pimax_model(model_str)
-        if model_info:
-            result["model"] = model_info.get("display_name", model_str or "unknown")
-            result["features"] = {
-                "eye_tracking": model_info.get("eye_tracking", False),
-                "foveated_rendering": model_info.get("foveated_rendering", False),
-                "brightness_control": model_info.get("brightness_control", True),
-            }
-            result["max_refresh_hz"] = model_info.get("max_refresh_hz", [72, 90])
-            if model_info.get("resolution_per_eye"):
-                w, h = model_info["resolution_per_eye"]
-                result["resolution_per_eye"] = f"{w}x{h}"
-        elif model_str:
-            result["model"] = model_str
-
-        return result
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def get_pimax_settings(config_path: str = "") -> dict:
-    """Read ALL current Pimax settings with values and valid ranges.
-
-    Detects whether PiTool or Pimax Play is installed and reads from the
-    correct location. Merges PiTool config, Pimax Play config, and registry
-    into a unified view.
-
-    Returns:
-    - current_values: all detected setting key/value pairs
-    - valid_ranges: type, min/max or options, and description per key
-    - sources: list of config files/registry entries that were read
-    - software_stack: pitool / pimax_play / unknown
-    - openxr_settings: contents of the Pimax OpenXR layer config (if found)
-
-    Use this before set_pimax_settings or optimize_pimax_for_msfs to
-    understand what is currently configured and what can be changed.
-    """
-    try:
-        result: dict = {
-            "current_values": {},
-            "valid_ranges": {},
-            "sources": [],
-            "software_stack": "unknown",
-        }
-
-        _VALID_RANGES: dict[str, dict] = {
-            "renderResolution": {
-                "type": "float", "min": 0.5, "max": 2.0,
-                "description": "Supersampling multiplier (1.0 = native resolution)",
-            },
-            "refreshRate": {
-                "type": "int", "options": [72, 90, 110, 120, 144],
-                "description": "Display refresh rate in Hz (model-dependent)",
-            },
-            "fov": {
-                "type": "str", "options": ["small", "normal", "large", "potato"],
-                "description": "Field of view preset",
-            },
-            "fovLevel": {
-                "type": "int", "options": [0, 1, 2, 3],
-                "description": "FOV level: 0=Potato, 1=Small, 2=Normal, 3=Large",
-            },
-            "smartSmoothing": {
-                "type": "bool",
-                "description": "Asynchronous Spacewarp / motion smoothing reprojection",
-            },
-            "compulsorySmoothing": {
-                "type": "bool",
-                "description": "Always-on reprojection (ignores FPS threshold)",
-            },
-            "ffrLevel": {
-                "type": "int", "options": [0, 1, 2, 3, 4],
-                "description": "Fixed Foveated Rendering level: 0=Off, 1=Low … 4=Ultra",
-            },
-            "parallelProjection": {
-                "type": "bool",
-                "description": "Required True for correct MSFS VR rendering (prevents warping)",
-            },
-            "brightness": {
-                "type": "int", "min": 0, "max": 255,
-                "description": "Backlight brightness applied to both eyes",
-            },
-            "contrast": {
-                "type": "int", "min": 0, "max": 255,
-                "description": "Display contrast level",
-            },
-            "eyeTracking": {
-                "type": "bool",
-                "description": "Eye tracking (Pimax Crystal / Crystal Super only)",
-            },
-            "dynamicFoveatedRendering": {
-                "type": "bool",
-                "description": "Dynamic FFR driven by eye tracking gaze data",
-            },
-            "ipd": {
-                "type": "float", "min": 55.0, "max": 75.0,
-                "description": "Interpupillary distance in mm",
-            },
-            "hiddenAreaMask": {
-                "type": "bool",
-                "description": "Hidden area mask to skip rendering outside visible FOV",
-            },
-            "piplay_color_brightness_0": {
-                "type": "int", "min": 0, "max": 100,
-                "description": "Left eye brightness slider (Pimax Play Device Settings)",
-            },
-            "piplay_color_brightness_1": {
-                "type": "int", "min": 0, "max": 100,
-                "description": "Right eye brightness slider (Pimax Play Device Settings)",
-            },
-            "piplay_color_contrast_0": {
-                "type": "int", "min": 0, "max": 100,
-                "description": "Left eye contrast slider",
-            },
-            "piplay_color_contrast_1": {
-                "type": "int", "min": 0, "max": 100,
-                "description": "Right eye contrast slider",
-            },
-            "piplay_color_saturation_0": {
-                "type": "int", "min": 0, "max": 100,
-                "description": "Left eye saturation slider",
-            },
-            "piplay_color_saturation_1": {
-                "type": "int", "min": 0, "max": 100,
-                "description": "Right eye saturation slider",
-            },
-            "piplay_refreshrate": {
-                "type": "int", "options": [72, 90, 110, 120, 144],
-                "description": "Refresh rate as stored by Pimax Play",
-            },
-        }
-        result["valid_ranges"] = _VALID_RANGES
-
-        # PiTool config
-        pitool_cfg = _find_pitool_config()
-        if pitool_cfg:
-            try:
-                data = _json.loads(pitool_cfg.read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    result["current_values"].update(data)
-                    result["sources"].append({"file": str(pitool_cfg), "type": "pitool"})
-                    result["software_stack"] = "pitool"
-            except Exception as exc:
-                result["sources"].append(
-                    {"file": str(pitool_cfg), "type": "pitool", "error": str(exc)}
-                )
-
-        # Main Pimax config (via existing _find_pimax_config)
-        cfg = _find_pimax_config(config_path)
-        if cfg and cfg != pitool_cfg:
-            try:
-                settings = _read_pimax_settings(cfg)
-                result["current_values"].update(settings)
-                result["sources"].append({"file": str(cfg), "type": "main_config"})
-                if result["software_stack"] == "unknown":
-                    result["software_stack"] = "pimax_play"
-            except Exception as exc:
-                result["sources"].append(
-                    {"file": str(cfg), "type": "main_config", "error": str(exc)}
-                )
-
-        # Pimax Play config
-        piplay_cfg = _find_pimax_play_config()
-        if piplay_cfg and piplay_cfg != cfg:
-            try:
-                data = _json.loads(piplay_cfg.read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    result["current_values"].update(data)
-                    result["sources"].append({"file": str(piplay_cfg), "type": "pimax_play"})
-                    if result["software_stack"] == "unknown":
-                        result["software_stack"] = "pimax_play"
-            except Exception as exc:
-                result["sources"].append(
-                    {"file": str(piplay_cfg), "type": "pimax_play", "error": str(exc)}
-                )
-
-        # Registry overlay (highest priority — Pimax Play reads live from registry)
-        try:
-            reg_vals = _read_pimax_registry()
-            if reg_vals:
-                result["current_values"].update(reg_vals)
-                result["sources"].append({"file": "registry", "type": "registry"})
-        except Exception:
-            pass
-
-        # OpenXR layer config
-        openxr_cfg = _find_pimax_openxr_config()
-        if openxr_cfg:
-            try:
-                data = _json.loads(openxr_cfg.read_text(encoding="utf-8"))
-                result["openxr_settings"] = data
-                result["sources"].append({"file": str(openxr_cfg), "type": "openxr"})
-            except Exception as exc:
-                result["sources"].append(
-                    {"file": str(openxr_cfg), "type": "openxr", "error": str(exc)}
-                )
-
-        if not result["current_values"]:
-            return _pimax_not_found_error()
-
-        return result
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def set_pimax_settings(
-    render_quality: float | None = None,
-    smart_smoothing: bool | None = None,
-    hidden_area_mask: bool | None = None,
-    fov_mode: str | None = None,
-    refresh_rate: int | None = None,
-    brightness: int | None = None,
-    contrast: int | None = None,
-    foveated_rendering: bool | None = None,
-    eye_tracking: bool | None = None,
-    parallel_projection: bool | None = None,
-    config_path: str = "",
-    restart_service: bool = True,
-    force_restart: bool = False,
-    dry_run: bool = False,
-) -> dict:
-    """Set multiple Pimax settings at once in a single operation.
-
-    Preferred over calling set_pimax_setting repeatedly — this applies all
-    changes in one backup + write + registry update + optional restart cycle.
-
-    Parameters (all optional — omit to leave unchanged):
-        render_quality: Supersampling multiplier 0.5–2.0 (maps to renderResolution).
-        smart_smoothing: Enable/disable ASW motion reprojection.
-        hidden_area_mask: Enable/disable hidden area mask.
-        fov_mode: "small" / "normal" / "large" / "potato".
-        refresh_rate: 72 / 90 / 110 / 120 / 144 Hz (model-dependent).
-        brightness: 0–255 backlight brightness (applied to both eyes).
-        contrast: 0–255 contrast level (applied to both eyes).
-        foveated_rendering: Enable/disable Fixed Foveated Rendering (Crystal only).
-        eye_tracking: Enable/disable eye tracking + DFR (Crystal / Crystal Super only).
-        parallel_projection: Set True — required for correct MSFS VR rendering.
-        config_path: Override auto-detected Pimax config path.
-        restart_service: Restart Pimax Play after applying (default True).
-        force_restart: Restart even if a VR session is active.
-        dry_run: Preview what would change without writing anything.
-    """
-    try:
-        # Input validation
-        if render_quality is not None and not (0.5 <= render_quality <= 2.0):
-            return {
-                "error": f"render_quality must be between 0.5 and 2.0, got {render_quality}"
-            }
-        if brightness is not None and not (0 <= brightness <= 255):
-            return {
-                "error": f"brightness must be between 0 and 255, got {brightness}. "
-                         "Pimax brightness range is 0 (darkest) to 255 (brightest)."
-            }
-        if contrast is not None and not (0 <= contrast <= 255):
-            return {"error": f"contrast must be between 0 and 255, got {contrast}"}
-        if refresh_rate is not None and refresh_rate not in (72, 90, 110, 120, 144, 160, 180):
-            return {
-                "error": f"refresh_rate {refresh_rate} Hz is not a standard Pimax value. "
-                         "Valid: 72, 90, 110, 120, 144"
-            }
-        if fov_mode is not None and fov_mode.lower() not in ("small", "normal", "large", "potato"):
-            return {
-                "error": f"fov_mode must be 'small', 'normal', 'large', or 'potato', "
-                         f"got '{fov_mode}'"
-            }
-
-        cfg = _find_pimax_config(config_path)
-        if cfg is None:
-            return _pimax_not_found_error()
-
-        current = _read_pimax_settings(cfg)
-        if not current:
-            return {"error": f"Could not read Pimax settings from {cfg}"}
-
-        # Build updates dict — only from non-None arguments
-        updates: dict[str, object] = {}
-        if render_quality is not None:
-            updates["renderResolution"] = render_quality
-        if smart_smoothing is not None:
-            updates["smartSmoothing"] = smart_smoothing
-        if hidden_area_mask is not None:
-            updates["hiddenAreaMask"] = hidden_area_mask
-        if fov_mode is not None:
-            fov_lower = fov_mode.lower()
-            updates["fov"] = fov_lower
-            fov_level_map = {"potato": 0, "small": 1, "normal": 2, "large": 3}
-            updates["fovLevel"] = fov_level_map.get(fov_lower, 2)
-        if refresh_rate is not None:
-            updates["refreshRate"] = refresh_rate
-            updates["piplay_refreshrate"] = refresh_rate
-        if brightness is not None:
-            updates["brightness"] = brightness
-            updates["piplay_color_brightness_0"] = brightness
-            updates["piplay_color_brightness_1"] = brightness
-        if contrast is not None:
-            updates["contrast"] = contrast
-            updates["piplay_color_contrast_0"] = contrast
-            updates["piplay_color_contrast_1"] = contrast
-        if foveated_rendering is not None:
-            updates["ffrLevel"] = 2 if foveated_rendering else 0
-        if eye_tracking is not None:
-            updates["eyeTracking"] = eye_tracking
-            updates["dynamicFoveatedRendering"] = eye_tracking
-        if parallel_projection is not None:
-            updates["parallelProjection"] = parallel_projection
-
-        if not updates:
-            return {"status": "no_changes", "note": "No settings were specified."}
-
-        # Build preview of changes
-        would_change = {
-            k: {
-                "old": current.get(k, "<not set>"),
-                "new": v,
-                "label": PIMAX_SETTING_DEFS.get(k, {}).get("label", k),
-            }
-            for k, v in updates.items()
-        }
-
-        if dry_run:
-            return {
-                "status": "dry_run",
-                "would_change": would_change,
-                "config_file": str(cfg),
-                "note": "Set dry_run=False to apply.",
-            }
-
-        # Apply to in-memory state
-        for k, v in updates.items():
-            current[k] = v
-
-        backup_file = _pimax_create_backup(cfg, current)
-
-        # Write JSON config (only update keys that already exist in the file)
-        try:
-            json_data = _json.loads(cfg.read_text(encoding="utf-8"))
-            if isinstance(json_data, dict):
-                for k, v in updates.items():
-                    if k in json_data:
-                        json_data[k] = v
-                cfg.write_text(
-                    _json.dumps(json_data, indent=2, ensure_ascii=False), encoding="utf-8"
-                )
-        except Exception as exc:
-            logger.warning("set_pimax_settings: could not write JSON config: %s", exc)
-
-        registry_audit = _apply_pimax_settings_to_registry(updates, verify=True)
-
-        result: dict = {
-            "status": "ok",
-            "applied": {
-                k: {
-                    "label": PIMAX_SETTING_DEFS.get(k, {}).get("label", k),
-                    "old": would_change[k]["old"],
-                    "new": v,
-                }
-                for k, v in updates.items()
-            },
-            "config_file": str(cfg),
-            "backup": str(backup_file),
-            "registry_audit": registry_audit,
-        }
-        _pimax_apply_restart(result, restart_service, force_restart)
-        return result
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def get_pimax_recommended_settings(hardware_tier: str = "") -> dict:
-    """Return recommended Pimax settings for MSFS VR based on hardware — dry run only.
-
-    Does NOT apply any changes. Returns a full recommendation dict showing
-    exactly what optimize_pimax_for_msfs would set and why, so the user
-    can review and decide before committing.
-
-    The hardware tier is auto-detected from GPU/VRAM if not supplied.
-    Override with hardware_tier: "ultra", "high", "mid_high", "mid", or "low".
-
-    Returns:
-    - detected_tier / tier_label: which GPU performance tier was used
-    - gpu_name / vram_gb / cpu_cores / ram_gb: detected hardware
-    - recommended: dict of setting → {value, reason}
-    - summary: one-line human-readable description
-    """
-    try:
-        vram_gb, gpu_name, cpu_cores, ram_gb = _get_hw_for_tier()
-        tier = (
-            hardware_tier.strip().lower()
-            if hardware_tier.strip()
-            else _classify_vr_tier(vram_gb, gpu_name, cpu_cores, ram_gb)
-        )
-
-        _TIER_RECOMMENDATIONS: dict[str, dict[str, tuple]] = {
-            "ultra": {
-                "renderResolution": (1.3, "RTX 4090/5090 class GPU can sustain 1.3× SS in MSFS VR"),
-                "smartSmoothing": (False, "Ultra tier maintains 45+ FPS natively; smoothing not needed"),
-                "fov": ("large", "Sufficient GPU headroom for maximum Large FOV"),
-                "fovLevel": (3, "Large FOV for maximum immersion"),
-                "ffrLevel": (0, "No FFR needed at this GPU tier"),
-                "parallelProjection": (True, "Required for correct MSFS VR rendering"),
-                "refreshRate": (90, "90 Hz stable on ultra tier GPUs"),
-            },
-            "high": {
-                "renderResolution": (1.1, "RTX 4080/4070Ti can handle 1.1× SS boost comfortably"),
-                "smartSmoothing": (False, "High tier GPU sustains 45+ FPS without smoothing"),
-                "fov": ("large", "High-end GPU handles Large FOV without major FPS loss"),
-                "fovLevel": (3, "Large FOV"),
-                "ffrLevel": (1, "Light FFR as insurance for complex scenery"),
-                "parallelProjection": (True, "Required for MSFS VR"),
-                "refreshRate": (90, "90 Hz with good frame pacing on high tier"),
-            },
-            "mid_high": {
-                "renderResolution": (1.0, "RTX 3080/4070 at native resolution for stable framerate"),
-                "smartSmoothing": (True, "Smart Smoothing maintains 45 FPS floor"),
-                "fov": ("normal", "Normal FOV balances quality and performance"),
-                "fovLevel": (2, "Normal FOV"),
-                "ffrLevel": (2, "Medium FFR saves GPU load in peripheral vision"),
-                "parallelProjection": (True, "Required for MSFS VR"),
-                "refreshRate": (90, "90 Hz with Smart Smoothing halfrate at 45 FPS"),
-            },
-            "mid": {
-                "renderResolution": (0.8, "RTX 3070/6700XT needs sub-native SS in MSFS VR"),
-                "smartSmoothing": (True, "Smart Smoothing essential on mid-tier GPU"),
-                "fov": ("normal", "Normal FOV keeps pixel count manageable"),
-                "fovLevel": (2, "Normal FOV"),
-                "ffrLevel": (3, "High FFR to maintain playable FPS on mid-tier"),
-                "parallelProjection": (True, "Required for MSFS VR"),
-                "refreshRate": (72, "72 Hz more achievable than 90 Hz on mid-tier"),
-            },
-            "low": {
-                "renderResolution": (0.6, "Low-tier GPU requires significant SS reduction for MSFS"),
-                "smartSmoothing": (True, "Smart Smoothing essential on low-tier hardware"),
-                "fov": ("small", "Small FOV reduces pixel count significantly"),
-                "fovLevel": (1, "Small FOV"),
-                "ffrLevel": (4, "Maximum FFR to save GPU on low-tier hardware"),
-                "parallelProjection": (True, "Required for MSFS VR"),
-                "refreshRate": (72, "72 Hz is the only realistic target on low-tier hardware"),
-            },
-        }
-
-        rec_raw = _TIER_RECOMMENDATIONS.get(tier, _TIER_RECOMMENDATIONS["mid"])
-        recommended = {
-            k: {"value": v, "reason": reason}
-            for k, (v, reason) in rec_raw.items()
-        }
-
-        tier_labels = {
-            "ultra": "Ultra (RTX 4090 / RTX 5090 class)",
-            "high": "High (RTX 4080 / 4070 Ti class)",
-            "mid_high": "Mid-High (RTX 3080 / 4070 class)",
-            "mid": "Mid (RTX 3070 / 6700 XT class)",
-            "low": "Low (RTX 3060 and below)",
-        }
-        rr = rec_raw["renderResolution"][0]
-        ss = rec_raw["smartSmoothing"][0]
-        fov = rec_raw["fov"][0]
-        hz = rec_raw["refreshRate"][0]
-
-        return {
-            "status": "recommendation_only",
-            "note": "Dry run — call optimize_pimax_for_msfs to apply these settings.",
-            "detected_tier": tier,
-            "tier_label": tier_labels.get(tier, tier),
-            "gpu_name": gpu_name or "unknown",
-            "vram_gb": vram_gb,
-            "ram_gb": ram_gb,
-            "cpu_cores": cpu_cores,
-            "recommended": recommended,
-            "summary": (
-                f"For {tier_labels.get(tier, tier)} in MSFS VR: "
-                f"render_quality={rr}, smart_smoothing={'on' if ss else 'off'}, "
-                f"fov={fov}, {hz}Hz"
-            ),
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def optimize_pimax_for_msfs(
-    hardware_tier: str = "",
-    config_path: str = "",
-    restart_service: bool = True,
-    force_restart: bool = False,
-    dry_run: bool = False,
-) -> dict:
-    """Apply hardware-aware Pimax settings optimized specifically for MSFS VR.
-
-    Auto-detects GPU tier and writes the appropriate Pimax settings to get
-    the best performance/quality balance in Microsoft Flight Simulator VR.
-
-    GPU tier → what gets applied:
-    - ultra  (4090/5090):    render=1.3, smoothing=off, fov=large,  90Hz, FFR=off
-    - high   (4080/4070Ti):  render=1.1, smoothing=off, fov=large,  90Hz, FFR=low
-    - mid_high (3080/4070):  render=1.0, smoothing=on,  fov=normal, 90Hz, FFR=med
-    - mid    (3070/6700XT):  render=0.8, smoothing=on,  fov=normal, 72Hz, FFR=high
-    - low:                   render=0.6, smoothing=on,  fov=small,  72Hz, FFR=ultra
-
-    All tiers force parallelProjection=True (required for MSFS VR).
-
-    Args:
-        hardware_tier: Override detected tier: "ultra"/"high"/"mid_high"/"mid"/"low".
-        config_path: Pimax config path (auto-detected if empty).
-        restart_service: Restart Pimax Play after applying (default True).
-        force_restart: Restart even if a VR session is currently active.
-        dry_run: Preview what would be set without writing anything.
-    """
-    try:
-        vram_gb, gpu_name, cpu_cores, ram_gb = _get_hw_for_tier()
-        tier = (
-            hardware_tier.strip().lower()
-            if hardware_tier.strip()
-            else _classify_vr_tier(vram_gb, gpu_name, cpu_cores, ram_gb)
-        )
-
-        _TIER_SETTINGS: dict[str, dict] = {
-            "ultra": {
-                "renderResolution": 1.3,
-                "smartSmoothing": False,
-                "compulsorySmoothing": False,
-                "fov": "large",
-                "fovLevel": 3,
-                "ffrLevel": 0,
-                "parallelProjection": True,
-                "refreshRate": 90,
-            },
-            "high": {
-                "renderResolution": 1.1,
-                "smartSmoothing": False,
-                "compulsorySmoothing": False,
-                "fov": "large",
-                "fovLevel": 3,
-                "ffrLevel": 1,
-                "parallelProjection": True,
-                "refreshRate": 90,
-            },
-            "mid_high": {
-                "renderResolution": 1.0,
-                "smartSmoothing": True,
-                "compulsorySmoothing": False,
-                "fov": "normal",
-                "fovLevel": 2,
-                "ffrLevel": 2,
-                "parallelProjection": True,
-                "refreshRate": 90,
-            },
-            "mid": {
-                "renderResolution": 0.8,
-                "smartSmoothing": True,
-                "compulsorySmoothing": True,
-                "fov": "normal",
-                "fovLevel": 2,
-                "ffrLevel": 3,
-                "parallelProjection": True,
-                "refreshRate": 72,
-            },
-            "low": {
-                "renderResolution": 0.6,
-                "smartSmoothing": True,
-                "compulsorySmoothing": True,
-                "fov": "small",
-                "fovLevel": 1,
-                "ffrLevel": 4,
-                "parallelProjection": True,
-                "refreshRate": 72,
-            },
-        }
-
-        _REASONS: dict[str, dict[str, str]] = {
-            "ultra": {
-                "renderResolution": "4090/5090 class GPU can sustain 1.3× SS in MSFS VR",
-                "smartSmoothing": "Ultra tier GPU runs 45+ FPS natively; smoothing not needed",
-                "fov": "Enough GPU headroom for maximum Large FOV",
-                "ffrLevel": "No FFR needed at this GPU tier",
-                "refreshRate": "90 Hz stable on ultra tier",
-            },
-            "high": {
-                "renderResolution": "4080/4070Ti handles 1.1× SS comfortably",
-                "smartSmoothing": "High tier sustains 45+ FPS without smoothing",
-                "fov": "High-end GPU handles Large FOV",
-                "ffrLevel": "Light FFR as insurance for complex scenery",
-                "refreshRate": "90 Hz with good frame pacing on high tier",
-            },
-            "mid_high": {
-                "renderResolution": "3080/4070 at native resolution for stable framerate",
-                "smartSmoothing": "Smart Smoothing maintains 45 FPS floor",
-                "fov": "Normal FOV balances quality and performance",
-                "ffrLevel": "Medium FFR saves GPU load in peripheral vision",
-                "refreshRate": "90 Hz with Smart Smoothing halfrate at 45 FPS",
-            },
-            "mid": {
-                "renderResolution": "3070/6700XT needs sub-native SS in MSFS VR",
-                "smartSmoothing": "Smart Smoothing essential on mid-tier GPU",
-                "fov": "Normal FOV keeps pixel count manageable",
-                "ffrLevel": "High FFR required to maintain playable FPS",
-                "refreshRate": "72 Hz more achievable than 90 Hz on mid-tier",
-            },
-            "low": {
-                "renderResolution": "Low-tier GPU requires significant SS reduction for MSFS",
-                "smartSmoothing": "Smart Smoothing is essential on low-tier hardware",
-                "fov": "Small FOV reduces pixel count significantly",
-                "ffrLevel": "Maximum FFR to save GPU on low-tier hardware",
-                "refreshRate": "72 Hz is the only realistic target on low-tier hardware",
-            },
-        }
-
-        updates = dict(_TIER_SETTINGS.get(tier, _TIER_SETTINGS["mid"]))
-        reasons = _REASONS.get(tier, _REASONS["mid"])
-
-        if dry_run:
-            return {
-                "status": "dry_run",
-                "detected_tier": tier,
-                "gpu_name": gpu_name or "unknown",
-                "vram_gb": vram_gb,
-                "would_set": {
-                    k: {"value": v, "reason": reasons.get(k, "")}
-                    for k, v in updates.items()
-                },
-                "note": "Set dry_run=False to apply these settings.",
-            }
-
-        cfg = _find_pimax_config(config_path)
-        if cfg is None:
-            return _pimax_not_found_error()
-
-        current = _read_pimax_settings(cfg)
-        if not current:
-            return {"error": f"Could not read Pimax settings from {cfg}"}
-
-        changed = {
-            k: {"old": current.get(k, "<not set>"), "new": v, "reason": reasons.get(k, "")}
-            for k, v in updates.items()
-        }
-
-        for k, v in updates.items():
-            current[k] = v
-
-        backup_file = _pimax_create_backup(cfg, current)
-
-        try:
-            json_data = _json.loads(cfg.read_text(encoding="utf-8"))
-            if isinstance(json_data, dict):
-                for k, v in updates.items():
-                    if k in json_data:
-                        json_data[k] = v
-                cfg.write_text(
-                    _json.dumps(json_data, indent=2, ensure_ascii=False), encoding="utf-8"
-                )
-        except Exception as exc:
-            logger.warning("optimize_pimax_for_msfs: could not write JSON: %s", exc)
-
-        registry_audit = _apply_pimax_settings_to_registry(updates, verify=True)
-
-        result: dict = {
-            "status": "ok",
-            "detected_tier": tier,
-            "gpu_name": gpu_name or "unknown",
-            "vram_gb": vram_gb,
-            "applied": changed,
-            "config_file": str(cfg),
-            "backup": str(backup_file),
-            "registry_audit": registry_audit,
-            "summary": (
-                f"Pimax optimized for MSFS VR ({tier} tier): "
-                f"render={updates['renderResolution']}, "
-                f"smoothing={'on' if updates['smartSmoothing'] else 'off'}, "
-                f"fov={updates['fov']}, {updates['refreshRate']}Hz"
-            ),
-        }
-        _pimax_apply_restart(result, restart_service, force_restart)
-        return result
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def get_pimax_openxr_settings() -> dict:
-    """Read the Pimax Play OpenXR layer configuration file.
-
-    When Pimax Play is the active OpenXR runtime, some rendering settings
-    (supersampling override, foveated rendering mode) are controlled via
-    the OpenXR layer JSON file rather than the main Pimax config.
-
-    Returns the raw settings dict plus the config file path.
-    Use set_pimax_openxr_settings to write changes to this file.
-    """
-    try:
-        cfg = _find_pimax_openxr_config()
-        if cfg is None:
-            return {
-                "error": "Pimax OpenXR config not found.",
-                "searched": [
-                    str(
-                        Path(os.environ.get("APPDATA", ""))
-                        / "Pimax" / "runtime" / "openxr_default.json"
-                    ),
-                    r"C:\Program Files\Pimax\runtime\openxr_default.json",
-                ],
-                "hint": (
-                    "This file only exists if Pimax Play is installed "
-                    "and has been run at least once."
-                ),
-            }
-        data = _json.loads(cfg.read_text(encoding="utf-8"))
-        return {
-            "status": "ok",
-            "config_file": str(cfg),
-            "settings": data,
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def set_pimax_openxr_settings(
-    settings: dict,
-    config_path: str = "",
-    dry_run: bool = False,
-) -> dict:
-    """Write settings to the Pimax Play OpenXR layer JSON configuration.
-
-    When Pimax Play is the active OpenXR runtime, this file controls
-    OpenXR-level rendering overrides such as supersampling and foveated
-    rendering mode. Changes are merged into the existing config.
-
-    Args:
-        settings: Dict of key→value pairs to write into the OpenXR config.
-                  Example: {"supersampling": 1.2, "foveatedRendering": True}
-        config_path: Override the config file path (auto-detected if empty).
-        dry_run: Show what would change without writing anything.
-    """
-    try:
-        if config_path:
-            cfg = Path(config_path)
-        else:
-            cfg = _find_pimax_openxr_config()
-
-        if cfg is None or not cfg.exists():
-            return {
-                "error": "Pimax OpenXR config not found. Cannot write settings.",
-                "hint": (
-                    "Ensure Pimax Play is installed and has been launched at least once "
-                    "so the runtime config file is created."
-                ),
-            }
-
-        try:
-            current_data = _json.loads(cfg.read_text(encoding="utf-8"))
-        except Exception:
-            current_data = {}
-
-        if not isinstance(current_data, dict):
-            current_data = {}
-
-        would_change = {
-            k: {"old": current_data.get(k, "<not set>"), "new": v}
-            for k, v in settings.items()
-            if current_data.get(k) != v
-        }
-
-        if dry_run:
-            return {
-                "status": "dry_run",
-                "config_file": str(cfg),
-                "would_change": would_change,
-                "note": "Set dry_run=False to apply.",
-            }
-
-        current_data.update(settings)
-        cfg.write_text(
-            _json.dumps(current_data, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
-
-        return {
-            "status": "ok",
-            "config_file": str(cfg),
-            "applied": would_change,
-            "hint": "Restart Pimax Play for OpenXR layer changes to take effect.",
-        }
-    except Exception as e:
-        return {"error": str(e)}
 
 
 # ---------------------------------------------------------------------------
@@ -6165,7 +4975,9 @@ def fix_msfs(
         return {
             "status": "ok",
             "steps": steps,
-            "message": "MSFS wurde beendet.",
+            "message": "MSFS wurde beendet." + (
+                " Shader-Cache geleert." if action == "clear_shader_cache" else ""
+            ),
         }
 
     if action in ("restart", "clear_shader_cache", "clear_rolling_cache", "full_reset"):
@@ -6285,11 +5097,7 @@ def _ps_json(script: str, timeout: int = 60) -> list[dict]:
     raw = _ps(f"({script}) | ConvertTo-Json -Depth 4 -Compress", timeout=timeout)
     if not raw:
         return []
-    try:
-        data = _json.loads(raw)
-    except _json.JSONDecodeError:
-        logger.warning("_ps_json: could not parse PowerShell output as JSON: %.200s", raw)
-        return []
+    data = _json.loads(raw)
     if isinstance(data, dict):
         return [data]
     return data
@@ -6403,16 +5211,10 @@ def manage_processes(
 
     if action == "kill":
         if pid:
-            try:
-                _ps(f"Stop-Process -Id {pid} -Force")
-            except RuntimeError as exc:
-                return {"error": f"Could not kill PID {pid}: {exc}"}
+            _ps(f"Stop-Process -Id {pid} -Force")
             return {"status": "ok", "killed_pid": pid}
         if name:
-            try:
-                _ps(f"Stop-Process -Name '{name}' -Force")
-            except RuntimeError as exc:
-                return {"error": f"Could not kill process '{name}': {exc}"}
+            _ps(f"Stop-Process -Name '{name}' -Force")
             return {"status": "ok", "killed_name": name}
         return {"error": "Provide 'pid' or 'name' to kill a process."}
 
@@ -8361,9 +7163,6 @@ def _trigger_download(url: str, community_path: str,
     dl_dir = (Path(downloads_dir).expanduser()
               if downloads_dir else Path.home() / "Downloads")
 
-    if not dl_dir.exists():
-        return {"error": f"Downloads directory not found: {dl_dir}"}
-
     analysis = _analyse_page(url)
 
     # Handle login-required pages
@@ -8630,12 +7429,87 @@ RESHADE_VR_PRESETS: dict[str, dict] = {
 }
 
 
-# ── ReShade helpers (old _find/_read/_write helpers removed — use _rs_locate_ini / _rs_load_ini / _rs_save_ini) ───
+# ── ReShade helpers ───────────────────────────────────────────────────────
+
+def _find_reshade_ini(game_dir: str = "") -> Path | None:
+    """Find ReShade.ini — either in a specified game dir or by searching."""
+    if game_dir:
+        gd = Path(game_dir)
+        for name in _RESHADE_INI_NAMES:
+            candidate = gd / name
+            if candidate.exists():
+                return candidate
+        # Recurse one level
+        if gd.is_dir():
+            for sub in gd.iterdir():
+                if sub.is_dir():
+                    for name in _RESHADE_INI_NAMES:
+                        candidate = sub / name
+                        if candidate.exists():
+                            return candidate
+        return None
+
+    # Auto-search known game directories
+    for gd in _RESHADE_GAME_DIRS:
+        if not gd.exists():
+            continue
+        for name in _RESHADE_INI_NAMES:
+            candidate = gd / name
+            if candidate.exists():
+                return candidate
+        # Search subdirectories (one level)
+        if gd.is_dir():
+            try:
+                for sub in gd.iterdir():
+                    if sub.is_dir():
+                        for name in _RESHADE_INI_NAMES:
+                            candidate = sub / name
+                            if candidate.exists():
+                                return candidate
+            except PermissionError:
+                continue
+
+    # Last resort: PowerShell search
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             r'Get-ChildItem -Path "C:\","D:\","E:\" -Recurse '
+             r'-Include "ReShade.ini","dxgi.ini","d3d11.ini" '
+             r'-ErrorAction SilentlyContinue '
+             r'| Select-Object -First 5 -ExpandProperty FullName'],
+            capture_output=True, text=True, timeout=30,
+        )
+        for line in result.stdout.strip().splitlines():
+            p = Path(line.strip())
+            if p.is_file():
+                return p
+    except Exception:
+        pass
+
+    return None
+
+
+def _read_reshade_ini(ini_path: Path) -> _configparser.ConfigParser:
+    """Read a ReShade.ini preserving case and comments."""
+    config = _configparser.ConfigParser(
+        interpolation=None,
+        comment_prefixes=(";",),
+        inline_comment_prefixes=(";",),
+    )
+    config.optionxform = str  # preserve case
+    config.read(str(ini_path), encoding="utf-8")
+    return config
+
+
+def _write_reshade_ini(config: _configparser.ConfigParser, ini_path: Path) -> None:
+    """Write ReShade.ini back to disk."""
+    with open(ini_path, "w", encoding="utf-8") as f:
+        config.write(f)
 
 
 def _find_preset_file(ini_path: Path) -> Path | None:
     """Find the currently active preset file referenced by ReShade.ini."""
-    config, _ = _rs_load_ini()
+    config = _read_reshade_ini(ini_path)
     preset_path = None
     for section in config.sections():
         if config.has_option(section, "PresetPath"):
@@ -8652,14 +7526,46 @@ def _find_preset_file(ini_path: Path) -> Path | None:
 
 
 def _read_preset(preset_path: Path) -> _configparser.ConfigParser:
-    """Read a ReShade preset .ini file."""
+    """Read a ReShade preset .ini file.
+
+    ReShade preset files often have key=value pairs BEFORE the first [Section]
+    header (e.g. ``Techniques=CAS,Vibrance``, ``TechniqueSorting=...``,
+    ``PreprocessorDefinitions=``).  Python's configparser raises
+    ``MissingSectionHeaderError`` when it encounters those lines, which would
+    silently swallow the entire file and return an empty config (or crash).
+
+    Fix: strip all lines that appear before the first ``[Section]`` header and
+    parse only the section-based content.  The header-less lines (Techniques=,
+    TechniqueSorting=) are managed exclusively via ``_update_reshade_techniques``,
+    which uses raw regex operations on the full file text.
+    """
     config = _configparser.ConfigParser(
         interpolation=None,
         comment_prefixes=(";",),
         inline_comment_prefixes=(";",),
     )
     config.optionxform = str
-    config.read(str(preset_path), encoding="utf-8")
+
+    try:
+        content = preset_path.read_text(encoding="utf-8", errors="replace")
+    except (OSError, IOError):
+        return config
+
+    # Collect only lines from the first [Section] header onward
+    section_lines: list[str] = []
+    in_section = False
+    for line in content.splitlines(keepends=True):
+        if not in_section and line.strip().startswith("["):
+            in_section = True
+        if in_section:
+            section_lines.append(line)
+
+    if section_lines:
+        try:
+            config.read_string("".join(section_lines))
+        except Exception:
+            pass  # Return empty config on any remaining parse error
+
     return config
 
 
@@ -8687,6 +7593,61 @@ def _list_presets(ini_path: Path) -> list[dict]:
     return presets
 
 
+def _update_reshade_techniques(preset_path: Path,
+                               enable: list[str],
+                               disable: list[str]) -> None:
+    """Add/remove effect names from the Techniques= and TechniqueSorting= lines.
+
+    ReShade only runs effects listed in Techniques= — writing [Effect] sections
+    alone does nothing.  This function reads the raw preset file and patches
+    both lines so ReShade picks up the change without a restart (it polls the
+    preset file for changes).
+    """
+    try:
+        content = preset_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return
+
+    # Parse existing Techniques list (entries may look like "CAS" or "CAS@CAS.fx")
+    tech_match = re.search(r'^Techniques=(.*)$', content, re.MULTILINE)
+    if tech_match:
+        techs_raw = [t.strip() for t in tech_match.group(1).split(',') if t.strip()]
+    else:
+        techs_raw = []
+
+    def _base(name: str) -> str:
+        """Strip @filename suffix → base effect name."""
+        return name.split('@')[0].strip()
+
+    # Index by base name so "CAS@CAS.fx" and "CAS" are treated as the same
+    bases_to_full: dict[str, str] = {_base(t): t for t in techs_raw}
+
+    # Disable: remove by base name
+    for eff in disable:
+        bases_to_full.pop(eff, None)
+
+    # Enable: add if not already present (use bare name — ReShade resolves .fx)
+    for eff in enable:
+        if eff not in bases_to_full:
+            bases_to_full[eff] = eff
+
+    new_techs = list(bases_to_full.values())
+    tech_line = f"Techniques={','.join(new_techs)}"
+    sort_line = f"TechniqueSorting={','.join(new_techs)}"
+
+    if tech_match:
+        content = re.sub(r'^Techniques=.*$', tech_line, content, flags=re.MULTILINE)
+    else:
+        content = tech_line + '\n' + content
+
+    if re.search(r'^TechniqueSorting=', content, re.MULTILINE):
+        content = re.sub(r'^TechniqueSorting=.*$', sort_line, content, flags=re.MULTILINE)
+    else:
+        content = re.sub(r'^(Techniques=.*)$', r'\1\n' + sort_line, content, flags=re.MULTILINE)
+
+    preset_path.write_text(content, encoding="utf-8")
+
+
 # ── ReShade MCP Tools ─────────────────────────────────────────────────────
 
 @mcp.tool()
@@ -8704,7 +7665,7 @@ def analyze_reshade(
     Args:
         game_dir: Game directory containing ReShade.ini (auto-detected if empty).
     """
-    ini = _rs_locate_ini()
+    ini = _find_reshade_ini(game_dir)
     if ini is None:
         return {
             "error": (
@@ -8715,39 +7676,57 @@ def analyze_reshade(
             "searched": [str(p) for p in _RESHADE_GAME_DIRS[:6]],
         }
 
-    config, ini = _rs_load_ini()
+    config = _read_reshade_ini(ini)
 
     # Active preset
     preset_path = _find_preset_file(ini)
     preset_data = _read_preset(preset_path) if preset_path else None
 
-    # Gather effect status and settings
+    # Read the Techniques= list from the raw preset file to determine what's active
+    # (ReShade only runs effects in this list — section keys like Enabled=1 are ignored)
+    active_techniques: set[str] = set()
+    if preset_path and preset_path.exists():
+        try:
+            raw = preset_path.read_text(encoding="utf-8", errors="replace")
+            m = re.search(r'^Techniques=(.*)$', raw, re.MULTILINE)
+            if m:
+                for t in m.group(1).split(','):
+                    base = t.strip().split('@')[0].strip()
+                    if base:
+                        active_techniques.add(base)
+        except Exception:
+            pass
+
+    # Gather effect status and settings from the preset sections
     effects_table: list[dict] = []
     if preset_data:
         for section in preset_data.sections():
-            # Enabled/disabled status
-            enabled = True
-            technique_section = section
-            # Check technique list or per-effect toggle
-            for opt in preset_data.options(section):
-                if opt.lower() in ("enabled", "active"):
-                    enabled = preset_data.getboolean(section, opt, fallback=True)
-
-            # Check known effect definitions
             defn = RESHADE_EFFECTS.get(section, {})
             label = defn.get("label", section)
             category = defn.get("category", "")
 
-            settings: dict[str, str] = {}
+            # Enabled = present in Techniques= list (authoritative) or, as fallback,
+            # via explicit Enabled= key inside the section
+            if active_techniques:
+                enabled = section in active_techniques
+            else:
+                # Fallback for old preset files that don't have a Techniques= line
+                enabled = True
+                for opt in preset_data.options(section):
+                    if opt.lower() in ("enabled", "active"):
+                        enabled = preset_data.getboolean(section, opt, fallback=True)
+                        break
+
+            params: dict[str, str] = {}
             for opt in preset_data.options(section):
                 if opt.lower() not in ("enabled", "active"):
-                    settings[opt] = preset_data.get(section, opt)
+                    params[opt] = preset_data.get(section, opt)
 
             effects_table.append({
                 "effect": label,
                 "category": category,
                 "enabled": enabled,
-                "settings": settings,
+                "settings": params,
             })
 
     # Available presets
@@ -8803,10 +7782,13 @@ def set_reshade_effect(
         "adaptive sharpen": "AdaptiveSharpen",
         "klarheit": "Clarity",
         "clarity": "Clarity",
-        "farbe": "Vibrance",
+        # Vibrance = subtile Sättigungsanhebung für bereits-gesättigte Farben
         "vibrance": "Vibrance",
-        "sättigung": "Vibrance",
-        "saturation": "Tonemap",
+        # Colorfulness = globale Farbintensität (direkterer Sättigungseffekt)
+        "farbe": "Colorfulness",
+        "sättigung": "Colorfulness",   # Colorfulness ist der präzisere Sättigungs-Effekt
+        "saturation": "Colorfulness",  # Tonemap.Saturation wäre nur ein Parameter, nicht ein Effekt
+        "farbintensität": "Colorfulness",
         "tonemap": "Tonemap",
         "tonemapping": "Tonemap",
         "gamma": "Tonemap",
@@ -8833,7 +7815,7 @@ def set_reshade_effect(
     }
     resolved = _EFFECT_ALIASES.get(effect.lower().strip(), effect.strip())
 
-    ini = _rs_locate_ini()
+    ini = _find_reshade_ini(game_dir)
     if ini is None:
         return {"error": "ReShade.ini nicht gefunden. Gib game_dir an."}
 
@@ -8853,24 +7835,26 @@ def set_reshade_effect(
 
     applied: dict = {}
 
-    if enabled is not None:
-        # ReShade uses Techniques list or per-section keys
-        # We update both approaches
-        config.set(resolved, "Enabled", "1" if enabled else "0")
-        applied["enabled"] = enabled
-
+    # 1. Write per-parameter values first (configparser overwrites the whole file,
+    #    so it MUST run before _update_reshade_techniques patches the Techniques= line)
     if settings:
         for key, val in settings.items():
             config.set(resolved, key, str(val))
             applied[key] = val
+        with open(preset_path, "w", encoding="utf-8") as f:
+            config.write(f)
 
-    with open(preset_path, "w", encoding="utf-8") as f:
-        config.write(f)
+    # 2. Update Techniques= list AFTER the configparser write (otherwise it gets overwritten)
+    if enabled is not None:
+        if enabled:
+            _update_reshade_techniques(preset_path, enable=[resolved], disable=[])
+        else:
+            _update_reshade_techniques(preset_path, enable=[], disable=[resolved])
+        applied["enabled"] = enabled
 
     defn = RESHADE_EFFECTS.get(resolved, {})
 
-    # ReShade reads preset files live — but only if it detects a change.
-    # Touch the file to force a reload.
+    # ReShade detects preset changes by file modification time.
     try:
         preset_path.touch()
     except Exception:
@@ -8883,10 +7867,9 @@ def set_reshade_effect(
         "applied": applied,
         "preset_file": str(preset_path),
         "hinweis": (
-            "Preset-Datei aktualisiert. ReShade übernimmt Änderungen "
-            "normalerweise live im laufenden Spiel. "
-            "Falls nicht sichtbar: Home-Taste drücken → ReShade-Overlay → "
-            "Preset neu laden. Oder MSFS neu starten."
+            "Preset-Datei aktualisiert (Techniques-Liste + Parameter). "
+            "ReShade übernimmt Änderungen normalerweise live. "
+            "Falls nicht sichtbar: Home-Taste → ReShade-Overlay → Preset neu laden."
         ),
     }
 
@@ -8913,7 +7896,7 @@ def apply_reshade_preset(
         custom_preset_path: Path to a custom .ini preset (only for preset="custom").
         game_dir: Game directory with ReShade.ini (auto-detected if empty).
     """
-    ini = _rs_locate_ini()
+    ini = _find_reshade_ini(game_dir)
     if ini is None:
         return {"error": "ReShade.ini nicht gefunden. Gib game_dir an."}
 
@@ -8924,7 +7907,7 @@ def apply_reshade_preset(
         cp = Path(custom_preset_path)
         if not cp.is_file():
             return {"error": f"Preset-Datei nicht gefunden: {custom_preset_path}"}
-        config, ini = _rs_load_ini()
+        config = _read_reshade_ini(ini)
         for section in config.sections():
             if config.has_option(section, "PresetPath"):
                 config.set(section, "PresetPath", str(cp))
@@ -8933,7 +7916,7 @@ def apply_reshade_preset(
             if not config.has_section("GENERAL"):
                 config.add_section("GENERAL")
             config.set("GENERAL", "PresetPath", str(cp))
-        _rs_save_ini(config, ini)
+        _write_reshade_ini(config, ini)
         return {
             "status": "ok",
             "preset": cp.stem,
@@ -8961,33 +7944,31 @@ def apply_reshade_preset(
         interpolation=None)
     config.optionxform = str
 
-    # Disable effects listed in 'disable'
-    for eff_name in preset_def.get("disable", []):
-        if config.has_section(eff_name):
-            config.set(eff_name, "Enabled", "0")
-
-    # Enable and configure effects
+    # Write per-effect parameters into their sections
     applied: dict = {}
     for eff_name, eff_settings in preset_def.get("effects", {}).items():
         if not config.has_section(eff_name):
             config.add_section(eff_name)
         for key, val in eff_settings.items():
-            if key == "enabled":
-                config.set(eff_name, "Enabled", "1" if val else "0")
-            else:
+            if key != "enabled":  # "enabled" handled via Techniques list below
                 config.set(eff_name, key, str(val))
         applied[eff_name] = eff_settings
 
     with open(preset_path, "w", encoding="utf-8") as f:
         config.write(f)
 
+    # CRITICAL: Update the Techniques= list — this is what actually activates effects
+    enable_list = [e for e, s in preset_def.get("effects", {}).items() if s.get("enabled", True)]
+    disable_list = preset_def.get("disable", [])
+    _update_reshade_techniques(preset_path, enable=enable_list, disable=disable_list)
+
     # Point ReShade.ini to this preset
-    ini_config, ini = _rs_load_ini()
+    ini_config = _read_reshade_ini(ini)
     for section in ini_config.sections():
         if ini_config.has_option(section, "PresetPath"):
             ini_config.set(section, "PresetPath", str(preset_path))
             break
-    _rs_save_ini(ini_config, ini)
+    _write_reshade_ini(ini_config, ini)
 
     # Touch to help ReShade detect the change
     try:
@@ -8999,11 +7980,11 @@ def apply_reshade_preset(
         "status": "ok",
         "preset": preset,
         "description": preset_def["description"],
-        "effects_enabled": list(preset_def.get("effects", {}).keys()),
-        "effects_disabled": preset_def.get("disable", []),
+        "effects_enabled": enable_list,
+        "effects_disabled": disable_list,
         "preset_file": str(preset_path),
         "hinweis": (
-            f"Preset '{preset}' angewendet. ReShade lädt Änderungen "
+            f"Preset '{preset}' angewendet (Techniques-Liste aktualisiert). ReShade lädt Änderungen "
             "normalerweise live. Falls nicht sichtbar: Home-Taste → "
             "ReShade-Overlay → Preset wechseln/neu laden."
         ),
@@ -9021,7 +8002,7 @@ def list_reshade_presets(
     Args:
         game_dir: Game directory with ReShade.ini (auto-detected if empty).
     """
-    ini = _rs_locate_ini()
+    ini = _find_reshade_ini(game_dir)
     if ini is None:
         return {"error": "ReShade.ini nicht gefunden. Gib game_dir an."}
 
@@ -9071,7 +8052,7 @@ def uninstall_reshade(
         game_dir: Game directory containing ReShade (auto-detected if empty).
         backup: Create a backup folder before deleting (default True).
     """
-    ini = _rs_locate_ini()
+    ini = _find_reshade_ini(game_dir)
     if ini is None:
         return {
             "status": "not_found",
@@ -9216,21 +8197,86 @@ OPENXR_SETTING_DEFS: dict[str, dict] = {
         "category": "upscaling",
     },
     # ── Post-Processing / Farbe ──
+    # Registry-Skalierung für Prozentwerte: gespeicherter Wert = Prozent × 10
+    #   → 1000 = 100 % = Neutralwert (kein Effekt auf das Bild)
+    #   →  800 =  80 % (gedämpft), 1500 = 150 % (verstärkt)
+    # Additive Werte (vibrance, shadows): 0 = kein Effekt, positiv = Verstärkung
+    # ACHTUNG: post_saturation = 0 → Graustufen (schwarz-weiß)!
     "post_process": {
         "label": "Post-Processing",
         "values": {"0": "Off", "1": "On"},
         "category": "color",
     },
-    "post_brightness": {"label": "Helligkeit", "category": "color"},
-    "post_contrast": {"label": "Kontrast", "category": "color"},
-    "post_exposure": {"label": "Belichtung", "category": "color"},
-    "post_saturation": {"label": "Sättigung", "category": "color"},
-    "post_vibrance": {"label": "Vibrance", "category": "color"},
-    "post_gain_r": {"label": "Farbe Rot", "category": "color"},
-    "post_gain_g": {"label": "Farbe Grün", "category": "color"},
-    "post_gain_b": {"label": "Farbe Blau", "category": "color"},
-    "post_highlights": {"label": "Lichter", "category": "color"},
-    "post_shadows": {"label": "Schatten", "category": "color"},
+    "post_brightness": {
+        "label": "Helligkeit",
+        "category": "color",
+        "unit": "percent",          # Eingabe 0–200 → ×10 gespeichert
+        "min": 0, "max": 2000, "default": 1000,
+        "hint": "100 = normal, 120 = heller, 80 = dunkler",
+    },
+    "post_contrast": {
+        "label": "Kontrast",
+        "category": "color",
+        "unit": "percent",
+        "min": 0, "max": 2000, "default": 1000,
+        "hint": "100 = normal, 120 = mehr Kontrast, 80 = flacher",
+    },
+    "post_exposure": {
+        "label": "Belichtung",
+        "category": "color",
+        "unit": "percent",
+        "min": 0, "max": 2000, "default": 1000,
+        "hint": "100 = normal, 130 = überbelichtet, 70 = unterbelichtet",
+    },
+    "post_saturation": {
+        "label": "Sättigung",
+        "category": "color",
+        "unit": "percent",
+        "min": 0, "max": 2000, "default": 1000,
+        "hint": "100 = normal, 0 = GRAUSTUFEN (schwarz-weiß!), 150 = sattere Farben",
+    },
+    "post_vibrance": {
+        "label": "Vibrance",
+        "category": "color",
+        "unit": "additive",         # 0 = kein Effekt, positiv = mehr Vibrance
+        "min": 0, "max": 1000, "default": 0,
+        "hint": "0 = kein Effekt, 200 = moderate Vibrance, 500 = stark",
+    },
+    "post_gain_r": {
+        "label": "Farbkanal Rot",
+        "category": "color",
+        "unit": "percent",
+        "min": 0, "max": 2000, "default": 1000,
+        "hint": "100 = normal, 0 = kein Rot (Bild grün-blau), 150 = mehr Rot",
+    },
+    "post_gain_g": {
+        "label": "Farbkanal Grün",
+        "category": "color",
+        "unit": "percent",
+        "min": 0, "max": 2000, "default": 1000,
+        "hint": "100 = normal, 0 = kein Grün, 150 = mehr Grün",
+    },
+    "post_gain_b": {
+        "label": "Farbkanal Blau",
+        "category": "color",
+        "unit": "percent",
+        "min": 0, "max": 2000, "default": 1000,
+        "hint": "100 = normal, 0 = kein Blau, 150 = mehr Blau",
+    },
+    "post_highlights": {
+        "label": "Lichter",
+        "category": "color",
+        "unit": "percent",
+        "min": 0, "max": 2000, "default": 1000,
+        "hint": "100 = normal, 80 = Lichter absenken (HDR-Effekt), 120 = heller",
+    },
+    "post_shadows": {
+        "label": "Schatten",
+        "category": "color",
+        "unit": "additive",
+        "min": 0, "max": 1000, "default": 0,
+        "hint": "0 = kein Effekt, 200 = Schatten aufhellen, 500 = stark",
+    },
     "post_sunglasses": {
         "label": "Sonnenbrille",
         "values": {"0": "Off", "1": "Light", "2": "Dark", "3": "Night"},
@@ -9740,13 +8786,29 @@ def analyze_openxr(
         label = defn.get("label", key)
         category = defn.get("category", "sonstige")
         value_map = defn.get("values", {})
-        display = value_map.get(str(val), str(val))
+        unit = defn.get("unit", "")
+        setting_default = defn.get("default")
+
+        # Format display value — percent settings show human-readable "%"
+        if value_map:
+            display = value_map.get(str(val), str(val))
+        elif unit == "percent":
+            pct = val // 10
+            neutral_marker = " ✓ (neutral)" if val == setting_default else (
+                " ⚠ (zu niedrig!)" if val < 500 else ""
+            )
+            display = f"{pct} %{neutral_marker}"
+        elif unit == "additive":
+            display = f"{val} (neutral=0)" if val == 0 else str(val)
+        else:
+            display = str(val)
 
         categories.setdefault(category, []).append({
             "key": key,
             "label": label,
             "value": val,
             "display": display,
+            "neutral": setting_default,
         })
 
     return {
@@ -9774,25 +8836,34 @@ def set_openxr_setting(
     Für MSFS-Grafik (DLSS, Wolken, Terrain) → set_msfs_setting verwenden.
 
     OpenXR Toolkit steuert: Upscaling (NIS/FSR/CAS), Schärfe, Foveated
-    Rendering (VRS), Post-Processing (Helligkeit/Kontrast), Reprojection.
+    Rendering (VRS), Post-Processing (Helligkeit/Kontrast/Sättigung), Reprojection.
 
     Writes directly to: HKCU\\SOFTWARE\\OpenXR_Toolkit\\FlightSimulator2024.exe
     Changes take effect at the next VR session start.
 
+    FARBEINSTELLUNGEN — Wertebereich (gespeichert als Ganzzahl × 10):
+      • 100  = 100 % = Neutralwert (kein Effekt, Originalfarben)
+      • 0    = 0 % — ACHTUNG: Sättigung 0 = Graustufen! Helligkeit 0 = schwarz!
+      • 150  = 150 % (Farbe verstärkt)
+      • post_process MUSS aktiviert sein (wird automatisch eingeschaltet)
+    Eingabe: "80" → 80 % (800 gespeichert), "100" → neutral (1000), "150" → 1500
+    Relative: "+10" → +10 Prozentpunkte, "-5" → -5 Prozentpunkte
+    Reset: "normal" oder "reset" → setzt Neutralwert wieder her (100 % / 1000)
+
     Use this when the user mentions "OpenXR" and wants to change:
     - "OpenXR Schärfe auf 80" / "NIS Upscaling aktivieren"
     - "OpenXR Foveated Rendering einschalten"
-    - "OpenXR Helligkeit erhöhen" / "OpenXR Kontrast auf 500"
+    - "OpenXR Helligkeit auf 110" / "OpenXR Kontrast auf 120"
+    - "OpenXR Sättigung normal" (→ 100 % = 1000, keine Graustufen)
     - "Motion Reprojection an" / "Turbo Mode aus"
     - "Sonnenbrille auf Dark"
 
-    Supports relative values: "+10", "-20" to adjust from current.
-
     Args:
         setting: Setting name (German or English), e.g. "schärfe",
-                 "upscaler", "helligkeit", "foveated", "turbo".
-        value: New value — name ("nis", "aus", "dark") or number ("80"),
-               or relative ("+10", "-5").
+                 "upscaler", "helligkeit", "sättigung", "foveated", "turbo".
+        value: New value — name ("nis", "aus", "dark"), percentage ("80" = 80 %),
+               multiplier ("1.5" = 150 %), relative ("+10", "-5"),
+               or "normal"/"reset" for neutral default.
         game_exe: Game executable (default: FlightSimulator2024.exe).
     """
     exe = game_exe or _OPENXR_MSFS2024_EXE
@@ -9820,58 +8891,149 @@ def set_openxr_setting(
     defn = OPENXR_SETTING_DEFS.get(reg_key, {})
     label = defn.get("label", reg_key)
     value_map = defn.get("values", {})
+    is_percent = defn.get("unit") == "percent"   # brightness/contrast/saturation etc.
+    is_additive = defn.get("unit") == "additive" # vibrance/shadows
+    setting_default = defn.get("default")
+    setting_min = defn.get("min", 0)
+    setting_max = defn.get("max", 65535)
+    setting_hint = defn.get("hint", "")
 
     # Read current value
     current = _read_openxr_settings(exe)
-    old_val = current.get(reg_key, 0)
+    old_val = current.get(reg_key, setting_default if setting_default is not None else 0)
 
     # Resolve value
     value_lower = value.strip().lower()
     resolved: int | None = None
 
-    # 1. Check named value aliases
-    alias_group = _OPENXR_VALUE_ALIASES.get(reg_key)
-    if alias_group is None and reg_key in _OPENXR_ON_OFF_KEYS:
-        alias_group = _OPENXR_VALUE_ALIASES["_on_off"]
+    # 1. Reset/Neutral aliases → use default
+    if value_lower in ("normal", "standard", "reset", "default", "zurücksetzen",
+                       "neutral", "zurücksetzen", "zurück", "aus", "off") and \
+            reg_key not in _OPENXR_ON_OFF_KEYS and not value_map:
+        if value_lower in ("normal", "standard", "reset", "default",
+                           "zurücksetzen", "zurück", "neutral"):
+            if setting_default is not None:
+                resolved = setting_default
 
-    if alias_group and value_lower in alias_group:
-        resolved = int(alias_group[value_lower])
+    # 2. Check named value aliases (enum keys like scaling_type, vrs, post_sunglasses)
+    if resolved is None:
+        alias_group = _OPENXR_VALUE_ALIASES.get(reg_key)
+        if alias_group is None and reg_key in _OPENXR_ON_OFF_KEYS:
+            alias_group = _OPENXR_VALUE_ALIASES["_on_off"]
+        if alias_group and value_lower in alias_group:
+            resolved = int(alias_group[value_lower])
 
-    # 2. Special: if user says "NIS"/"FSR"/"CAS" as value for scaling_type
+    # 3. Special: "NIS"/"FSR"/"CAS" as value for scaling_type
     if resolved is None and reg_key == "scaling_type":
         for name, num in _OPENXR_VALUE_ALIASES["scaling_type"].items():
             if value_lower == name:
                 resolved = int(num)
                 break
 
-    # 3. Relative adjustment: "+10", "-5"
+    # 4. Relative adjustment: "+10", "-5"  (for percent settings: relative to registry value)
     if resolved is None:
         v_stripped = value.strip()
         if v_stripped.startswith("+") or (v_stripped.startswith("-") and len(v_stripped) > 1):
             try:
                 delta = int(v_stripped)
-                resolved = old_val + delta
+                if is_percent:
+                    # "+10" means +10 percentage points → +100 in registry
+                    resolved = old_val + delta * 10
+                else:
+                    resolved = old_val + delta
             except ValueError:
                 pass
 
-    # 4. Direct integer
+    # 5. Float multiplier for percent settings: "1.5" → 150 % → 1500 stored
+    if resolved is None and is_percent:
+        v_stripped = value.strip().rstrip('%')
+        if '.' in v_stripped:
+            try:
+                f = float(v_stripped)
+                if value.strip().endswith('%'):
+                    resolved = int(f * 10)   # "150.5%" → 1505
+                else:
+                    resolved = int(f * 1000) # "1.5"   → 1500
+            except ValueError:
+                pass
+
+    # 6. Percentage string "80%" or plain integer
     if resolved is None:
+        v_stripped = value.strip()
+        has_percent_suffix = v_stripped.endswith('%')
+        v_clean = v_stripped.rstrip('%')
         try:
-            resolved = int(value.strip())
+            raw_int = int(v_clean)
+            if is_percent:
+                if has_percent_suffix:
+                    # Explicit "%": always multiply by 10
+                    resolved = raw_int * 10
+                elif 0 <= raw_int <= 200:
+                    # Compact percentage: "80" → 80 % → 800 stored
+                    # Range 0–200 covers all typical UI slider values (0–200 %)
+                    resolved = raw_int * 10
+                else:
+                    # Value > 200: treat as raw registry value (e.g. "1500")
+                    resolved = raw_int
+            else:
+                resolved = raw_int
         except ValueError:
             pass
 
     if resolved is None:
+        hint_text = f" Tipp: {setting_hint}" if setting_hint else ""
         return {
             "error": f"Kann Wert '{value}' nicht interpretieren für '{label}'.",
-            "erlaubte_werte": value_map if value_map else "Ganzzahl",
+            "erlaubte_werte": value_map if value_map else (
+                f"Prozent 0–200 (z.B. '100' = neutral, '150' = 150 %) oder "
+                f"Registry-Rohwert 0–{setting_max}" if is_percent else "Ganzzahl"
+            ),
+            "hinweis": hint_text.strip(),
         }
+
+    # Clamp to valid range
+    resolved = max(setting_min, min(setting_max, resolved))
+
+    # Safety warnings before writing
+    warnings_list: list[str] = []
+    if reg_key == "post_saturation" and resolved == 0:
+        warnings_list.append(
+            "⚠️ Sättigung = 0 → Bild wird GRAUSTUFEN (schwarz-weiß)! "
+            "Neutral = 1000 (100 %). Für normale Farben: 'sättigung 100'."
+        )
+    elif reg_key == "post_saturation" and resolved < 500:
+        warnings_list.append(
+            f"⚠️ Sättigung {resolved // 10} % ist sehr niedrig — Farben wirken fast grau. "
+            "Neutral = 100 % (1000)."
+        )
+    if reg_key == "post_brightness" and resolved < 300:
+        warnings_list.append(
+            f"⚠️ Helligkeit {resolved // 10} % ist sehr niedrig — Bild wird sehr dunkel. "
+            "Neutral = 100 % (1000)."
+        )
+    if reg_key in ("post_gain_r", "post_gain_g", "post_gain_b") and resolved == 0:
+        warnings_list.append(
+            f"⚠️ {label} = 0 → Farbkanal vollständig deaktiviert! Neutral = 100 % (1000)."
+        )
+
+    # Auto-enable post_process for color-category settings
+    # (without it, all post-processing is disabled regardless of individual values)
+    pp_enabled_now = False
+    if defn.get("category") == "color" and reg_key != "post_process":
+        current_pp = current.get("post_process", 0)
+        if current_pp != 1:
+            _write_openxr_setting("post_process", 1, exe)
+            pp_enabled_now = True
 
     # Write to registry
     ok = _write_openxr_setting(reg_key, resolved, exe)
 
-    old_display = value_map.get(str(old_val), str(old_val))
-    new_display = value_map.get(str(resolved), str(resolved))
+    old_display = value_map.get(str(old_val), (
+        f"{old_val // 10} %" if is_percent else str(old_val)
+    ))
+    new_display = value_map.get(str(resolved), (
+        f"{resolved // 10} %" if is_percent else str(resolved)
+    ))
 
     if not ok:
         return {"error": f"Konnte '{reg_key}' nicht in Registry schreiben."}
@@ -9880,7 +9042,7 @@ def set_openxr_setting(
     verify = _read_openxr_settings(exe)
     verified = verify.get(reg_key) == resolved
 
-    return {
+    result: dict = {
         "status": "ok",
         "einstellung": label,
         "key": reg_key,
@@ -9895,6 +9057,20 @@ def set_openxr_setting(
             "und neu starten (Ctrl+Tab oder MSFS neu starten)."
         ),
     }
+
+    if setting_hint:
+        result["wertebereich"] = setting_hint
+
+    if pp_enabled_now:
+        result["post_process_aktiviert"] = (
+            "Post-Processing war deaktiviert — wurde automatisch eingeschaltet "
+            "(Voraussetzung für alle Farbeffekte)."
+        )
+
+    if warnings_list:
+        result["warnungen"] = warnings_list
+
+    return result
 
 
 @mcp.tool()
@@ -9948,9 +9124,14 @@ def apply_openxr_preset(
         "Balanced": {
             "scaling_type": 1,    # NIS
             "sharpness": 50,
-            "post_process": 1,    # On
-            "post_contrast": 500,
-            "post_saturation": 300,
+            "post_process": 1,    # On — PFLICHT für Farbeffekte
+            "post_brightness": 1000,  # 100 % = neutral
+            "post_contrast": 1100,    # 110 % = leicht mehr Kontrast
+            "post_saturation": 1100,  # 110 % = leicht sattere Farben
+            "post_vibrance": 150,     # Schwache Vibrance-Verstärkung
+            "post_gain_r": 1000,      # 100 % = neutral (Rot)
+            "post_gain_g": 1000,      # 100 % = neutral (Grün)
+            "post_gain_b": 1000,      # 100 % = neutral (Blau)
             "vrs": 1,             # Preset
             "vrs_inner": 0,       # 1x
             "vrs_middle": 1,      # 1/2
@@ -9961,11 +9142,15 @@ def apply_openxr_preset(
         "Quality": {
             "scaling_type": 3,    # CAS (nur Schärfe, kein Upscaling)
             "sharpness": 40,
-            "post_process": 1,    # On
-            "post_contrast": 400,
-            "post_saturation": 200,
-            "post_vibrance": 200,
-            "vrs": 0,             # Off
+            "post_process": 1,    # On — PFLICHT für Farbeffekte
+            "post_brightness": 1000,  # 100 % = neutral
+            "post_contrast": 1050,    # 105 % = minimaler Kontrast-Boost
+            "post_saturation": 1050,  # 105 % = minimal sattere Farben
+            "post_vibrance": 100,     # Sehr dezente Vibrance
+            "post_gain_r": 1000,      # 100 % = neutral
+            "post_gain_g": 1000,      # 100 % = neutral
+            "post_gain_b": 1000,      # 100 % = neutral
+            "vrs": 0,             # Off (volle Auflösung)
             "turbo": 0,           # Off
             "motion_reprojection": 0,  # Default
         },
@@ -10015,7028 +9200,522 @@ def apply_openxr_preset(
     }
 
 
+# ===========================================================================
+# GPU-aware VR Color Profiles
+# Three-layer system: Pimax hardware → OpenXR post-processing → ReShade
+# ===========================================================================
+# All layers are tuned to maximize visual quality while staying within FPS
+# budget for each GPU tier.  FPS impact is measured at Pimax-resolution
+# (per eye ~2448×2448 in 90 Hz mode).
+#
+# Pimax  : hardware-level panel adjustments — zero GPU cost
+# OpenXR : pre-render color grading via toolkit post-process — ~1-2 % FPS
+# ReShade: post-render effects (sharpening, vibrance, tonemap) — 2-8 % FPS
 # ---------------------------------------------------------------------------
-# Hardware Profile & VR Performance Tier
-# ---------------------------------------------------------------------------
 
-# VR performance tiers based on combined CPU+GPU+RAM score
-_VR_TIERS = [
-    ("ultra",   "RTX 4090 / RX 7900 XTX level — maximale VR-Qualität möglich"),
-    ("high",    "RTX 4080/4070 Ti / RX 7900 XT — sehr gute VR-Qualität"),
-    ("mid_high","RTX 4070/3080 / RX 6800 XT — gute VR-Qualität mit Kompromissen"),
-    ("mid",     "RTX 3070/3060 Ti / RX 6700 XT — mittlere VR-Qualität"),
-    ("low",     "RTX 3060 oder schwächer — Performance-Modus empfohlen"),
-]
-
-
-def _classify_vr_tier(vram_gb: float, gpu_name: str, cpu_cores: int, ram_gb: float) -> str:
-    name = gpu_name.upper()
-    if vram_gb >= 20 or any(x in name for x in ["4090", "4080", "7900 XTX", "7900 XT"]):
-        return "ultra"
-    if vram_gb >= 16 or any(x in name for x in ["4070 TI", "4070TI", "3090", "6900", "7900"]):
-        return "high"
-    if vram_gb >= 10 or any(x in name for x in ["4070", "3080", "6800", "7800", "4060 TI"]):
-        return "mid_high"
-    if vram_gb >= 8 or any(x in name for x in ["3070", "3060 TI", "6700", "6750", "4060"]):
-        return "mid"
-    return "low"
-
-
-@mcp.tool()
-def get_detailed_hardware_profile() -> dict:
-    """Liest alle Hardware-Details aus (GPU, CPU, RAM, Speicher) und berechnet den VR-Performance-Tier.
-
-    Rufe dieses Tool ZUERST auf bevor du VR-Einstellungen optimierst.
-    Gibt GPU-VRAM, CPU-Kerne, RAM, Speicher-Typ und den VR-Tier zurück.
-    """
-    # GPU via pynvml
-    gpu_info = {}
-    try:
-        pynvml.nvmlInit()
-        try:
-            h = pynvml.nvmlDeviceGetHandleByIndex(0)
-            name = pynvml.nvmlDeviceGetName(h)
-            if isinstance(name, bytes):
-                name = name.decode()
-            mem = pynvml.nvmlDeviceGetMemoryInfo(h)
-            temp = pynvml.nvmlDeviceGetTemperature(h, pynvml.NVML_TEMPERATURE_GPU)
-            clock = pynvml.nvmlDeviceGetClockInfo(h, pynvml.NVML_CLOCK_GRAPHICS)
-            max_clock = pynvml.nvmlDeviceGetMaxClockInfo(h, pynvml.NVML_CLOCK_GRAPHICS)
-            util = pynvml.nvmlDeviceGetUtilizationRates(h)
-            gpu_info = {
-                "name": name,
-                "vram_total_gb": round(mem.total / 1024**3, 1),
-                "vram_free_gb": round(mem.free / 1024**3, 1),
-                "temperature_c": temp,
-                "clock_mhz": clock,
-                "max_clock_mhz": max_clock,
-                "utilization_gpu_pct": util.gpu,
-                "utilization_mem_pct": util.memory,
-            }
-        finally:
-            pynvml.nvmlShutdown()
-    except Exception as exc:
-        gpu_info = {"error": str(exc)}
-
-    # CPU
-    try:
-        cpu_raw = _ps_json(
-            "Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, "
-            "NumberOfLogicalProcessors, MaxClockSpeed, CurrentClockSpeed, L2CacheSize, L3CacheSize"
-        )
-        cpu_info = cpu_raw[0] if cpu_raw else {}
-    except Exception:
-        cpu_info = {}
-
-    # RAM
-    try:
-        ram_raw = _ps_json(
-            "Get-CimInstance Win32_PhysicalMemory | Select-Object "
-            "Capacity, Speed, MemoryType, SMBIOSMemoryType, Manufacturer, PartNumber"
-        )
-        total_ram_bytes = sum(int(r.get("Capacity", 0) or 0) for r in ram_raw)
-        ram_gb = round(total_ram_bytes / 1024**3, 1)
-        mem_type_map = {24: "DDR3", 26: "DDR4", 34: "DDR5"}
-        mem_type = mem_type_map.get(int(ram_raw[0].get("SMBIOSMemoryType", 0) or 0), "DDR?") if ram_raw else "?"
-        ram_speed = ram_raw[0].get("Speed", "?") if ram_raw else "?"
-        ram_info = {
-            "total_gb": ram_gb,
-            "type": mem_type,
-            "speed_mhz": ram_speed,
-            "modules": len(ram_raw),
-        }
-    except Exception as exc:
-        ram_info = {"error": str(exc)}
-        ram_gb = 16.0
-
-    # Disk (MSFS-relevant)
-    try:
-        disk_raw = _ps_json(
-            "Get-PhysicalDisk | Select-Object FriendlyName, MediaType, Size, BusType"
-        )
-        disks = [
-            {
-                "name": d.get("FriendlyName", ""),
-                "type": d.get("MediaType", ""),
-                "bus": d.get("BusType", ""),
-                "size_gb": round(int(d.get("Size", 0) or 0) / 1024**3, 0),
-            }
-            for d in disk_raw
-        ]
-    except Exception:
-        disks = []
-
-    # Compute VR tier
-    vram_gb = gpu_info.get("vram_total_gb", 8.0) if "error" not in gpu_info else 8.0
-    cpu_cores = int(cpu_info.get("NumberOfCores", 8) or 8)
-    gpu_name = gpu_info.get("name", "") if "error" not in gpu_info else ""
-    tier = _classify_vr_tier(vram_gb, gpu_name, cpu_cores, ram_gb)
-    tier_desc = dict(_VR_TIERS).get(tier, "")
-
-    return {
-        "gpu": gpu_info,
-        "cpu": cpu_info,
-        "ram": ram_info,
-        "disks": disks,
-        "vr_tier": tier,
-        "vr_tier_beschreibung": tier_desc,
-        "empfehlung": (
-            f"Dein System ({gpu_name}, {vram_gb:.0f}GB VRAM, {cpu_cores} CPU-Kerne, {ram_gb:.0f}GB RAM) "
-            f"ist im VR-Tier '{tier}'. Sage 'VR optimieren' für hardware-spezifische Einstellungen."
+_VR_COLOR_PROFILES_BY_TIER: dict[str, dict] = {
+    "flagship": {
+        "description": (
+            "RTX 5090 / 4090 — Alle drei Ebenen maximiert. "
+            "Tiefes Schwarz, satte Farben, HDR-ähnlicher Look, scharfes Bild."
         ),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Master VR Optimizer — sets everything based on hardware
-# ---------------------------------------------------------------------------
-
-# Preset tables per tier: MSFS GraphicsVR settings
-_VR_MSFS_PRESETS: dict[str, dict[str, str]] = {
-    "ultra": {
-        "GraphicsVR.TerrainLoD": "2.5",
-        "GraphicsVR.ObjectsLoD": "2.5",
-        "GraphicsVR.CloudsQuality": "3",
-        "GraphicsVR.TextureResolution": "3",
-        "GraphicsVR.AnisotropicFilter": "4",
-        "GraphicsVR.ShadowQuality": "3",
-        "GraphicsVR.Reflections": "4",
-        "GraphicsVR.SSContact": "1",
-        "GraphicsVR.MotionBlur": "0",
-        "Graphics.TerrainLoD": "2.5",
-        "Graphics.ObjectsLoD": "2.5",
-        "Graphics.CloudsQuality": "3",
-        "Graphics.TextureResolution": "3",
-        "Graphics.AnisotropicFilter": "4",
-        "Graphics.ShadowQuality": "3",
-        "Video.DLSS": "1",
-        "Video.DLSSG": "1",
-        "Video.RenderScale": "100",
-        "RayTracing.Enabled": "0",
+        "fps_impact": "~4-7 %",   # OpenXR ~1-2% + CAS+Colorfulness+Vibrance+Tonemap ~3-5%
+        # OpenXR post-processing (registry values, 1000 = 100 % = neutral)
+        "openxr": {
+            "post_process":    1,
+            "post_brightness": 1000,   # 100 % — neutral (Pimax-Display hell genug)
+            "post_contrast":   1120,   # 112 % — etwas mehr Kontrast
+            "post_saturation": 1160,   # 116 % — sattere, lebendigere Farben
+            "post_vibrance":   250,    # Dezente Vibrance-Verstärkung
+            "post_exposure":   1000,   # 100 % — neutral
+            "post_gain_r":     1025,   # 102.5 % — leicht wärmerer Weißpunkt
+            "post_gain_g":     1000,   # 100 %
+            "post_gain_b":      975,   # 97.5 % — minimal kühler für Blautöne
+            "post_highlights":  940,   # 94 % — Lichter absenken (HDR-Look)
+            "post_shadows":      60,   # Schatten leicht aufhellen (Schattendetail)
+        },
+        # ReShade effects
+        "reshade_enable":  ["CAS", "Colorfulness", "Vibrance", "Tonemap"],
+        "reshade_disable": ["MXAO", "MagicBloom", "SMAA", "FXAA",
+                            "AdaptiveSharpen", "LumaSharpen"],
+        "reshade_settings": {
+            "CAS":          {"Sharpness": "0.60"},
+            "Colorfulness": {"colorfullness": "0.50", "lim_luma": "0.75"},
+            "Vibrance":     {"Vibrance": "0.20"},
+            "Tonemap":      {"Gamma": "1.02", "Exposure": "0.03",
+                             "Saturation": "0.05", "Defog": "0.0"},
+        },
+        # Pimax hardware display (0-100, 50 = neutral)
+        "pimax": {
+            "piplay_color_brightness_0": 52,
+            "piplay_color_brightness_1": 52,
+            "piplay_color_contrast_0":   56,
+            "piplay_color_contrast_1":   56,
+            "piplay_color_saturation_0": 62,
+            "piplay_color_saturation_1": 62,
+        },
     },
-    "high": {
-        "GraphicsVR.TerrainLoD": "2.0",
-        "GraphicsVR.ObjectsLoD": "2.0",
-        "GraphicsVR.CloudsQuality": "3",
-        "GraphicsVR.TextureResolution": "3",
-        "GraphicsVR.AnisotropicFilter": "4",
-        "GraphicsVR.ShadowQuality": "2",
-        "GraphicsVR.Reflections": "2",
-        "GraphicsVR.SSContact": "1",
-        "GraphicsVR.MotionBlur": "0",
-        "Graphics.TerrainLoD": "2.0",
-        "Graphics.ObjectsLoD": "2.0",
-        "Graphics.CloudsQuality": "3",
-        "Graphics.TextureResolution": "3",
-        "Graphics.AnisotropicFilter": "4",
-        "Graphics.ShadowQuality": "2",
-        "Video.DLSS": "2",
-        "Video.DLSSG": "0",
-        "Video.RenderScale": "100",
-        "RayTracing.Enabled": "0",
+    "high_end": {
+        "description": (
+            "RTX 5080 / 4080 / 3090 Ti — ReShade (leicht) + OpenXR + Pimax. "
+            "Sehr gute Farben, kein nennenswerter FPS-Verlust."
+        ),
+        "fps_impact": "~3-6 %",   # OpenXR ~1-2% + CAS+Vibrance+Tonemap ~2-4%
+        "openxr": {
+            "post_process":    1,
+            "post_brightness": 1000,
+            "post_contrast":   1100,   # 110 %
+            "post_saturation": 1130,   # 113 %
+            "post_vibrance":   180,
+            "post_exposure":   1000,
+            "post_gain_r":     1015,
+            "post_gain_g":     1000,
+            "post_gain_b":      985,
+            "post_highlights":  955,
+            "post_shadows":      40,
+        },
+        "reshade_enable":  ["CAS", "Vibrance", "Tonemap"],
+        "reshade_disable": ["MXAO", "MagicBloom", "Colorfulness",
+                            "AdaptiveSharpen", "LumaSharpen", "SMAA", "FXAA"],
+        "reshade_settings": {
+            "CAS":     {"Sharpness": "0.52"},
+            "Vibrance": {"Vibrance": "0.18"},
+            "Tonemap": {"Gamma": "1.01", "Exposure": "0.02",
+                        "Saturation": "0.04", "Defog": "0.0"},
+        },
+        "pimax": {
+            "piplay_color_brightness_0": 51,
+            "piplay_color_brightness_1": 51,
+            "piplay_color_contrast_0":   54,
+            "piplay_color_contrast_1":   54,
+            "piplay_color_saturation_0": 58,
+            "piplay_color_saturation_1": 58,
+        },
     },
     "mid_high": {
-        "GraphicsVR.TerrainLoD": "1.5",
-        "GraphicsVR.ObjectsLoD": "1.5",
-        "GraphicsVR.CloudsQuality": "2",
-        "GraphicsVR.TextureResolution": "2",
-        "GraphicsVR.AnisotropicFilter": "4",
-        "GraphicsVR.ShadowQuality": "2",
-        "GraphicsVR.Reflections": "1",
-        "GraphicsVR.SSContact": "1",
-        "GraphicsVR.MotionBlur": "0",
-        "Graphics.TerrainLoD": "1.5",
-        "Graphics.ObjectsLoD": "1.5",
-        "Graphics.CloudsQuality": "2",
-        "Graphics.TextureResolution": "2",
-        "Graphics.AnisotropicFilter": "4",
-        "Graphics.ShadowQuality": "2",
-        "Video.DLSS": "3",
-        "Video.DLSSG": "0",
-        "Video.RenderScale": "100",
-        "RayTracing.Enabled": "0",
+        "description": (
+            "RTX 4070 Ti SUPER / 3080 Ti — CAS-Schärfe + OpenXR + Pimax. "
+            "Farbeffekte nur über OpenXR (kein teures ReShade)."
+        ),
+        "fps_impact": "~2-4 %",   # OpenXR ~1-2% + CAS ~1-2%
+        "openxr": {
+            "post_process":    1,
+            "post_brightness": 1000,
+            "post_contrast":   1080,   # 108 %
+            "post_saturation": 1110,   # 111 %
+            "post_vibrance":   130,
+            "post_exposure":   1000,
+            "post_gain_r":     1010,
+            "post_gain_g":     1000,
+            "post_gain_b":      990,
+            "post_highlights":  965,
+            "post_shadows":      20,
+        },
+        "reshade_enable":  ["CAS"],   # Nur Schärfe — kein Farb-ReShade
+        "reshade_disable": ["MXAO", "MagicBloom", "Colorfulness", "Vibrance",
+                            "Tonemap", "AdaptiveSharpen", "LumaSharpen",
+                            "SMAA", "FXAA"],
+        "reshade_settings": {
+            "CAS": {"Sharpness": "0.48"},
+        },
+        "pimax": {
+            "piplay_color_brightness_0": 51,
+            "piplay_color_brightness_1": 51,
+            "piplay_color_contrast_0":   53,
+            "piplay_color_contrast_1":   53,
+            "piplay_color_saturation_0": 56,
+            "piplay_color_saturation_1": 56,
+        },
     },
-    "mid": {
-        "GraphicsVR.TerrainLoD": "1.0",
-        "GraphicsVR.ObjectsLoD": "1.0",
-        "GraphicsVR.CloudsQuality": "1",
-        "GraphicsVR.TextureResolution": "2",
-        "GraphicsVR.AnisotropicFilter": "3",
-        "GraphicsVR.ShadowQuality": "1",
-        "GraphicsVR.Reflections": "0",
-        "GraphicsVR.SSContact": "0",
-        "GraphicsVR.MotionBlur": "0",
-        "Graphics.TerrainLoD": "1.0",
-        "Graphics.ObjectsLoD": "1.0",
-        "Graphics.CloudsQuality": "1",
-        "Graphics.TextureResolution": "2",
-        "Graphics.AnisotropicFilter": "3",
-        "Graphics.ShadowQuality": "1",
-        "Video.DLSS": "4",
-        "Video.DLSSG": "0",
-        "Video.RenderScale": "100",
-        "RayTracing.Enabled": "0",
+    "mid_range": {
+        "description": (
+            "RTX 4070 / 3070 — Nur OpenXR + Pimax, kein ReShade. "
+            "FPS haben Vorrang; trotzdem deutlich besser als Defaults."
+        ),
+        "fps_impact": "~1-2 %",   # Nur OpenXR Post-Processing, kein ReShade
+        "openxr": {
+            "post_process":    1,
+            "post_brightness": 1000,
+            "post_contrast":   1060,   # 106 %
+            "post_saturation": 1090,   # 109 %
+            "post_vibrance":    80,
+            "post_exposure":   1000,
+            "post_gain_r":     1000,
+            "post_gain_g":     1000,
+            "post_gain_b":     1000,
+            "post_highlights":  975,
+            "post_shadows":      10,
+        },
+        "reshade_enable":  [],
+        "reshade_disable": ["MXAO", "MagicBloom", "Colorfulness", "Vibrance",
+                            "Tonemap", "CAS", "AdaptiveSharpen", "LumaSharpen",
+                            "SMAA", "FXAA", "Clarity"],
+        "reshade_settings": {},
+        "pimax": {
+            "piplay_color_brightness_0": 50,
+            "piplay_color_brightness_1": 50,
+            "piplay_color_contrast_0":   52,
+            "piplay_color_contrast_1":   52,
+            "piplay_color_saturation_0": 54,
+            "piplay_color_saturation_1": 54,
+        },
     },
-    "low": {
-        "GraphicsVR.TerrainLoD": "0.5",
-        "GraphicsVR.ObjectsLoD": "0.5",
-        "GraphicsVR.CloudsQuality": "0",
-        "GraphicsVR.TextureResolution": "1",
-        "GraphicsVR.AnisotropicFilter": "2",
-        "GraphicsVR.ShadowQuality": "0",
-        "GraphicsVR.Reflections": "0",
-        "GraphicsVR.SSContact": "0",
-        "GraphicsVR.MotionBlur": "0",
-        "Graphics.TerrainLoD": "0.5",
-        "Graphics.ObjectsLoD": "0.5",
-        "Graphics.CloudsQuality": "0",
-        "Graphics.TextureResolution": "1",
-        "Graphics.AnisotropicFilter": "2",
-        "Graphics.ShadowQuality": "0",
-        "Video.DLSS": "5",
-        "Video.DLSSG": "0",
-        "Video.RenderScale": "100",
-        "RayTracing.Enabled": "0",
+    "entry": {
+        "description": (
+            "RTX 4060 und darunter — Minimale OpenXR-Anpassungen, Pimax leicht. "
+            "FPS haben absolute Priorität."
+        ),
+        "fps_impact": "< 1 %",
+        "openxr": {
+            "post_process":    1,
+            "post_brightness": 1000,
+            "post_contrast":   1040,   # 104 %
+            "post_saturation": 1060,   # 106 %
+            "post_vibrance":     0,    # Kein Vibrance
+            "post_exposure":   1000,
+            "post_gain_r":     1000,
+            "post_gain_g":     1000,
+            "post_gain_b":     1000,
+            "post_highlights": 1000,
+            "post_shadows":       0,
+        },
+        "reshade_enable":  [],
+        "reshade_disable": ["MXAO", "MagicBloom", "Colorfulness", "Vibrance",
+                            "Tonemap", "CAS", "AdaptiveSharpen", "LumaSharpen",
+                            "SMAA", "FXAA", "Clarity"],
+        "reshade_settings": {},
+        "pimax": {
+            "piplay_color_brightness_0": 50,
+            "piplay_color_brightness_1": 50,
+            "piplay_color_contrast_0":   51,
+            "piplay_color_contrast_1":   51,
+            "piplay_color_saturation_0": 52,
+            "piplay_color_saturation_1": 52,
+        },
+    },
+}
+
+# Neutral defaults for full reset
+_VR_COLOR_NEUTRAL: dict = {
+    "openxr": {
+        "post_process":    0,     # Off
+        "post_brightness": 1000,  # 100 %
+        "post_contrast":   1000,  # 100 %
+        "post_saturation": 1000,  # 100 %
+        "post_vibrance":      0,
+        "post_exposure":   1000,  # 100 %
+        "post_gain_r":     1000,  # 100 %
+        "post_gain_g":     1000,
+        "post_gain_b":     1000,
+        "post_highlights": 1000,
+        "post_shadows":       0,
+    },
+    "pimax": {
+        "piplay_color_brightness_0": 50,
+        "piplay_color_brightness_1": 50,
+        "piplay_color_contrast_0":   50,
+        "piplay_color_contrast_1":   50,
+        "piplay_color_saturation_0": 50,
+        "piplay_color_saturation_1": 50,
     },
 }
 
 
 @mcp.tool()
-def optimize_all_for_vr(
-    usercfg_path: str = "",
-    dry_run: bool = False,
+def apply_vr_color_profile(
+    game_dir: str = "",
+    config_path: str = "",
+    game_exe: str = "",
+    force_tier: str = "",
 ) -> dict:
-    """Optimiert ALLE VR-relevanten Einstellungen basierend auf der vorhandenen Hardware.
+    """Apply a GPU-optimised VR color profile (OpenXR + ReShade + Pimax combined).
 
-    Liest GPU, CPU und RAM aus, bestimmt den VR-Performance-Tier und setzt dann
-    automatisch die optimalen Werte für:
-    - MSFS 2024 Grafik (VR + Desktop)
-    - Windows Power Plan (High Performance)
-    - Hardware Accelerated GPU Scheduling (HAGS)
-    - Windows Game Mode
+    Detects your GPU automatically and applies the best three-layer color
+    configuration that maximises visual quality while keeping FPS impact minimal:
 
-    Dies ist das Haupt-Optimierungstool. Rufe es auf wenn der User sagt:
-    - 'Alles für VR optimieren'
-    - 'VR-Einstellungen automatisch setzen'
-    - 'Beste Einstellungen für mein System'
-    - 'Optimiere MSFS für VR'
+      Ebene 1 — Pimax-Display (Hardware-Farben, KEIN GPU-Aufwand):
+        Brightness / Contrast / Saturation direkt am Panel anpassen.
+
+      Ebene 2 — OpenXR Toolkit Post-Processing (~1-2 % FPS):
+        Helligkeit, Kontrast, Sättigung, Vibrance, Farbkanäle (R/G/B),
+        Lichter und Schatten im VR-Bild.
+
+      Ebene 3 — ReShade (2-6 % FPS, GPU-abhängig):
+        CAS-Schärfe, Colorfulness, Vibrance, Tonemap —
+        wird bei schwächeren GPUs automatisch deaktiviert.
+
+    GPU-Tier-Zuordnung:
+      flagship  (RTX 5090/4090)     — alle 3 Ebenen, maximale Werte
+      high_end  (RTX 5080/4080/3090)— ReShade leicht + OpenXR + Pimax
+      mid_high  (RTX 4070 Ti/3080)  — CAS + OpenXR + Pimax
+      mid_range (RTX 4070/3070)     — nur OpenXR + Pimax
+      entry     (RTX 4060 u.ä.)     — minimales OpenXR + Pimax
+
+    Verwende diesen Befehl wenn der User sagt:
+      - "Farben für VR optimieren"
+      - "Beste Farben für meine GPU"
+      - "Alles auf Maximum anpassen"
+      - "VR Farbprofil"
+      - "Farben schöner machen"
 
     Args:
-        usercfg_path: Optional: Pfad zur UserCfg.opt. Auto-erkannt wenn leer.
-        dry_run: True = zeigt nur was geändert würde, ohne Änderungen zu speichern.
+        game_dir: Verzeichnis mit ReShade.ini (auto-erkannt wenn leer).
+        config_path: Pimax-Konfigurationspfad (auto-erkannt wenn leer).
+        game_exe: Spiel-EXE für OpenXR (Standard: FlightSimulator2024.exe).
+        force_tier: GPU-Tier erzwingen ('flagship'/'high_end'/'mid_high'/
+                    'mid_range'/'entry'). Leer = auto-Erkennung.
     """
-    import time
+    gpu_name, gpu_tier, vram_mb = _detect_gpu_tier()
 
-    results = {}
+    if force_tier and force_tier in _VR_COLOR_PROFILES_BY_TIER:
+        gpu_tier = force_tier
 
-    # 1. Read hardware
-    hw = get_detailed_hardware_profile()
-    tier = hw.get("vr_tier", "mid")
-    gpu_name = hw.get("gpu", {}).get("name", "Unbekannte GPU")
-    vram_gb = hw.get("gpu", {}).get("vram_total_gb", 8)
-    cpu_cores = int(hw.get("cpu", {}).get("NumberOfCores", 8) or 8)
-    ram_gb = hw.get("ram", {}).get("total_gb", 16)
-    results["hardware"] = {
+    if gpu_tier not in _VR_COLOR_PROFILES_BY_TIER:
+        gpu_tier = "mid_range"   # Safe default
+
+    profile = _VR_COLOR_PROFILES_BY_TIER[gpu_tier]
+    exe = game_exe or _OPENXR_MSFS2024_EXE
+
+    results: dict[str, dict] = {}
+    warnings: list[str] = []
+
+    # ── Ebene 1: OpenXR Toolkit ──────────────────────────────────────────────
+    openxr_applied: dict[str, int] = {}
+    openxr_failed:  list[str] = []
+    for key, val in profile["openxr"].items():
+        ok = _write_openxr_setting(key, val, exe)
+        if ok:
+            openxr_applied[key] = val
+        else:
+            openxr_failed.append(key)
+    results["openxr"] = {
+        "status": "ok" if not openxr_failed else "partial",
+        "angewendet": {
+            k: (f"{v // 10} %" if k not in ("post_process", "post_vibrance", "post_shadows") else str(v))
+            for k, v in openxr_applied.items()
+        },
+        "fehlgeschlagen": openxr_failed or None,
+    }
+
+    # ── Ebene 2: ReShade ─────────────────────────────────────────────────────
+    ini = _find_reshade_ini(game_dir)
+    if ini:
+        preset_path = _find_preset_file(ini)
+        if preset_path:
+            # Write per-effect parameters
+            rs_settings = profile.get("reshade_settings", {})
+            config = _read_preset(preset_path)
+            for eff_name, eff_params in rs_settings.items():
+                if not config.has_section(eff_name):
+                    config.add_section(eff_name)
+                for k, v in eff_params.items():
+                    config.set(eff_name, k, str(v))
+            with open(preset_path, "w", encoding="utf-8") as f:
+                config.write(f)
+            # Update Techniques= list
+            _update_reshade_techniques(
+                preset_path,
+                enable=profile.get("reshade_enable", []),
+                disable=profile.get("reshade_disable", []),
+            )
+            try:
+                preset_path.touch()
+            except Exception:
+                pass
+            results["reshade"] = {
+                "status": "ok",
+                "aktive_effekte": profile.get("reshade_enable", []),
+                "deaktivierte_effekte": profile.get("reshade_disable", []),
+                "preset_file": str(preset_path),
+            }
+        else:
+            results["reshade"] = {"status": "skipped", "grund": "Kein aktives Preset gefunden"}
+            warnings.append("ReShade-Preset nicht gefunden — ReShade-Ebene übersprungen.")
+    else:
+        results["reshade"] = {"status": "skipped", "grund": "ReShade.ini nicht gefunden"}
+        warnings.append("ReShade nicht gefunden — installiert und eingerichtet?")
+
+    # ── Ebene 3: Pimax ───────────────────────────────────────────────────────
+    cfg = _find_pimax_config(config_path)
+    if cfg:
+        pimax_updates = profile.get("pimax", {})
+        registry_result = _apply_pimax_settings_to_registry(pimax_updates, verify=True)
+        verified = sum(1 for v in registry_result.values() if v.get("verified"))
+        results["pimax"] = {
+            "status": "ok" if verified == len(pimax_updates) else "partial",
+            "angewendet": pimax_updates,
+            "registry_audit": registry_result,
+        }
+    else:
+        results["pimax"] = {"status": "skipped", "grund": "Pimax-Config nicht gefunden"}
+        warnings.append("Pimax nicht gefunden — Pimax Play installiert und konfiguriert?")
+
+    return {
+        "status": "ok" if not any(r.get("status") == "partial" for r in results.values()) else "partial",
         "gpu": gpu_name,
-        "vram_gb": vram_gb,
-        "cpu_kerne": cpu_cores,
-        "ram_gb": ram_gb,
-        "tier": tier,
-    }
-
-    # 2. MSFS settings
-    preset = _VR_MSFS_PRESETS.get(tier, _VR_MSFS_PRESETS["mid"])
-    cfg_path = _find_usercfg(usercfg_path)
-
-    if cfg_path and cfg_path.exists():
-        if not dry_run:
-            msfs_was_running = _is_msfs_running()
-            if msfs_was_running:
-                _kill_msfs(timeout_s=35)
-                _wait_for_file_unlocked(cfg_path, timeout_s=25)
-                time.sleep(1.5)
-
-            snapshot = _snapshot(cfg_path, f"Before optimize_all_for_vr tier={tier}")
-            text = cfg_path.read_text(encoding="utf-8")
-            entries = _parse_usercfg(text)
-            new_entries, not_applied = _apply_overrides(entries, preset)
-            cfg_path.write_text(_entries_to_text(new_entries), encoding="utf-8")
-
-            applied = {k: v for k, v in preset.items() if k not in not_applied}
-            results["msfs_einstellungen"] = {
-                "angewendet": len(applied),
-                "nicht_gefunden": list(not_applied),
-                "config_datei": str(cfg_path),
-                "snapshot": snapshot,
-            }
-        else:
-            results["msfs_einstellungen"] = {"vorschau": preset, "dry_run": True}
-    else:
-        results["msfs_einstellungen"] = {"fehler": "UserCfg.opt nicht gefunden"}
-
-    # 3. Windows tweaks
-    if not dry_run:
-        # High Performance power plan
-        try:
-            _ps("powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c")
-            results["power_plan"] = "High Performance aktiviert"
-        except Exception as exc:
-            results["power_plan"] = f"Fehler: {exc}"
-
-        # Game Mode
-        try:
-            _reg_add(r"HKCU\Software\Microsoft\GameBar", "AllowAutoGameMode", "REG_DWORD", "1")
-            _reg_add(r"HKCU\Software\Microsoft\GameBar", "AutoGameModeEnabled", "REG_DWORD", "1")
-            results["game_mode"] = "Game Mode aktiviert"
-        except Exception as exc:
-            results["game_mode"] = f"Fehler: {exc}"
-
-        # HAGS (Hardware Accelerated GPU Scheduling)
-        try:
-            _reg_add(
-                r"HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers",
-                "HwSchMode", "REG_DWORD", "2"
-            )
-            results["hags"] = "Hardware Accelerated GPU Scheduling aktiviert (Neustart erforderlich)"
-        except Exception as exc:
-            results["hags"] = f"Fehler: {exc}"
-    else:
-        results["windows_tweaks"] = {
-            "dry_run": True,
-            "würde_setzen": ["High Performance", "Game Mode", "HAGS"],
-        }
-
-    # 4. SteamVR optimization (if SteamVR is installed)
-    if not dry_run:
-        svr_path = _find_steamvr_settings_path()
-        if svr_path and svr_path.exists():
-            try:
-                svr_result = optimize_steamvr_for_hardware()
-                results["steamvr_optimierung"] = svr_result.get(
-                    "zusammenfassung",
-                    svr_result.get("status", "SteamVR optimiert")
-                )
-            except Exception as svr_exc:
-                results["steamvr_optimierung"] = f"SteamVR-Optimierung übersprungen: {svr_exc}"
-        else:
-            results["steamvr_optimierung"] = "SteamVR nicht installiert — übersprungen"
-
-    # 5. Pimax optimization (if Pimax is detected)
-    if not dry_run:
-        try:
-            pimax_cfg = _find_pimax_config()
-            if pimax_cfg:
-                pimax_result = optimize_pimax_for_msfs()
-                results["pimax_optimierung"] = pimax_result.get(
-                    "zusammenfassung",
-                    pimax_result.get("status", "Pimax optimiert")
-                )
-            else:
-                results["pimax_optimierung"] = "Pimax nicht erkannt — übersprungen"
-        except Exception as pimax_exc:
-            results["pimax_optimierung"] = f"Pimax-Optimierung übersprungen: {pimax_exc}"
-
-    # 6. Summary
-    tier_desc = dict(_VR_TIERS).get(tier, "")
-    settings_summary = []
-    for k, v in preset.items():
-        defn = SETTING_DEFS.get(k, {})
-        label = defn.get("label", k)
-        display = defn.get("values", {}).get(str(v), str(v))
-        settings_summary.append(f"{label}: {display}")
-
-    results["zusammenfassung"] = (
-        f"✅ VR-Optimierung für Tier '{tier}' abgeschlossen!\n"
-        f"GPU: {gpu_name} ({vram_gb:.0f}GB VRAM)\n"
-        f"Tier: {tier_desc}\n\n"
-        f"Gesetzte MSFS-Einstellungen:\n"
-        + "\n".join(f"  • {s}" for s in settings_summary[:10])
-    )
-    results["dry_run"] = dry_run
-    return results
-
-
-# ---------------------------------------------------------------------------
-# SteamVR Settings
-# ---------------------------------------------------------------------------
-
-def _find_steamvr_settings_path() -> "Path | None":
-    """Find SteamVR's steamvr.vrsettings JSON config file."""
-    candidates = [
-        Path(os.environ.get("LOCALAPPDATA", "")) / "openvr" / "openvrpaths.vrpaths",
-    ]
-    # Common Steam paths
-    for steam_root in [
-        r"C:\Program Files (x86)\Steam",
-        r"D:\Steam",
-        r"D:\SteamLibrary",
-        r"E:\Steam",
-    ]:
-        cfg = Path(steam_root) / "config" / "steamvr.vrsettings"
-        if cfg.exists():
-            return cfg
-    # Try via OpenVR paths
-    for c in candidates:
-        if c.exists():
-            try:
-                data = _json.loads(c.read_text(encoding="utf-8"))
-                config_dirs = data.get("config", [])
-                for d in config_dirs:
-                    p = Path(d) / "steamvr.vrsettings"
-                    if p.exists():
-                        return p
-            except Exception:
-                pass
-    return None
-
-
-@mcp.tool()
-def get_steamvr_settings() -> dict:
-    """Liest alle SteamVR-Einstellungen aus (Supersampling, Reprojection, Render Resolution usw.).
-
-    Nützlich um den aktuellen SteamVR-Zustand zu prüfen bevor optimiert wird.
-    Rufe dieses Tool auf wenn der User fragt: 'Was sind meine SteamVR-Einstellungen?'
-    """
-    path = _find_steamvr_settings_path()
-    if not path:
-        return {
-            "fehler": "steamvr.vrsettings nicht gefunden.",
-            "tipp": "Stelle sicher dass SteamVR mindestens einmal gestartet wurde.",
-        }
-
-    try:
-        data = _json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        return {"fehler": f"Datei konnte nicht gelesen werden: {exc}"}
-
-    steamvr = data.get("steamvr", {})
-    ss = steamvr.get("supersampleScale", 1.0)
-    reprojection = steamvr.get("allowReprojection", True)
-    interleaved = steamvr.get("motionSmoothing", True)
-    render_res = steamvr.get("renderTargetMultiplier", 1.0)
-    mirror_view = steamvr.get("mirrorView", True)
-
-    return {
-        "config_datei": str(path),
-        "supersampling": ss,
-        "render_resolution_multiplier": render_res,
-        "reprojection_erlaubt": reprojection,
-        "motion_smoothing": interleaved,
-        "mirror_view": mirror_view,
-        "rohdaten_steamvr": {k: v for k, v in steamvr.items() if isinstance(v, (int, float, bool, str))},
-    }
-
-
-@mcp.tool()
-def set_steamvr_setting(
-    setting: str,
-    value: str,
-) -> dict:
-    """Ändert eine SteamVR-Einstellung direkt in steamvr.vrsettings.
-
-    Beispiele:
-    - "supersampling" auf "1.5" — erhöht Bildqualität
-    - "reprojection" auf "false" — deaktiviert Reprojection
-    - "motion_smoothing" auf "true" — Motion Smoothing an
-
-    Args:
-        setting: "supersampling", "reprojection", "motion_smoothing", "render_resolution",
-                 "mirror_view"
-        value: Neuer Wert als String (Zahlen, "true"/"false")
-    """
-    path = _find_steamvr_settings_path()
-    if not path:
-        return {"fehler": "steamvr.vrsettings nicht gefunden."}
-
-    try:
-        data = _json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        return {"fehler": f"Lesen fehlgeschlagen: {exc}"}
-
-    setting_map = {
-        "supersampling":        ("steamvr", "supersampleScale",          float),
-        "reprojection":         ("steamvr", "allowReprojection",          lambda x: x.lower() == "true"),
-        "motion_smoothing":     ("steamvr", "motionSmoothing",            lambda x: x.lower() == "true"),
-        "render_resolution":    ("steamvr", "renderTargetMultiplier",     float),
-        "mirror_view":          ("steamvr", "mirrorView",                 lambda x: x.lower() == "true"),
-        "supersampling_filter": ("steamvr", "allowSupersampleFiltering",  lambda x: x.lower() == "true"),
-    }
-
-    key_lower = setting.lower().replace(" ", "_").replace("-", "_")
-    if key_lower not in setting_map:
-        return {
-            "fehler": f"Unbekannte Einstellung: '{setting}'",
-            "verfügbar": list(setting_map.keys()),
-        }
-
-    section, key, converter = setting_map[key_lower]
-    try:
-        converted = converter(value)
-    except Exception:
-        return {"fehler": f"Ungültiger Wert '{value}' für {setting}"}
-
-    if section not in data:
-        data[section] = {}
-    old_value = data[section].get(key, "nicht gesetzt")
-    data[section][key] = converted
-
-    try:
-        path.write_text(_json.dumps(data, indent="\t"), encoding="utf-8")
-    except Exception as exc:
-        return {"fehler": f"Schreiben fehlgeschlagen: {exc}"}
-
-    return {
-        "status": "ok",
-        "einstellung": key,
-        "vorher": old_value,
-        "nachher": converted,
-        "hinweis": "SteamVR muss neugestartet werden damit die Änderung wirkt.",
-    }
-
-
-@mcp.tool()
-def optimize_steamvr_for_hardware() -> dict:
-    """Optimiert SteamVR automatisch basierend auf der vorhandenen Hardware.
-
-    Setzt Supersampling, Motion Smoothing und Reprojection auf hardware-optimale Werte.
-    Rufe dieses Tool auf wenn der User fragt: 'SteamVR optimieren' oder 'SteamVR Einstellungen verbessern'
-    """
-    try:
-        pynvml.nvmlInit()
-        try:
-            h = pynvml.nvmlDeviceGetHandleByIndex(0)
-            mem = pynvml.nvmlDeviceGetMemoryInfo(h)
-            name = pynvml.nvmlDeviceGetName(h)
-            if isinstance(name, bytes):
-                name = name.decode()
-            vram_gb = mem.total / 1024**3
-        finally:
-            pynvml.nvmlShutdown()
-    except Exception:
-        vram_gb = 8.0
-        name = "Unbekannt"
-
-    tier = _classify_vr_tier(vram_gb, name, 8, 16)
-
-    ss_map = {"ultra": 1.5, "high": 1.3, "mid_high": 1.1, "mid": 1.0, "low": 0.8}
-    ss = ss_map.get(tier, 1.0)
-    motion_smoothing = tier in ("low", "mid")
-
-    path = _find_steamvr_settings_path()
-    if not path:
-        return {
-            "fehler": "steamvr.vrsettings nicht gefunden",
-            "empfehlung": f"Supersampling: {ss}, Motion Smoothing: {motion_smoothing}",
-        }
-
-    try:
-        data = _json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        return {"fehler": str(exc)}
-
-    if "steamvr" not in data:
-        data["steamvr"] = {}
-
-    old_ss = data["steamvr"].get("supersampleScale", 1.0)
-    data["steamvr"]["supersampleScale"] = ss
-    data["steamvr"]["motionSmoothing"] = motion_smoothing
-    data["steamvr"]["allowReprojection"] = True
-
-    path.write_text(_json.dumps(data, indent="\t"), encoding="utf-8")
-
-    return {
-        "status": "ok",
-        "gpu": name,
-        "tier": tier,
-        "supersampling": {"vorher": old_ss, "nachher": ss},
-        "motion_smoothing": motion_smoothing,
-        "hinweis": "SteamVR muss neu gestartet werden.",
-        "zusammenfassung": (
-            f"SteamVR optimiert für {name} (Tier: {tier}) — "
-            f"SS: {ss}x, Motion Smoothing: {motion_smoothing}"
-        ),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Windows VR & Gaming Tweaks
-# ---------------------------------------------------------------------------
-
-@mcp.tool()
-def optimize_windows_for_vr() -> dict:
-    """Optimiert Windows für maximale VR-Performance mit allen bekannten Tweaks.
-
-    Führt folgende Optimierungen durch:
-    - Hardware Accelerated GPU Scheduling (HAGS) aktivieren
-    - Windows Game Mode aktivieren
-    - Visual Effects auf Performance-Modus
-    - USB Selective Suspend deaktivieren (verhindert VR-Headset-Verbindungsabbrüche)
-    - High Performance Power Plan aktivieren
-    - Nvidia HPET deaktivieren (reduziert GPU-Latenz)
-    - MSFS Prozess-Priorität auf High setzen (wenn läuft)
-
-    Rufe dieses Tool auf wenn der User fragt:
-    - 'Windows für VR optimieren'
-    - 'Performance verbessern'
-    - 'VR ruckelt / stottert'
-    """
-    results = {}
-
-    # 1. HAGS
-    try:
-        _reg_add(
-            r"HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers",
-            "HwSchMode", "REG_DWORD", "2"
-        )
-        results["hags"] = "✅ Hardware Accelerated GPU Scheduling aktiviert"
-    except Exception as exc:
-        results["hags"] = f"❌ {exc}"
-
-    # 2. Game Mode
-    try:
-        _reg_add(r"HKCU\Software\Microsoft\GameBar", "AllowAutoGameMode", "REG_DWORD", "1")
-        _reg_add(r"HKCU\Software\Microsoft\GameBar", "AutoGameModeEnabled", "REG_DWORD", "1")
-        results["game_mode"] = "✅ Windows Game Mode aktiviert"
-    except Exception as exc:
-        results["game_mode"] = f"❌ {exc}"
-
-    # 3. Visual Effects → best performance
-    try:
-        _reg_add(
-            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects",
-            "VisualFXSetting", "REG_DWORD", "2"
-        )
-        results["visual_effects"] = "✅ Visuelle Effekte auf Performance-Modus"
-    except Exception as exc:
-        results["visual_effects"] = f"❌ {exc}"
-
-    # 4. USB Selective Suspend — disable via power plan
-    try:
-        _ps("powercfg /SETACVALUEINDEX SCHEME_CURRENT 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0")
-        _ps("powercfg /SETDCVALUEINDEX SCHEME_CURRENT 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0")
-        _ps("powercfg /SETACTIVE SCHEME_CURRENT")
-        results["usb_suspend"] = "✅ USB Selective Suspend deaktiviert"
-    except Exception as exc:
-        results["usb_suspend"] = f"❌ {exc}"
-
-    # 5. High Performance power plan
-    try:
-        _ps("powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c")
-        results["power_plan"] = "✅ High Performance Power Plan aktiviert"
-    except Exception as exc:
-        results["power_plan"] = f"❌ {exc}"
-
-    # 6. Disable HPET — reduces GPU interrupt latency
-    try:
-        _ps("bcdedit /set useplatformclock false 2>$null; bcdedit /set disabledynamictick yes 2>$null")
-        results["hpet"] = "✅ HPET deaktiviert (weniger GPU-Latenz)"
-    except Exception as exc:
-        results["hpet"] = f"ℹ️ HPET: {exc}"
-
-    # 7. MSFS priority if running
-    try:
-        _ps("$p = Get-Process FlightSimulator -EA SilentlyContinue; if ($p) { $p.PriorityClass = 'High' }")
-        results["msfs_priority"] = "✅ MSFS Prozess-Priorität auf High gesetzt"
-    except Exception as exc:
-        results["msfs_priority"] = f"ℹ️ MSFS nicht gestartet: {exc}"
-
-    ok_count = sum(1 for v in results.values() if str(v).startswith("✅"))
-    return {
-        "status": "ok",
-        "optimierungen": results,
-        "ergebnis": f"{ok_count}/{len(results)} Optimierungen erfolgreich angewendet.",
-        "hinweis": "HAGS erfordert einen Windows-Neustart um vollständig wirksam zu werden.",
-    }
-
-
-@mcp.tool()
-def set_hardware_accelerated_gpu_scheduling(enabled: bool = True) -> dict:
-    """Aktiviert oder deaktiviert Hardware Accelerated GPU Scheduling (HAGS).
-
-    HAGS reduziert CPU-Overhead und GPU-Latenz — empfohlen für VR.
-    Erfordert Windows 10 2004+ und eine kompatible Nvidia/AMD GPU.
-    Ein Windows-Neustart ist nach der Änderung erforderlich.
-
-    Args:
-        enabled: True = aktivieren (empfohlen), False = deaktivieren
-    """
-    value = "2" if enabled else "1"
-    try:
-        _reg_add(
-            r"HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers",
-            "HwSchMode", "REG_DWORD", value
-        )
-    except Exception as exc:
-        return {"fehler": str(exc)}
-
-    try:
-        current = _reg_query(
-            r"HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers",
-            "HwSchMode"
-        )
-    except Exception:
-        current = "?"
-
-    return {
-        "status": "ok",
-        "hags": "aktiviert" if enabled else "deaktiviert",
-        "registry_wert": current,
-        "hinweis": "Windows-Neustart erforderlich damit die Änderung wirksam wird.",
-    }
-
-
-@mcp.tool()
-def set_virtual_memory(
-    size_gb: float = 0,
-    drive: str = "C",
-    auto: bool = False,
-) -> dict:
-    """Konfiguriert die Windows Auslagerungsdatei (Virtual Memory / Page File).
-
-    MSFS benötigt viel RAM — bei wenig physischem RAM kann mehr virtueller Speicher
-    die Performance verbessern. Empfohlen: Initial- und Maximalgröße = 1.5x RAM.
-
-    Args:
-        size_gb: Größe in GB (0 = empfohlene Größe berechnen). Wird als Initial- und Maximalwert gesetzt.
-        drive: Laufwerksbuchstabe (Standard: C)
-        auto: True = Windows verwaltet automatisch (überschreibt size_gb)
-    """
-    try:
-        ram_raw = _ps_json("Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize")
-        ram_mb = int(ram_raw[0].get("TotalVisibleMemorySize", 16384)) if ram_raw else 16384
-        ram_gb = ram_mb / 1024
-    except Exception:
-        ram_gb = 16.0
-
-    if auto:
-        script = (
-            "$cs = Get-CimInstance Win32_ComputerSystem; "
-            "$cs.AutomaticManagedPagefile = $true; "
-            "$cs | Set-CimInstance"
-        )
-        try:
-            _ps(script)
-            return {"status": "ok", "modus": "Windows verwaltet automatisch", "neustart": True}
-        except Exception as exc:
-            return {"fehler": str(exc)}
-
-    if size_gb == 0:
-        size_gb = round(ram_gb * 1.5, 0)
-
-    size_mb = int(size_gb * 1024)
-    drive_letter = drive.upper().rstrip(":\\")
-
-    script = f"""
-$cs = Get-CimInstance Win32_ComputerSystem
-$cs.AutomaticManagedPagefile = $false
-$cs | Set-CimInstance
-$pf = Get-CimInstance -Query "SELECT * FROM Win32_PageFileSetting WHERE Name LIKE '{drive_letter}%'"
-if ($pf) {{
-    $pf.InitialSize = {size_mb}
-    $pf.MaximumSize = {size_mb}
-    $pf | Set-CimInstance
-}} else {{
-    New-CimInstance -ClassName Win32_PageFileSetting -Property @{{Name='{drive_letter}:\\pagefile.sys'; InitialSize={size_mb}; MaximumSize={size_mb}}}
-}}
-"""
-    try:
-        _ps(script)
-        return {
-            "status": "ok",
-            "laufwerk": f"{drive_letter}:",
-            "größe_gb": size_gb,
-            "größe_mb": size_mb,
-            "ram_gb": round(ram_gb, 1),
-            "hinweis": "Neustart erforderlich. Empfehlung: 1.5x RAM.",
-            "neustart": True,
-        }
-    except Exception as exc:
-        return {"fehler": str(exc)}
-
-
-# ---------------------------------------------------------------------------
-# Nvidia Control Panel Profile (via registry)
-# ---------------------------------------------------------------------------
-
-@mcp.tool()
-def set_nvidia_low_latency_mode(mode: str = "ultra") -> dict:
-    """Setzt Nvidia Low Latency Mode (Reflex) für weniger Input-Lag in VR.
-
-    Reduziert die GPU-Renderlatenz erheblich — empfohlen für VR.
-    Setzt den Wert im Windows-Registry für alle Anwendungen.
-
-    Args:
-        mode: "off" (0), "on" (1), "ultra" (2 — empfohlen für VR)
-    """
-    modes = {"off": "0x00000000", "on": "0x00000001", "ultra": "0x00000011"}
-    mode_lower = mode.lower()
-    if mode_lower not in modes:
-        return {"fehler": f"Unbekannter Modus '{mode}'. Verfügbar: off, on, ultra"}
-
-    reg_val = modes[mode_lower]
-    try:
-        result = subprocess.run(
-            [
-                "reg", "add",
-                r"HKLM\SYSTEM\CurrentControlSet\Services\nvlddmkm\Global",
-                "/v", "NvCplLowLatencyMode", "/t", "REG_DWORD",
-                "/d", reg_val, "/f",
-            ],
-            capture_output=True, text=True,
-        )
-        success = result.returncode == 0
-    except Exception as exc:
-        return {"fehler": str(exc)}
-
-    return {
-        "status": "ok" if success else "fehler",
-        "modus": mode_lower,
-        "wert": reg_val,
-        "hinweis": "Wirkt nach Neustart der Grafikkarten-Treiber oder Windows-Neustart.",
-    }
-
-
-@mcp.tool()
-def get_nvidia_driver_info() -> dict:
-    """Liest Nvidia Treiber-Version, installiertes CUDA, und Treiber-Einstellungen aus.
-
-    Nützlich um zu prüfen ob der Treiber aktuell ist und welche Features verfügbar sind.
-    """
-    info = {}
-
-    # Driver version via nvidia-smi
-    try:
-        r = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=driver_version,name,memory.total,power.limit,clocks.max.graphics",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True, text=True, timeout=10,
-        )
-        if r.returncode == 0:
-            parts = [p.strip() for p in r.stdout.strip().split(",")]
-            info["driver_version"]  = parts[0] if len(parts) > 0 else "?"
-            info["gpu_name"]        = parts[1] if len(parts) > 1 else "?"
-            info["vram_mb"]         = parts[2] if len(parts) > 2 else "?"
-            info["power_limit_w"]   = parts[3] if len(parts) > 3 else "?"
-            info["max_clock_mhz"]   = parts[4] if len(parts) > 4 else "?"
-    except Exception as exc:
-        info["nvidia_smi_fehler"] = str(exc)
-
-    # CUDA via pynvml
-    try:
-        pynvml.nvmlInit()
-        try:
-            ver = pynvml.nvmlSystemGetCudaDriverVersion()
-            info["cuda_driver_version"] = f"{ver // 1000}.{(ver % 1000) // 10}"
-            info["gpu_anzahl"] = pynvml.nvmlDeviceGetCount()
-        finally:
-            pynvml.nvmlShutdown()
-    except Exception:
-        pass
-
-    # Display driver version from registry
-    try:
-        reg_ver = _reg_query(
-            r"HKLM\SOFTWARE\NVIDIA Corporation\Global\NVTweak\Devices\1",
-            "DriverVersion"
-        )
-        info["registry_driver_version"] = reg_ver
-    except Exception:
-        pass
-
-    return info
-
-
-# ---------------------------------------------------------------------------
-# MSFS Batch Settings & Rolling Cache
-# ---------------------------------------------------------------------------
-
-@mcp.tool()
-def set_msfs_multiple_settings(
-    settings: dict,
-    usercfg_path: str = "",
-    auto_restart: bool = True,
-) -> dict:
-    """Ändert mehrere MSFS-Einstellungen auf einmal (effizienter als einzelne Aufrufe).
-
-    Nützlich wenn der User sagt:
-    - 'Terrain auf 2.0 und Wolken auf Ultra und Schatten auf Medium'
-    - 'Alle VR-Einstellungen auf High setzen'
-
-    Args:
-        settings: Dictionary mit Einstellungen, z.B.:
-                  {"terrain lod": "2.0", "wolken": "ultra", "schatten": "hoch"}
-        usercfg_path: Optional Pfad zur UserCfg.opt
-        auto_restart: MSFS nach Änderung neu starten
-    """
-    import time
-
-    cfg_path = _find_usercfg(usercfg_path) or DEFAULT_USERCFG_PATH
-    if not cfg_path.exists():
-        return {"fehler": "UserCfg.opt nicht gefunden", "tipp": "Starte MSFS einmal."}
-
-    # Resolve all setting aliases
-    resolved: dict[str, str] = {}
-    errors: list[str] = []
-
-    for setting_name, value in settings.items():
-        setting_lower = setting_name.strip().lower()
-        config_key = _MSFS_SETTING_ALIASES.get(setting_lower)
-        if not config_key:
-            for k in SETTING_DEFS:
-                if k.lower() == setting_lower or k.split(".", 1)[-1].lower() == setting_lower:
-                    config_key = k
-                    break
-        if not config_key:
-            errors.append(f"Unbekannte Einstellung: '{setting_name}'")
-            continue
-
-        # Resolve value
-        value_lower = value.strip().lower()
-        group = _MSFS_VALUE_GROUP.get(config_key)
-        if group is None and config_key in _QUALITY_KEYS:
-            group = "_quality_4"
-        if group and group in _MSFS_VALUE_ALIASES:
-            resolved_value = _MSFS_VALUE_ALIASES[group].get(value_lower, value.strip())
-        else:
-            resolved_value = value.strip()
-
-        resolved[config_key] = resolved_value
-
-        # Also apply to VR/desktop counterpart
-        twin = _VR_DESKTOP_PAIRS.get(config_key)
-        if twin:
-            resolved[twin] = resolved_value
-
-    if not resolved:
-        return {"fehler": "Keine gültigen Einstellungen gefunden.", "unbekannt": errors}
-
-    # Kill MSFS first
-    msfs_was_running = _is_msfs_running()
-    if msfs_was_running:
-        _kill_msfs(timeout_s=35)
-        _wait_for_file_unlocked(cfg_path, timeout_s=25)
-        time.sleep(1.5)
-
-    snapshot = _snapshot(cfg_path, "Before set_msfs_multiple_settings")
-    text = cfg_path.read_text(encoding="utf-8")
-    entries = _parse_usercfg(text)
-    new_entries, not_applied = _apply_overrides(entries, resolved)
-    cfg_path.write_text(_entries_to_text(new_entries), encoding="utf-8")
-
-    # Verify
-    verify = _read_current_settings(cfg_path)
-    verified_count = sum(1 for k, v in resolved.items() if verify.get(k) == v)
-
-    result = {
-        "status": "ok",
-        "angewendet": len(resolved) - len(not_applied),
-        "verifiziert": verified_count,
-        "nicht_gefunden": list(not_applied),
-        "fehler_eingabe": errors,
-        "snapshot": snapshot,
-        "config_datei": str(cfg_path),
-    }
-
-    if auto_restart and msfs_was_running:
-        time.sleep(2)
-        launch_msfs_vr(force_restart=False)
-        result["neustart"] = "MSFS wird in VR neu gestartet."
-
-    return result
-
-
-@mcp.tool()
-def manage_msfs_rolling_cache(
-    action: str = "status",
-    size_gb: float = 8.0,
-    location: str = "",
-) -> dict:
-    """Verwaltet den MSFS Rolling Cache (verbessert Streaming-Performance bei schlechter Internet-Verbindung).
-
-    Args:
-        action: "status" — aktuellen Status anzeigen
-                "enable" — aktivieren mit angegebener Größe
-                "disable" — deaktivieren
-                "clear" — Cache leeren (ohne Deaktivierung)
-                "set_size" — Größe ändern
-        size_gb: Cache-Größe in GB (Standard: 8 GB, Empfehlung: 8-32 GB)
-        location: Pfad für den Cache (Standard: MSFS-Standardpfad)
-    """
-    cfg_path = _find_usercfg()
-    if not cfg_path:
-        return {"fehler": "UserCfg.opt nicht gefunden."}
-
-    cache_file = cfg_path.parent / "cache" / "RollingCache.ccc"
-    useropt_path = cfg_path
-
-    try:
-        text = useropt_path.read_text(encoding="utf-8")
-    except Exception as exc:
-        return {"fehler": f"UserCfg.opt lesen fehlgeschlagen: {exc}"}
-
-    if action == "status":
-        cache_exists = cache_file.exists()
-        cache_size = cache_file.stat().st_size / 1024**3 if cache_exists else 0
-        cache_enabled = "RollingCacheEnabled 1" in text
-        cache_size_setting = ""
-        for line in text.splitlines():
-            if "RollingCacheMaxSize" in line:
-                cache_size_setting = line.strip()
-                break
-        return {
-            "cache_aktiviert": cache_enabled,
-            "cache_datei": str(cache_file),
-            "cache_datei_existiert": cache_exists,
-            "cache_datei_größe_gb": round(cache_size, 2),
-            "einstellung_in_config": cache_size_setting,
-        }
-
-    elif action in ("enable", "set_size"):
-        size_mb = int(size_gb * 1024)
-        entries = _parse_usercfg(text)
-        overrides = {
-            "General.RollingCacheEnabled": "1",
-            "General.RollingCacheMaxSize": str(size_mb),
-        }
-        if location:
-            overrides["General.RollingCachePath"] = location
-        new_entries, _ = _apply_overrides(entries, overrides)
-        useropt_path.write_text(_entries_to_text(new_entries), encoding="utf-8")
-        return {
-            "status": "ok",
-            "aktion": action,
-            "größe_gb": size_gb,
-            "hinweis": "MSFS muss neu gestartet werden.",
-        }
-
-    elif action == "disable":
-        entries = _parse_usercfg(text)
-        new_entries, _ = _apply_overrides(entries, {"General.RollingCacheEnabled": "0"})
-        useropt_path.write_text(_entries_to_text(new_entries), encoding="utf-8")
-        return {"status": "ok", "aktion": "deaktiviert"}
-
-    elif action == "clear":
-        cleared = False
-        size_before = 0
-        if cache_file.exists():
-            size_before = cache_file.stat().st_size / 1024**3
-            try:
-                cache_file.unlink()
-                cleared = True
-            except Exception as exc:
-                return {"fehler": f"Cache löschen fehlgeschlagen: {exc}"}
-        return {
-            "status": "ok",
-            "gelöscht": cleared,
-            "größe_vorher_gb": round(size_before, 2),
-            "hinweis": "Cache wird beim nächsten MSFS-Start neu aufgebaut.",
-        }
-
-    else:
-        return {
-            "fehler": f"Unbekannte Aktion '{action}'. Verfügbar: status, enable, disable, clear, set_size"
-        }
-
-
-# ---------------------------------------------------------------------------
-# Complete VR Diagnosis
-# ---------------------------------------------------------------------------
-
-@mcp.tool()
-def diagnose_vr_complete() -> dict:
-    """Vollständige VR-Diagnose: Hardware, Einstellungen, Empfehlungen in einem Tool.
-
-    Analysiert:
-    - Hardware (GPU/CPU/RAM/VR-Tier)
-    - MSFS Grafik-Einstellungen
-    - OpenXR Runtime
-    - SteamVR Einstellungen (falls vorhanden)
-    - Windows Optimierungen (HAGS, Game Mode, Power Plan)
-    - Gibt priorisierte Empfehlungen zurück
-
-    Rufe dieses Tool auf wenn der User sagt:
-    - 'Was kann ich verbessern?'
-    - 'VR Diagnose'
-    - 'Warum ist VR so ruckelig?'
-    - 'Alles analysieren'
-    """
-    report = {}
-
-    # 1. Hardware
-    hw = get_detailed_hardware_profile()
-    tier = hw.get("vr_tier", "mid")
-    report["hardware"] = {
-        "gpu": hw.get("gpu", {}).get("name", "?"),
-        "vram_gb": hw.get("gpu", {}).get("vram_total_gb", "?"),
-        "cpu": hw.get("cpu", {}).get("Name", "?"),
-        "cpu_kerne": hw.get("cpu", {}).get("NumberOfCores", "?"),
-        "ram_gb": hw.get("ram", {}).get("total_gb", "?"),
-        "tier": tier,
-    }
-
-    # 2. MSFS settings
-    cfg_path = _find_usercfg()
-    msfs_issues = []
-    if cfg_path and cfg_path.exists():
-        current = _read_current_settings(cfg_path)
-        key_settings = {}
-        for key in [
-            "Video.DLSS", "GraphicsVR.TerrainLoD", "GraphicsVR.CloudsQuality",
-            "GraphicsVR.ShadowQuality", "GraphicsVR.TextureResolution",
-            "RayTracing.Enabled", "Video.RenderScale",
-        ]:
-            if key in current:
-                defn = SETTING_DEFS.get(key, {})
-                raw = current[key]
-                display = defn.get("values", {}).get(raw, raw)
-                key_settings[key] = f"{raw} ({display})"
-        report["msfs_einstellungen"] = key_settings
-
-        if current.get("RayTracing.Enabled") == "1":
-            msfs_issues.append("⚠️ RayTracing ist AN — kostet massiv VR-FPS, empfohlen: AUS")
-        if current.get("Video.DLSS", "0") == "0" and tier != "ultra":
-            msfs_issues.append("💡 DLSS ist aus — aktiviere DLSS Quality/Balanced für bessere FPS")
-        terrain = float(current.get("GraphicsVR.TerrainLoD", "1.0") or "1.0")
-        if tier in ("low", "mid") and terrain > 1.0:
-            msfs_issues.append(f"⚠️ Terrain LoD {terrain} ist zu hoch für deinen GPU-Tier")
-    else:
-        report["msfs_einstellungen"] = {"fehler": "UserCfg.opt nicht gefunden"}
-        msfs_issues.append("❌ MSFS Config nicht gefunden — MSFS einmal starten")
-
-    # 3. OpenXR
-    try:
-        oxr = get_openxr_runtime()
-        report["openxr"] = {
-            "aktiv": oxr.get("active_runtime_name", "?"),
-            "pfad": oxr.get("active_runtime_path", "?"),
-        }
-    except Exception:
-        report["openxr"] = {"fehler": "OpenXR Runtime nicht erkannt"}
-
-    # 4. SteamVR
-    svr_path = _find_steamvr_settings_path()
-    if svr_path:
-        try:
-            svr_data = _json.loads(svr_path.read_text())
-            svr = svr_data.get("steamvr", {})
-            ss = svr.get("supersampleScale", 1.0)
-            report["steamvr"] = {
-                "supersampling": ss,
-                "motion_smoothing": svr.get("motionSmoothing", "?"),
-            }
-            if ss > 1.5 and tier in ("low", "mid"):
-                msfs_issues.append(f"⚠️ SteamVR Supersampling {ss}x ist zu hoch für deinen GPU-Tier")
-        except Exception:
-            report["steamvr"] = {"fehler": "steamvr.vrsettings nicht lesbar"}
-    else:
-        report["steamvr"] = {"info": "SteamVR nicht gefunden"}
-
-    # 5. Pimax headset (if detected)
-    try:
-        pimax_cfg = _find_pimax_config()
-        if pimax_cfg:
-            pimax_info = get_pimax_headset_info()
-            report["pimax"] = {
-                "headset": pimax_info.get("headset_name", "?"),
-                "render_quality": pimax_info.get("render_quality", "?"),
-                "refresh_hz": pimax_info.get("refresh_rate_hz", "?"),
-            }
-            rq = float(pimax_info.get("render_quality") or 1.0)
-            if rq > 1.5 and tier in ("low", "mid"):
-                msfs_issues.append(f"⚠️ Pimax Render Quality {rq} zu hoch für GPU-Tier '{tier}'")
-        else:
-            report["pimax"] = {"info": "Pimax nicht erkannt"}
-    except Exception:
-        report["pimax"] = {"info": "Pimax-Diagnose nicht verfügbar"}
-
-    # 6. System temperatures
-    try:
-        temps = get_system_temps()
-        cpu_t = temps.get("cpu_temp_celsius")
-        gpu_t = temps.get("gpu_temp_celsius")
-        report["temperaturen"] = {
-            "cpu": cpu_t,
-            "gpu": gpu_t,
-        }
-        if isinstance(cpu_t, float) and cpu_t > 90:
-            msfs_issues.append(f"🔥 CPU-Temperatur {cpu_t}°C — Throttling-Risiko!")
-        if isinstance(gpu_t, int) and gpu_t > 90:
-            msfs_issues.append(f"🔥 GPU-Temperatur {gpu_t}°C — Throttling-Risiko!")
-    except Exception:
-        report["temperaturen"] = {"info": "nicht verfügbar"}
-
-    # 7. Community folder add-on count
-    try:
-        comm = get_msfs_community_folder()
-        addon_count = comm.get("addon_anzahl", 0)
-        report["community_addons"] = addon_count
-        if addon_count > 100:
-            msfs_issues.append(
-                f"⚠️ {addon_count} Community Add-ons aktiv — hohe Anzahl kann MSFS-Ladezeiten erhöhen"
-            )
-    except Exception:
-        report["community_addons"] = "nicht ermittelbar"
-
-    # 8. Windows optimizations check
-    win_issues = []
-    try:
-        hags = _reg_query(r"HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers", "HwSchMode")
-        report["hags"] = "aktiviert" if str(hags).strip() == "2" else "NICHT aktiviert"
-        if str(hags).strip() != "2":
-            win_issues.append("💡 HAGS nicht aktiv — aktiviere Hardware Accelerated GPU Scheduling")
-    except Exception:
-        report["hags"] = "unbekannt"
-        win_issues.append("💡 HAGS Status unbekannt — empfohlen zu aktivieren")
-
-    try:
-        game_mode = _reg_query(r"HKCU\Software\Microsoft\GameBar", "AutoGameModeEnabled")
-        report["game_mode"] = "aktiviert" if str(game_mode).strip() == "1" else "NICHT aktiviert"
-        if str(game_mode).strip() != "1":
-            win_issues.append("💡 Windows Game Mode nicht aktiv")
-    except Exception:
-        report["game_mode"] = "unbekannt"
-
-    # 9. Event log GPU crashes (last hour)
-    try:
-        ev = get_event_log_errors(hours=1)
-        gpu_tdrs = len(ev.get("gpu_abstürze_tdr") or [])
-        if gpu_tdrs > 0:
-            msfs_issues.append(f"❌ {gpu_tdrs} GPU-Treiberabsturz (TDR) in der letzten Stunde — Treiber/OC prüfen!")
-        report["gpu_tdr_letzte_stunde"] = gpu_tdrs
-    except Exception:
-        report["gpu_tdr_letzte_stunde"] = "nicht geprüft"
-
-    # Compile all issues
-    all_issues = msfs_issues + win_issues
-    report["probleme_gefunden"] = len(all_issues)
-    report["empfehlungen"] = all_issues if all_issues else ["✅ Keine kritischen Probleme gefunden!"]
-    report["zusammenfassung"] = (
-        f"VR-Tier: {tier} | GPU: {report['hardware']['gpu']} | "
-        f"{len(all_issues)} Probleme gefunden.\n"
-        + ("\n".join(all_issues) if all_issues else "System ist gut konfiguriert.")
-    )
-
-    return report
-
-
-# ---------------------------------------------------------------------------
-# Game Copilot Auto-Updater tools
-# ---------------------------------------------------------------------------
-
-_GC_UPDATE_JSON = (
-    "https://github.com/Bennidesign2003/GodotRenderingAI"
-    "/releases/download/MSFS24/update.json"
-)
-_GC_RELEASES_API = (
-    "https://api.github.com/repos/Bennidesign2003/GodotRenderingAI/releases"
-)
-
-
-@mcp.tool()
-def check_for_gameCopilot_update(current_version: str = "") -> dict:
-    """Check GitHub for a new Game Copilot version.
-
-    Call this when the user asks 'Gibt es ein Update?' or 'Neue Version?'.
-    Returns version info, changelog, and whether an update is available.
-
-    Args:
-        current_version: Current installed version string, e.g. '3.5.3'.
-                         If empty, only returns latest version info.
-    """
-    try:
-        resp = httpx.get(_GC_UPDATE_JSON, timeout=10, follow_redirects=True)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:
-        return {"error": f"Update-Check fehlgeschlagen: {exc}"}
-
-    latest = data.get("latest_version") or data.get("LatestVersion", "")
-    download_url = data.get("download_url") or data.get("DownloadUrl", "")
-    changelog = data.get("changelog") or data.get("Changelog") or []
-
-    update_available = False
-    if current_version and latest:
-        try:
-            from packaging.version import Version
-            update_available = Version(latest) > Version(current_version)
-        except Exception:
-            # Fallback: simple string compare
-            update_available = latest.strip("v") != current_version.strip("v")
-
-    return {
-        "aktuelle_version": current_version or "unbekannt",
-        "neueste_version": latest,
-        "update_verfügbar": update_available,
-        "download_url": download_url,
-        "changelog": changelog,
+        "gpu_tier": gpu_tier,
+        "vram_gb": round(vram_mb / 1024, 1),
+        "profil_beschreibung": profile["description"],
+        "fps_impact": profile["fps_impact"],
+        "ebenen": results,
+        "warnungen": warnings if warnings else None,
         "hinweis": (
-            f"Version {latest} ist verfügbar! Sage 'Update installieren' um es zu installieren."
-            if update_available else
-            f"Game Copilot {current_version} ist aktuell."
+            f"GPU-Farbprofil '{gpu_tier}' angewendet (GPU: {gpu_name}). "
+            "OpenXR: wird bei nächstem VR-Start aktiv. "
+            "ReShade: sofort wirksam (Preset aktualisiert). "
+            "Pimax: sofort (Registry). "
+            "Falls keine Änderung sichtbar: VR-Modus neu starten (Ctrl+Tab in MSFS)."
         ),
     }
 
 
 @mcp.tool()
-def install_gameCopilot_update(confirmed: bool = False) -> dict:
-    """Download and install the latest Game Copilot update from GitHub.
+def reset_vr_colors(
+    reset_openxr: bool = True,
+    reset_pimax: bool = True,
+    reset_reshade: bool = True,
+    game_dir: str = "",
+    config_path: str = "",
+    game_exe: str = "",
+) -> dict:
+    """Reset all VR color settings to neutral defaults.
 
-    This downloads the update zip, extracts it, and launches a batch script
-    that replaces the application files and restarts Game Copilot.
+    Setzt OpenXR Toolkit, Pimax-Display und ReShade-Farbeffekte auf neutrale
+    Standardwerte zurück.  Ideal wenn Farben falsch aussehen (B&W, zu dunkel,
+    übersättigt) und man einen sauberen Neustart möchte.
 
-    WICHTIG: Frage den User IMMER nach Bestätigung bevor du dieses Tool aufrufst!
-    Rufe es erst auf wenn confirmed=True.
+    Verwende diesen Befehl wenn der User sagt:
+      - "Farben zurücksetzen"
+      - "Farben reparieren"
+      - "Alles auf Standard"
+      - "Schwarz-weiß Problem beheben"
+      - "VR Farben funktionieren nicht"
 
     Args:
-        confirmed: Must be True — user confirmed they want to install the update.
+        reset_openxr:  OpenXR Post-Processing auf neutral zurücksetzen.
+        reset_pimax:   Pimax-Display-Farben auf neutral (50/50/50).
+        reset_reshade: Alle ReShade-Farbeffekte deaktivieren.
+        game_dir:      ReShade-Verzeichnis (auto-erkannt).
+        config_path:   Pimax-Config-Pfad (auto-erkannt).
+        game_exe:      Spiel-EXE für OpenXR.
     """
-    if not confirmed:
-        return {
-            "warte_auf_bestätigung": True,
-            "nachricht": "Bitte bestätige: Soll Game Copilot jetzt aktualisiert werden? (Ja/Nein)"
-        }
+    exe = game_exe or _OPENXR_MSFS2024_EXE
+    results: dict[str, dict] = {}
 
-    import tempfile
-    import shutil as _shutil
-    import zipfile as _zf
-
-    # 1. Get download URL from update.json
-    try:
-        resp = httpx.get(_GC_UPDATE_JSON, timeout=10, follow_redirects=True)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:
-        return {"error": f"Update-Info konnte nicht geladen werden: {exc}"}
-
-    download_url = data.get("download_url") or data.get("DownloadUrl", "")
-    latest_version = data.get("latest_version") or data.get("LatestVersion", "")
-
-    if not download_url:
-        return {"error": "Keine Download-URL in update.json gefunden."}
-
-    # 2. Download zip
-    update_dir = Path(tempfile.gettempdir()) / "GameCopilotUpdate"
-    if update_dir.exists():
-        _shutil.rmtree(update_dir)
-    update_dir.mkdir(parents=True)
-    zip_path = update_dir / "update.zip"
-
-    try:
-        with httpx.stream("GET", download_url, timeout=120, follow_redirects=True) as r:
-            r.raise_for_status()
-            with open(zip_path, "wb") as f:
-                for chunk in r.iter_bytes(chunk_size=65536):
-                    f.write(chunk)
-    except Exception as exc:
-        return {"error": f"Download fehlgeschlagen: {exc}"}
-
-    # 3. Extract
-    extract_dir = update_dir / "extracted"
-    extract_dir.mkdir()
-    try:
-        with _zf.ZipFile(zip_path) as z:
-            z.extractall(extract_dir)
-    except Exception as exc:
-        return {"error": f"Entpacken fehlgeschlagen: {exc}"}
-
-    # 4. Find new exe
-    new_exe = None
-    for f in extract_dir.rglob("*.exe"):
-        new_exe = f
-        break
-
-    if new_exe is None:
-        return {"error": "Kein .exe im Update-Archiv gefunden."}
-
-    # 5. Write a batch script that replaces files and restarts
-    app_dir = Path(__file__).parent.parent  # GameCopilot/Assets/../ = GameCopilot dir
-    current_exe = next(Path(app_dir).rglob("GameCopilot.exe"), None) or (Path(app_dir) / "GameCopilot.exe")
-
-    bat_path = update_dir / "apply_update.bat"
-    bat_content = f"""@echo off
-echo Game Copilot Update wird installiert...
-timeout /t 3 /nobreak >nul
-xcopy /E /Y /I "{extract_dir}" "{app_dir}"
-echo Update abgeschlossen! Starte Game Copilot neu...
-start "" "{current_exe}"
-del "%~f0"
-"""
-    bat_path.write_text(bat_content, encoding="utf-8")
-
-    # 6. Launch bat and signal app to close
-    try:
-        subprocess.Popen(
-            ["cmd", "/c", str(bat_path)],
-            creationflags=subprocess.CREATE_NEW_CONSOLE,
-            close_fds=True,
-        )
-    except Exception as exc:
-        return {"error": f"Update-Skript konnte nicht gestartet werden: {exc}"}
-
-    return {
-        "status": "ok",
-        "nachricht": (
-            f"Update auf Version {latest_version} wird installiert! "
-            f"Game Copilot wird jetzt beendet und neu gestartet."
-        ),
-        "neue_version": latest_version,
-        "update_dir": str(update_dir),
-        "neustart": True,
-    }
-
-
-# ---------------------------------------------------------------------------
-# MCP Server self-update tools
-# ---------------------------------------------------------------------------
-
-_MCP_REPO = "Bennidesign2003/Pimax-Graphics-MCP"
-_MCP_RELEASES_API = f"https://api.github.com/repos/{_MCP_REPO}/releases/latest"
-# Fallback: raw main branch (used only if release asset URL unavailable)
-_MCP_RAW_FALLBACK = (
-    f"https://raw.githubusercontent.com/{_MCP_REPO}/main/mcp-server.py"
-)
-
-
-def _get_current_mcp_version() -> str:
-    """Read __mcp_version__ from this running server.py file."""
-    try:
-        with open(__file__, encoding="utf-8") as f:
-            for line in f:
-                m = re.match(r'#\s*__mcp_version__\s*=\s*"([^"]+)"', line)
-                if m:
-                    return m.group(1)
-    except Exception:
-        pass
-    return "unbekannt"
-
-
-def _get_remote_mcp_version(raw_content: str) -> str:
-    """Extract __mcp_version__ from downloaded server.py content."""
-    for line in raw_content.splitlines()[:5]:
-        m = re.match(r'#\s*__mcp_version__\s*=\s*"([^"]+)"', line)
-        if m:
-            return m.group(1)
-    return ""
-
-
-def _fetch_latest_release_info() -> dict:
-    """Fetch latest GitHub Release metadata for the MCP server repo.
-
-    Returns dict with keys: tag_name, published_at, download_url, body.
-    Raises on network error.
-    """
-    r = httpx.get(
-        _MCP_RELEASES_API,
-        timeout=15,
-        headers={"User-Agent": "GameCopilot"},
-        follow_redirects=True,
-    )
-    r.raise_for_status()
-    data = r.json()
-
-    # Find mcp-server.py asset download URL
-    download_url = _MCP_RAW_FALLBACK
-    for asset in data.get("assets", []):
-        if asset.get("name", "").lower() == "mcp-server.py":
-            download_url = asset["browser_download_url"]
-            break
-
-    return {
-        "tag_name": data.get("tag_name", ""),
-        "published_at": data.get("published_at", ""),
-        "download_url": download_url,
-        "body": data.get("body", ""),
-        "html_url": data.get("html_url", ""),
-    }
-
-
-@mcp.tool()
-def check_for_mcp_server_update() -> dict:
-    """Prüft ob eine neuere Version des Pimax-Graphics-MCP Servers auf GitHub verfügbar ist.
-
-    Liest das neueste GitHub Release von Bennidesign2003/Pimax-Graphics-MCP
-    und vergleicht die Version mit dem laufenden Server.
-    Rufe dieses Tool auf wenn der User fragt ob der MCP Server aktuell ist.
-    """
-    current = _get_current_mcp_version()
-
-    try:
-        release = _fetch_latest_release_info()
-    except Exception as exc:
-        return {"error": f"GitHub nicht erreichbar: {exc}", "aktuelle_version": current}
-
-    # Version aus Tag-Name lesen (z.B. "v3.6.1" → "3.6.1")
-    remote_version = release["tag_name"].lstrip("v") or "unbekannt"
-
-    update_available = False
-    if current != "unbekannt" and remote_version != "unbekannt":
-        try:
-            from packaging.version import Version as _V
-            update_available = _V(remote_version) > _V(current)
-        except Exception:
-            update_available = remote_version != current
-
-    return {
-        "aktuelle_version": current,
-        "github_version": remote_version,
-        "update_verfügbar": update_available,
-        "release_datum": release["published_at"],
-        "release_url": release["html_url"],
-        "download_url": release["download_url"],
-        "server_datei": str(Path(__file__)),
-        "hinweis": (
-            f"MCP Server Update verfügbar: {current} → {remote_version}. "
-            f"Sage 'MCP Server aktualisieren' um das Update zu installieren."
-        ) if update_available else (
-            f"MCP Server {current} ist aktuell."
-        ),
-    }
-
-
-@mcp.tool()
-def update_mcp_server(confirmed: bool = False) -> dict:
-    """Lädt die neueste Version des Nvidia MCP Servers von GitHub herunter und ersetzt die lokale Datei.
-
-    Nach dem Update muss Game Copilot neugestartet werden (oder sage 'MCP Server neustarten').
-    Frage den User IMMER nach Bestätigung bevor du confirmed=True setzt!
-
-    Args:
-        confirmed: Muss True sein — User hat Aktualisierung bestätigt.
-    """
-    if not confirmed:
-        current = _get_current_mcp_version()
-        return {
-            "warte_auf_bestätigung": True,
-            "aktuelle_version": current,
-            "nachricht": (
-                "Soll der Nvidia MCP Server jetzt aktualisiert werden? "
-                "Der Server wird danach neu gestartet. (Ja / Nein)"
-            ),
-        }
-
-    # Resolve download URL from latest GitHub Release asset
-    download_url = _MCP_RAW_FALLBACK
-    release_tag = ""
-    try:
-        release = _fetch_latest_release_info()
-        download_url = release["download_url"]
-        release_tag = release["tag_name"]
-    except Exception:
-        pass  # Fall back to raw URL
-
-    # Download full server.py from GitHub Release asset
-    try:
-        r = httpx.get(download_url, timeout=60,
-                      headers={"User-Agent": "GameCopilot"},
-                      follow_redirects=True)
-        r.raise_for_status()
-        new_content = r.text
-    except Exception as exc:
-        return {"error": f"Download fehlgeschlagen ({download_url}): {exc}"}
-
-    new_version = _get_remote_mcp_version(new_content)
-    if not new_version:
-        return {
-            "error": "Heruntergeladene Datei enthält keine __mcp_version__ — Update abgebrochen.",
-            "grund": "Sicherheitscheck: Datei sieht nicht wie ein gültiger MCP Server aus.",
-        }
-
-    # Backup current server.py
-    server_path = Path(__file__)
-    backup_path = server_path.parent / (server_path.name + ".bak")
-    try:
-        import shutil as _sh
-        _sh.copy2(server_path, backup_path)
-    except Exception:
-        pass  # Backup is best-effort
-
-    # Replace server.py with new version
-    try:
-        server_path.write_text(new_content, encoding="utf-8")
-    except Exception as exc:
-        return {"error": f"Datei konnte nicht ersetzt werden: {exc}"}
-
-    # Write restart flag so McpClientService auto-restarts
-    restart_flag = server_path.parent / "__mcp_restart_requested__"
-    try:
-        restart_flag.write_text(new_version, encoding="utf-8")
-    except Exception:
-        pass
-
-    return {
-        "status": "ok",
-        "neue_version": new_version,
-        "release_tag": release_tag,
-        "download_quelle": download_url,
-        "server_datei": str(server_path),
-        "backup": str(backup_path),
-        "neustart_erforderlich": True,
-        "nachricht": (
-            f"✅ MCP Server wurde auf Version {new_version} aktualisiert! "
-            f"Sage jetzt 'MCP Server neustarten' damit die neue Version aktiv wird."
-        ),
-    }
-
-
-# ===========================================================================
-# NEW TOOLS — Game Copilot v3.6.0
-# ===========================================================================
-
-# ---------------------------------------------------------------------------
-# A1. OpenXR Layers
-# ---------------------------------------------------------------------------
-
-@mcp.tool()
-def get_openxr_layers() -> dict:
-    """List all active OpenXR API layers from the Windows registry.
-
-    API layers can affect VR performance and compatibility (e.g. OpenXR Toolkit,
-    OVR Advanced Settings, Pimax OpenXR layer). Too many layers = overhead.
-
-    Returns:
-        implicit_layers: Always-on API layers (HKLM/HKCU registry).
-        explicit_layers: Explicitly enabled layers (user-activated).
-        total_count: Combined layer count.
-    """
-    try:
-        implicit: list[dict] = []
-        explicit: list[dict] = []
-
-        ps_result = _ps(
-            r"""
-$result = @()
-$paths = @(
-    @{key='HKLM:\SOFTWARE\Khronos\OpenXR\1\ApiLayers\Implicit'; type='implicit'},
-    @{key='HKCU:\SOFTWARE\Khronos\OpenXR\1\ApiLayers\Implicit'; type='implicit'},
-    @{key='HKLM:\SOFTWARE\Khronos\OpenXR\1\ApiLayers\Explicit'; type='explicit'},
-    @{key='HKCU:\SOFTWARE\Khronos\OpenXR\1\ApiLayers\Explicit'; type='explicit'}
-)
-foreach ($entry in $paths) {
-    if (Test-Path $entry.key) {
-        $vals = Get-ItemProperty $entry.key -ErrorAction SilentlyContinue
-        if ($vals) {
-            $vals.PSObject.Properties |
-            Where-Object { $_.Name -notlike 'PS*' } |
-            ForEach-Object {
-                $result += "$($entry.type)|$($_.Name)|$($_.Value)"
-            }
-        }
-    }
-}
-$result -join "`n"
-"""
-        )
-
-        for line in ps_result.splitlines():
-            line = line.strip()
-            if "|" not in line:
-                continue
-            parts = line.split("|", 2)
-            if len(parts) < 3:
-                continue
-            layer_type, name, value = parts
-            layer_info = {
-                "path": name.strip(),
-                # For implicit layers: value 0 = enabled, 1 = disabled
-                "enabled": value.strip() == "0",
-            }
-            if layer_type == "implicit":
-                implicit.append(layer_info)
+    if reset_openxr:
+        applied: dict = {}
+        failed: list = []
+        for key, val in _VR_COLOR_NEUTRAL["openxr"].items():
+            ok = _write_openxr_setting(key, val, exe)
+            if ok:
+                applied[key] = val
             else:
-                explicit.append(layer_info)
-
-        return {
-            "implicit_layers": implicit,
-            "explicit_layers": explicit,
-            "total_count": len(implicit) + len(explicit),
-            "hinweis": (
-                "Implicit layers sind immer aktiv (können VR-Performance beeinflussen). "
-                "Explicit layers müssen vom Nutzer aktiviert werden. "
-                "Viele aktive Layers können Latenz erhöhen."
-            ),
+                failed.append(key)
+        results["openxr"] = {
+            "status": "ok" if not failed else "partial",
+            "zurückgesetzt": len(applied),
+            "fehlgeschlagen": failed or None,
         }
-    except Exception as e:
-        return {"error": str(e)}
 
-
-# ---------------------------------------------------------------------------
-# A2. MSFS Process / Performance Monitoring
-# ---------------------------------------------------------------------------
-
-@mcp.tool()
-def is_msfs_running() -> dict:
-    """Prüft ob Microsoft Flight Simulator gerade läuft (einfacher Boolean-Check).
-
-    Rufe dies auf bevor du Konfig-Änderungen machst — MSFS muss für
-    UserCfg.opt-Änderungen geschlossen sein.
-
-    Returns:
-        running: True wenn MSFS aktiv ist.
-        warnung: Hinweis wenn MSFS läuft und Änderungen geplant sind.
-    """
-    try:
-        running = _is_msfs_running()
-        if running:
-            procs = _ps_json(
-                "Get-Process | Where-Object { "
-                "$_.ProcessName -like '*FlightSimulator*' -or "
-                "$_.ProcessName -like '*MSFS*' "
-                "} | Select-Object ProcessName, Id -First 3"
-            )
-            return {
-                "running": True,
-                "prozesse": procs,
-                "warnung": (
-                    "MSFS läuft! Config-Änderungen werden beim nächsten "
-                    "MSFS-Start möglicherweise überschrieben. MSFS erst schließen."
-                ),
-            }
-        return {"running": False, "hinweis": "MSFS ist nicht aktiv — Config-Änderungen können sicher gespeichert werden."}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def get_msfs_process_info() -> dict:
-    """Detaillierte Prozess-Info für Microsoft Flight Simulator.
-
-    Gibt PID, CPU-Auslastung, RAM-Verbrauch und Fenstertitel zurück.
-    Nützlich um zu prüfen ob MSFS hängt oder zu viel Ressourcen verbraucht.
-    """
-    try:
-        procs = _ps_json(
-            "Get-Process | Where-Object { "
-            "$_.ProcessName -like '*FlightSimulator*' -or "
-            "$_.ProcessName -like '*MSFS*' "
-            "} | Select-Object ProcessName, Id, "
-            "@{N='CPU_s';E={[math]::Round($_.CPU,1)}}, "
-            "@{N='MemoryMB';E={[math]::Round($_.WorkingSet64/1MB,1)}}, "
-            "@{N='MemoryGB';E={[math]::Round($_.WorkingSet64/1GB,2)}}, "
-            "MainWindowTitle, Responding, PriorityClass"
-        )
-        if not procs:
-            return {"running": False, "hinweis": "MSFS läuft nicht."}
-
-        proc = procs[0] if isinstance(procs, list) else procs
-        memory_mb = float(proc.get("MemoryMB") or 0)
-        responding = proc.get("Responding", True)
-
-        warnungen = []
-        if memory_mb > 20000:
-            warnungen.append(f"⚠️ MSFS nutzt {memory_mb:.0f} MB RAM — sehr hoher Verbrauch")
-        if not responding:
-            warnungen.append("❌ MSFS antwortet nicht (möglicherweise eingefroren)")
-
-        return {
-            "running": True,
-            "prozess_info": proc,
-            "warnungen": warnungen,
-            "zusammenfassung": (
-                f"MSFS läuft (PID {proc.get('Id', '?')}) — "
-                f"RAM: {proc.get('MemoryGB', '?')} GB"
-            ),
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def get_msfs_fps_estimate() -> dict:
-    """Schätzt MSFS-Performance über CPU/GPU-Last als Proxy für FPS.
-
-    Da MSFS keine FPS-API bereitstellt, liest dieses Tool GPU-Auslastung
-    (via NVML) und CPU-Last als Performance-Proxy. Für echte FPS:
-    Strg+Z in MSFS oder SteamVR-Overlay verwenden.
-
-    Returns:
-        gpu_usage_percent: GPU-Auslastung (Nvidia NVML).
-        system_cpu_percent: Gesamt-CPU-Last.
-        msfs_memory_gb: MSFS RAM-Verbrauch.
-        fps_hinweis: Einschätzung ob System unter VR-Last steht.
-    """
-    try:
-        result: dict = {}
-
-        procs = _ps_json(
-            "Get-Process | Where-Object { "
-            "$_.ProcessName -like '*FlightSimulator*' -or "
-            "$_.ProcessName -like '*MSFS*' "
-            "} | Select-Object ProcessName, "
-            "@{N='CPU_s';E={[math]::Round($_.CPU,1)}}, "
-            "@{N='MemoryGB';E={[math]::Round($_.WorkingSet64/1GB,2)}}"
-        )
-
-        if not procs:
-            return {
-                "running": False,
-                "hinweis": "MSFS läuft nicht. Starte MSFS für Performance-Messung.",
-            }
-
-        result["msfs_running"] = True
-        proc = procs[0] if isinstance(procs, list) else procs
-        result["msfs_memory_gb"] = proc.get("MemoryGB", "?")
-
-        # System CPU
-        try:
-            cpu_load = _ps_json(
-                "Get-CimInstance Win32_Processor "
-                "| Select-Object @{N='Load';E={$_.LoadPercentage}}"
-            )
-            if cpu_load:
-                c = cpu_load[0] if isinstance(cpu_load, list) else cpu_load
-                result["system_cpu_percent"] = c.get("Load", "?")
-        except Exception:
-            result["system_cpu_percent"] = "nicht verfügbar"
-
-        # GPU via NVML
-        try:
-            pynvml.nvmlInit()
-            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-            util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-            result["gpu_usage_percent"] = util.gpu
-            result["gpu_memory_used_percent"] = util.memory
-            pynvml.nvmlShutdown()
-        except Exception:
-            result["gpu_usage_percent"] = "nicht verfügbar (kein NVML)"
-
-        # FPS hint
-        gpu_pct = result.get("gpu_usage_percent", 0)
-        if isinstance(gpu_pct, (int, float)):
-            if gpu_pct > 95:
-                result["fps_hinweis"] = "GPU-limitiert (>95%) — FPS durch GPU begrenzt (ideal für VR!)"
-            elif gpu_pct > 70:
-                result["fps_hinweis"] = "GPU gut ausgelastet (70-95%) — gesunde VR-Last"
-            elif gpu_pct > 40:
-                result["fps_hinweis"] = "GPU mäßig ausgelastet — möglicherweise CPU-Bottleneck"
-            else:
-                result["fps_hinweis"] = "GPU wenig ausgelastet — CPU-Bottleneck oder MSFS im Menü"
-        else:
-            result["fps_hinweis"] = "GPU-Last nicht messbar"
-
-        result["empfehlung"] = (
-            "Für echte FPS: Strg+Z in MSFS (integrierter FPS-Counter) "
-            "oder SteamVR Dashboard (zeigt FPS + Frametimes)."
-        )
-        return result
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# ---------------------------------------------------------------------------
-# A3. Audio / VR Audio
-# ---------------------------------------------------------------------------
-
-@mcp.tool()
-def get_audio_devices() -> dict:
-    """Listet alle Windows-Audio-Geräte auf (Wiedergabe und Aufnahme).
-
-    VR-Headsets (Pimax, Index, Quest) erscheinen oft als eigene Audio-Geräte.
-    Nutze set_default_audio_device() um das VR-Headset-Audio als Standard zu setzen.
-
-    Returns:
-        geräte: Alle Sound-Geräte (WMI + PnP).
-        tipp: Hinweis zum Setzen des Standard-Geräts.
-    """
-    try:
-        # WMI Sound devices (always works)
-        wmi_devices = _ps_json(
-            "Get-WmiObject Win32_SoundDevice "
-            "| Select-Object Name, Status, DeviceID, Manufacturer"
-        )
-
-        # PnP audio endpoints (more detailed)
-        pnp_devices = _ps_json(
-            "Get-PnpDevice -Class AudioEndpoint -ErrorAction SilentlyContinue "
-            "| Where-Object { $_.Status -eq 'OK' } "
-            "| Select-Object FriendlyName, InstanceId, Status"
-        )
-
-        return {
-            "geräte_wmi": wmi_devices if isinstance(wmi_devices, list) else [],
-            "geräte_pnp": pnp_devices if isinstance(pnp_devices, list) else [],
-            "tipp": (
-                "VR-Headset-Audio als Standard setzen: "
-                "set_default_audio_device(device_name='Headset-Name') "
-                "oder manuell: Systemsteuerung → Sound → Wiedergabe."
-            ),
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def set_default_audio_device(device_name: str) -> dict:
-    """Setzt ein Audio-Gerät als Windows-Standard-Wiedergabegerät.
-
-    Nützlich um das VR-Headset-Audio (Pimax, Index, Quest) als Standard
-    zu setzen damit MSFS-Audio durch das Headset abgespielt wird.
-
-    Args:
-        device_name: Teil des Gerätenamens (Groß-/Kleinschreibung egal).
-                     z.B. 'Pimax', 'Headphones', 'Headset', 'Index'.
-
-    Returns:
-        status: 'ok', 'nicht_gefunden', oder 'manuell_erforderlich'.
-    """
-    try:
-        if not device_name:
-            return {"error": "device_name darf nicht leer sein."}
-
-        # Check if device exists
-        check = _ps_json(
-            f"Get-WmiObject Win32_SoundDevice "
-            f"| Where-Object {{ $_.Name -like '*{device_name}*' }} "
-            f"| Select-Object Name, DeviceID"
-        )
-
-        if not check:
-            # Try PnP
-            check = _ps_json(
-                f"Get-PnpDevice -Class AudioEndpoint -ErrorAction SilentlyContinue "
-                f"| Where-Object {{ $_.FriendlyName -like '*{device_name}*' -and $_.Status -eq 'OK' }} "
-                f"| Select-Object FriendlyName, InstanceId"
-            )
-
-        if not check:
-            return {
-                "status": "nicht_gefunden",
-                "gerät": device_name,
-                "hinweis": (
-                    f"Gerät '{device_name}' nicht gefunden. "
-                    "Nutze get_audio_devices() um den genauen Namen zu sehen."
-                ),
-            }
-
-        # Try nircmd.exe (free tool from nirsoft.net)
-        nircmd_result = _ps(
-            f"""
-$nircmd = "$env:SystemRoot\\nircmd.exe"
-$nircmd2 = "$env:ProgramFiles\\nircmd\\nircmd.exe"
-if (Test-Path $nircmd) {{
-    & $nircmd setdefaultsounddevice '{device_name}' 1
-    Write-Output "OK_NIRCMD"
-}} elseif (Test-Path $nircmd2) {{
-    & $nircmd2 setdefaultsounddevice '{device_name}' 1
-    Write-Output "OK_NIRCMD"
-}} else {{
-    Write-Output "MANUAL_REQUIRED"
-}}
-"""
-        )
-
-        if "OK_NIRCMD" in nircmd_result:
-            return {
-                "status": "ok",
-                "gerät": device_name,
-                "methode": "nircmd",
-                "nachricht": f"'{device_name}' wurde als Standard-Audiogerät gesetzt.",
-            }
-
-        return {
-            "status": "manuell_erforderlich",
-            "gerät_gefunden": True,
-            "gefundene_geräte": check,
-            "anleitung": (
-                f"Gerät '{device_name}' gefunden. "
-                "Automatisches Setzen erfordert NirCmd (nirsoft.net/utils/nircmd.html). "
-                "Manuell: Systemsteuerung → Sound → Wiedergabe → Gerät → 'Als Standard festlegen'."
-            ),
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def get_spatial_audio_status() -> dict:
-    """Prüft ob Windows Spatial Audio (Windows Sonic oder Dolby Atmos) aktiviert ist.
-
-    Spatial Audio verbessert VR-Immersion. Windows Sonic for Headphones ist kostenlos
-    und direkt in Windows 10/11 integriert.
-
-    Returns:
-        spatial_audio_enabled: Ob Spatial Audio aktiv ist.
-        empfehlung: Ob Spatial Audio für VR aktiviert werden sollte.
-    """
-    try:
-        # Check registry for spatial audio settings
-        result = _ps(
-            r"""
-$enabled = $false
-$format = 'Keines'
-
-$spatialFormats = @{
-    '{B19349B0-0BBE-4f4a-A938-E60A5F39E5CF}' = 'Windows Sonic for Headphones'
-    '{B18F4B13-6FE9-4209-8A53-79A67A1FA08B}' = 'Dolby Atmos for Headphones'
-    '{D3489861-8414-429C-B3CD-84E6C3CEF5E1}' = 'DTS Headphone:X'
-}
-
-$sonicKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\SpatialAudio'
-if (Test-Path $sonicKey) {
-    $val = Get-ItemPropertyValue $sonicKey -Name 'SpatialAudioMode' -ErrorAction SilentlyContinue
-    if ($null -ne $val) {
-        $enabled = $true
-        $fmt = $spatialFormats[$val]
-        $format = if ($fmt) { $fmt } else { "Unbekanntes Format ($val)" }
-    }
-}
-
-# Also check via device-level registry
-$renderBase = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render'
-if (-not $enabled -and (Test-Path $renderBase)) {
-    $devs = Get-ChildItem $renderBase -ErrorAction SilentlyContinue | Select-Object -First 5
-    foreach ($dev in $devs) {
-        $propsPath = "$($dev.PSPath)\Properties"
-        if (Test-Path $propsPath) {
-            # Property {1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},6 = Spatial format GUID
-            $p = Get-ItemProperty $propsPath -ErrorAction SilentlyContinue
-            $spatialProp = $p.PSObject.Properties |
-                Where-Object { $_.Name -like '*1DA5D803*' } |
-                Select-Object -First 1
-            if ($spatialProp -and $spatialProp.Value) {
-                $enabled = $true
-                $format = "Spatial Audio (gerätespezifisch)"
-            }
-        }
-    }
-}
-
-"$enabled|$format"
-"""
-        )
-
-        parts = result.strip().split("|", 1)
-        enabled = parts[0].strip().lower() == "true" if parts else False
-        fmt = parts[1].strip() if len(parts) > 1 else "Keines"
-
-        return {
-            "spatial_audio_enabled": enabled,
-            "format": fmt,
-            "empfehlung": (
-                "✅ Spatial Audio aktiv — gut für VR-Immersion." if enabled
-                else (
-                    "💡 Spatial Audio nicht aktiv. Für VR empfohlen: "
-                    "Systemsteuerung → Sound → Wiedergabe → Gerät → Eigenschaften "
-                    "→ Spatial Sound → 'Windows Sonic for Headphones' aktivieren."
-                )
-            ),
-            "hinweis": "Windows Sonic ist kostenlos und verbessert VR-Klang erheblich.",
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# ---------------------------------------------------------------------------
-# A4. Display & Resolution Tools
-# ---------------------------------------------------------------------------
-
-@mcp.tool()
-def get_display_info() -> dict:
-    """Listet alle Monitore: Auflösung, Refresh Rate, HDR-Status und Primary-Flag.
-
-    Im VR-Modus den Desktop-Monitor auf niedrige Auflösung/Refresh zu setzen
-    gibt GPU-Ressourcen für das Headset frei.
-
-    Returns:
-        monitore: Liste aktiver Monitore mit technischen Details.
-        grafikkarte: Aktuelle Auflösung/Refresh der primären GPU.
-    """
-    try:
-        # Screen info via .NET Forms
-        screen_info = _ps_json(
-            r"""
-Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
-$screens = [System.Windows.Forms.Screen]::AllScreens
-$out = @()
-foreach ($s in $screens) {
-    $out += @{
-        DeviceName   = $s.DeviceName
-        Width        = $s.Bounds.Width
-        Height       = $s.Bounds.Height
-        IsPrimary    = $s.Primary
-        BitsPerPixel = $s.BitsPerPixel
-    }
-}
-$out
-"""
-        )
-
-        # GPU/display details via WMI
-        gpu_info = _ps_json(
-            "Get-CimInstance Win32_VideoController "
-            "| Select-Object Name, CurrentRefreshRate, "
-            "CurrentHorizontalResolution, CurrentVerticalResolution, "
-            "@{N='VRAM_GB';E={[math]::Round($_.AdapterRAM/1GB,1)}}"
-        )
-
-        # HDR check via registry
-        hdr_status = _ps(
-            r"""
-$hdrEnabled = $false
-$key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\VideoSettings'
-if (Test-Path $key) {
-    $val = Get-ItemPropertyValue $key -Name 'EnableHDROutput' -ErrorAction SilentlyContinue
-    $hdrEnabled = ($val -eq 1)
-}
-$hdrEnabled
-"""
-        )
-
-        hdr_on = hdr_status.strip().lower() == "true"
-
-        return {
-            "monitore": screen_info if isinstance(screen_info, list) else [],
-            "grafikkarte": gpu_info if isinstance(gpu_info, list) else [],
-            "hdr_aktiv": hdr_on,
-            "tipp_vr": (
-                "Im VR-Betrieb: Desktop-Monitor auf 1920×1080 @ 60 Hz setzen "
-                "(Windows Anzeigeeinstellungen) um GPU-Kapazität für das Headset freizugeben."
-            ),
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def get_vr_render_resolution() -> dict:
-    """Berechnet die effektive VR-Renderauflösung aus Pimax + SteamVR Supersampling.
-
-    Kombiniert native Headset-Auflösung, Pimax Render Quality und SteamVR SS-Faktor
-    um die tatsächlich gerenderte Auflösung pro Auge zu berechnen.
-    Hohe Renderauflösungen kosten überproportional viel VRAM und GPU-Zeit.
-
-    Returns:
-        render_auflösung_pro_auge: Effektiv gerenderte Auflösung.
-        gesamt_mpixel: Gesamtpixel (beide Augen) in Megapixel.
-        empfehlung: Ob die Kombination für die Hardware angemessen ist.
-    """
-    try:
-        result: dict = {}
-
-        # Pimax headset
-        try:
-            pimax_info = get_pimax_headset_info()
-            native_w = int(pimax_info.get("display_width_per_eye") or 2160)
-            native_h = int(pimax_info.get("display_height_per_eye") or 2160)
-            headset_name = pimax_info.get("headset_name", "Unbekannt")
-            render_quality = float(pimax_info.get("render_quality") or 1.0)
-        except Exception:
-            native_w, native_h = 2160, 2160
-            headset_name = "Unbekannt"
-            render_quality = 1.0
-
-        result["headset"] = headset_name
-        result["native_auflösung_pro_auge"] = f"{native_w}x{native_h}"
-        result["pimax_render_quality"] = render_quality
-
-        # SteamVR supersampling
-        steamvr_ss = 1.0
-        svr_path = _find_steamvr_settings_path()
-        if svr_path and svr_path.exists():
-            try:
-                svr_data = _json.loads(svr_path.read_text(encoding="utf-8"))
-                steamvr_ss = float(svr_data.get("steamvr", {}).get("supersampleScale") or 1.0)
-                result["steamvr_supersampling"] = steamvr_ss
-            except Exception:
-                result["steamvr_supersampling"] = "nicht lesbar"
-        else:
-            result["steamvr_supersampling"] = "SteamVR nicht gefunden"
-
-        # Calculate
-        effective_ss = render_quality * steamvr_ss
-        render_w = int(native_w * (effective_ss ** 0.5))
-        render_h = int(native_h * (effective_ss ** 0.5))
-        total_pixels = render_w * render_h * 2
-
-        result["effektiver_ss_faktor"] = round(effective_ss, 3)
-        result["render_auflösung_pro_auge"] = f"{render_w}x{render_h}"
-        result["gesamt_pixel_beide_augen"] = f"{total_pixels:,}"
-        result["gesamt_mpixel"] = round(total_pixels / 1_000_000, 1)
-
-        # Hardware tier
-        try:
-            hw = get_detailed_hardware_profile()
-            vram_gb = float(hw.get("gpu", {}).get("vram_total_gb") or 8)
-            tier = hw.get("vr_tier", "mid")
-        except Exception:
-            vram_gb, tier = 8.0, "mid"
-
-        mpixels = result["gesamt_mpixel"]
-        if mpixels > 20:
-            empf = f"⚠️ {mpixels}M Pixel sehr hoch für {tier}-Tier ({vram_gb:.0f}GB VRAM). Reduziere Pimax RQ oder SteamVR SS."
-        elif mpixels > 14:
-            empf = f"💡 {mpixels}M Pixel — anspruchsvoll. OK für high/ultra-Tier."
-        else:
-            empf = f"✅ {mpixels}M Pixel — angemessene Renderauflösung."
-
-        result["empfehlung"] = empf
-        return result
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def set_windows_display_scaling(scale_percent: int = 100) -> dict:
-    """Setzt die Windows DPI-Skalierung für den primären Monitor via Registry.
-
-    Für VR empfohlen: 100% (keine Skalierung) setzt GPU-Ressourcen frei
-    und reduziert Kompatibilitätsprobleme mit VR-Software.
-
-    Args:
-        scale_percent: Skalierung in Prozent. Gültig: 100, 125, 150, 175, 200, 225, 250.
-
-    Hinweis: Vollständige Wirkung nach Neuanmeldung oder Explorer-Neustart.
-    """
-    try:
-        valid_scales = [100, 125, 150, 175, 200, 225, 250]
-        if scale_percent not in valid_scales:
-            return {
-                "error": f"Ungültiger Skalierungswert '{scale_percent}'. Gültig: {valid_scales}",
-            }
-
-        dpi_value = int(scale_percent * 96 / 100)
-
-        out = _ps(
-            f"""
-Set-ItemProperty -Path 'HKCU:\\Control Panel\\Desktop' -Name 'LogPixels' -Value {dpi_value} -Type DWord -Force
-Set-ItemProperty -Path 'HKCU:\\Control Panel\\Desktop' -Name 'Win8DpiScaling' -Value 1 -Type DWord -Force
-Write-Output "DPI_SET:{dpi_value}"
-"""
-        )
-
-        if f"DPI_SET:{dpi_value}" in out:
-            return {
-                "status": "ok",
-                "skalierung_prozent": scale_percent,
-                "dpi_wert": dpi_value,
-                "hinweis": (
-                    "DPI-Skalierung gesetzt. Effekt vollständig nach Neuanmeldung "
-                    "oder Explorer-Neustart (Taskmanager → Explorer.exe neustarten)."
-                ),
-            }
-        return {"status": "unbekannt", "ausgabe": out}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# ---------------------------------------------------------------------------
-# A5. Targeted System Performance Tools
-# ---------------------------------------------------------------------------
-
-@mcp.tool()
-def get_cpu_info() -> dict:
-    """Detaillierte CPU-Info: Kerne, Threads, Takt, Auslastung und Temperatur.
-
-    MSFS VR ist stark Single-Core-limitiert — hoher Turbotakt (>5GHz)
-    hat mehr Einfluss als zusätzliche Kerne.
-
-    Returns:
-        name, kerne, threads, max_takt_ghz, auslastung_prozent,
-        temperatur_celsius, vr_bewertung.
-    """
-    try:
-        cpu_raw = _ps_json(
-            "Get-CimInstance Win32_Processor | Select-Object "
-            "Name, NumberOfCores, NumberOfLogicalProcessors, "
-            "MaxClockSpeed, CurrentClockSpeed, LoadPercentage, Manufacturer"
-        )
-        cpu = (cpu_raw[0] if isinstance(cpu_raw, list) and cpu_raw else cpu_raw) or {}
-
-        # Temperature via WMI thermal zones (requires admin — may fail)
-        temp = None
-        try:
-            temp_raw = _ps_json(
-                "Get-CimInstance -Namespace root/wmi "
-                "-ClassName MSAcpi_ThermalZoneTemperature "
-                "-ErrorAction SilentlyContinue "
-                "| Select-Object CurrentTemperature"
-            )
-            if temp_raw:
-                items = temp_raw if isinstance(temp_raw, list) else [temp_raw]
-                temps = []
-                for item in items:
-                    raw = item.get("CurrentTemperature") or 0
-                    if raw > 2000:  # Kelvin * 10
-                        temps.append(round((raw - 2732) / 10.0, 1))
-                if temps:
-                    temp = max(t for t in temps if t > 0)
-        except Exception:
-            pass
-
-        cores = int(cpu.get("NumberOfCores") or 0)
-        threads = int(cpu.get("NumberOfLogicalProcessors") or 0)
-        max_clock = int(cpu.get("MaxClockSpeed") or 0)
-        load = cpu.get("LoadPercentage") or 0
-        name = cpu.get("Name", "Unbekannt")
-
-        if max_clock >= 5000 and cores >= 8:
-            vr_rating = "✅ Ausgezeichnet für MSFS VR"
-        elif max_clock >= 4000 and cores >= 6:
-            vr_rating = "✅ Gut für MSFS VR"
-        elif max_clock >= 3500 and cores >= 4:
-            vr_rating = "⚠️ Ausreichend — hoher Single-Core-Takt bevorzugt"
-        else:
-            vr_rating = "❌ CPU-Bottleneck in MSFS VR wahrscheinlich"
-
-        temp_warnung = ""
-        if isinstance(temp, float):
-            if temp > 90:
-                temp_warnung = f"🔥 CPU sehr heiß ({temp}°C) — Kühlung prüfen!"
-            elif temp > 80:
-                temp_warnung = f"⚠️ CPU warm ({temp}°C)"
-
-        return {
-            "name": name,
-            "kerne_physisch": cores,
-            "threads_logisch": threads,
-            "max_takt_mhz": max_clock,
-            "max_takt_ghz": round(max_clock / 1000, 2) if max_clock else "?",
-            "auslastung_prozent": load,
-            "temperatur_celsius": temp if temp is not None else "nicht verfügbar (Admin erforderlich)",
-            "temp_warnung": temp_warnung,
-            "vr_bewertung": vr_rating,
-            "hinweis_msfs": "MSFS 2024 ist stark Single-Core-limitiert. Turbotakt > 5GHz = mehr FPS.",
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def get_ram_info() -> dict:
-    """Detaillierte RAM-Info: Gesamt, verfügbar, Takt, Slots und Dual-Channel.
-
-    Für MSFS VR sind 32 GB empfohlen. Dual-Channel erhöht die Speicherbandbreite
-    und reduziert CPU-Stottern erheblich.
-
-    Returns:
-        total_gb, available_gb, speed_mhz, slots_belegt/gesamt,
-        dual_channel, vr_bewertung.
-    """
-    try:
-        os_ram = _ps_json(
-            "Get-CimInstance Win32_OperatingSystem | Select-Object "
-            "@{N='TotalGB';E={[math]::Round($_.TotalVisibleMemorySize/1MB,1)}}, "
-            "@{N='FreeGB';E={[math]::Round($_.FreePhysicalMemory/1MB,1)}}"
-        )
-        os = (os_ram[0] if isinstance(os_ram, list) and os_ram else os_ram) or {}
-        total_gb = float(os.get("TotalGB") or 0)
-        free_gb = float(os.get("FreeGB") or 0)
-
-        modules = _ps_json(
-            "Get-CimInstance Win32_PhysicalMemory | Select-Object "
-            "BankLabel, @{N='CapacityGB';E={[math]::Round($_.Capacity/1GB,0)}}, "
-            "Speed, Manufacturer"
-        )
-
-        slots_total = 0
-        try:
-            slot_arr = _ps_json(
-                "Get-CimInstance Win32_PhysicalMemoryArray "
-                "| Select-Object MemoryDevices"
-            )
-            if slot_arr:
-                s = slot_arr[0] if isinstance(slot_arr, list) else slot_arr
-                slots_total = int(s.get("MemoryDevices") or 0)
-        except Exception:
-            pass
-
-        speed_mhz = 0
-        module_list = []
-        if isinstance(modules, list):
-            for m in modules:
-                sp = int(m.get("Speed") or 0)
-                if sp > speed_mhz:
-                    speed_mhz = sp
-                module_list.append({
-                    "slot": m.get("BankLabel", "?"),
-                    "größe_gb": m.get("CapacityGB", "?"),
-                    "takt_mhz": sp,
-                })
-        slots_used = len(module_list)
-        likely_dual = slots_used in (2, 4)
-
-        if total_gb >= 32:
-            vr_rating = "✅ Ausgezeichnet für MSFS VR (32+ GB)"
-        elif total_gb >= 24:
-            vr_rating = "✅ Gut (24 GB)"
-        elif total_gb >= 16:
-            vr_rating = "⚠️ Ausreichend — 32 GB empfohlen"
-        else:
-            vr_rating = f"❌ {total_gb:.0f} GB zu wenig — mind. 16 GB, empfohlen 32 GB"
-
-        return {
-            "gesamt_gb": total_gb,
-            "verfügbar_gb": round(free_gb, 1),
-            "genutzt_gb": round(total_gb - free_gb, 1),
-            "takt_mhz": speed_mhz,
-            "slots_belegt": slots_used,
-            "slots_gesamt": slots_total,
-            "dual_channel_wahrscheinlich": likely_dual,
-            "module": module_list,
-            "vr_bewertung": vr_rating,
-            "hinweis": "Dual-Channel (2 oder 4 Module) verdoppelt Speicherbandbreite — wichtig für CPU-Performance in MSFS.",
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def get_disk_info() -> dict:
-    """Laufwerks-Info: Kapazität, freier Speicher, SSD vs. HDD, MSFS-Laufwerk.
-
-    MSFS 2024 sollte auf einer NVMe-SSD installiert sein. HDD führt zu
-    langen Ladezeiten und schlechtem Terrain-Streaming in VR.
-
-    Returns:
-        laufwerke: Alle Laufwerke mit Typ, Größe, freiem Speicher.
-        msfs_laufwerk: Das Laufwerk mit der MSFS-Installation.
-        empfehlung: Ob die Konfiguration optimal ist.
-    """
-    try:
-        logical = _ps_json(
-            "Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | "
-            "Select-Object DeviceID, VolumeName, "
-            "@{N='GesamtGB';E={[math]::Round($_.Size/1GB,1)}}, "
-            "@{N='FreiGB';E={[math]::Round($_.FreeSpace/1GB,1)}}, "
-            "@{N='GenutztProzent';E={[math]::Round(($_.Size-$_.FreeSpace)/$_.Size*100,1)}}"
-        )
-
-        physical = _ps_json(
-            "Get-PhysicalDisk | Select-Object FriendlyName, MediaType, BusType, "
-            "@{N='GroesseGB';E={[math]::Round($_.Size/1GB,1)}}"
-        )
-
-        # Build SSD lookup from media type
-        ssd_hints: set[str] = set()
-        if isinstance(physical, list):
-            for pd in physical:
-                mt = str(pd.get("MediaType") or "")
-                bt = str(pd.get("BusType") or "")
-                if "SSD" in mt or "Solid" in mt or "NVMe" in bt or "NVM" in bt:
-                    ssd_hints.add(pd.get("FriendlyName", ""))
-
-        # Find MSFS drive
-        msfs_drive: str | None = None
-        cfg = _find_usercfg()
+    if reset_pimax:
+        cfg = _find_pimax_config(config_path)
         if cfg:
-            msfs_drive = str(cfg)[:2].upper()
-
-        disk_list = []
-        if isinstance(logical, list):
-            for d in logical:
-                drive_id = str(d.get("DeviceID", "")).upper()
-                disk_type = "SSD" if any(h for h in ssd_hints) else "Unbekannt"
-                frei = float(d.get("FreiGB") or 0)
-                entry = dict(d)
-                entry["typ"] = disk_type
-                entry["ist_msfs_laufwerk"] = (drive_id == msfs_drive)
-                if frei < 10:
-                    entry["warnung"] = f"⚠️ Wenig Speicher ({frei:.1f} GB frei)"
-                disk_list.append(entry)
-
-        msfs_info = next((d for d in disk_list if d.get("ist_msfs_laufwerk")), None)
-        empfehlung = "✅ MSFS-Laufwerk: SSD erkannt." if msfs_info else "MSFS-Laufwerk nicht identifiziert."
-        if msfs_info:
-            frei = float(msfs_info.get("FreiGB") or 0)
-            if frei < 20:
-                empfehlung += f" ⚠️ Nur {frei:.1f} GB frei — MSFS benötigt Platz für Rolling Cache."
-
-        return {
-            "laufwerke": disk_list,
-            "physische_laufwerke": physical if isinstance(physical, list) else [],
-            "msfs_laufwerk": msfs_drive,
-            "msfs_laufwerk_info": msfs_info,
-            "empfehlung": empfehlung,
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def get_system_temps() -> dict:
-    """Liest CPU- und GPU-Temperaturen aus.
-
-    Hohe Temperaturen führen zu Thermal Throttling = VR-Stottern.
-    GPU-Temp via NVML (Nvidia), CPU-Temp via WMI (erfordert ggf. Admin).
-
-    Returns:
-        cpu_temp_celsius, gpu_temp_celsius, gpu_hotspot_celsius, bewertung.
-    """
-    try:
-        result: dict = {}
-
-        # CPU via WMI thermal zones
-        cpu_temp = None
-        try:
-            temp_data = _ps_json(
-                "Get-CimInstance -Namespace root/wmi "
-                "-ClassName MSAcpi_ThermalZoneTemperature "
-                "-ErrorAction SilentlyContinue "
-                "| Select-Object CurrentTemperature"
+            reg_result = _apply_pimax_settings_to_registry(
+                _VR_COLOR_NEUTRAL["pimax"], verify=True
             )
-            if temp_data:
-                items = temp_data if isinstance(temp_data, list) else [temp_data]
-                valid = []
-                for item in items:
-                    raw = item.get("CurrentTemperature") or 0
-                    if raw > 2000:
-                        c = round((raw - 2732) / 10.0, 1)
-                        if 0 < c < 120:
-                            valid.append(c)
-                if valid:
-                    cpu_temp = max(valid)
-        except Exception:
-            pass
-
-        result["cpu_temp_celsius"] = (
-            cpu_temp if cpu_temp is not None
-            else "nicht verfügbar (WMI-Admin oder HWiNFO erforderlich)"
-        )
-
-        # GPU via NVML
-        gpu_temp = gpu_hotspot = gpu_mem_temp = None
-        try:
-            pynvml.nvmlInit()
-            h = pynvml.nvmlDeviceGetHandleByIndex(0)
-            gpu_temp = pynvml.nvmlDeviceGetTemperature(h, pynvml.NVML_TEMPERATURE_GPU)
-            try:
-                gpu_hotspot = pynvml.nvmlDeviceGetTemperature(h, 1)
-            except Exception:
-                pass
-            try:
-                gpu_mem_temp = pynvml.nvmlDeviceGetTemperature(h, 2)
-            except Exception:
-                pass
-            pynvml.nvmlShutdown()
-        except Exception:
-            pass
-
-        result["gpu_temp_celsius"] = gpu_temp if gpu_temp is not None else "nicht verfügbar"
-        if gpu_hotspot is not None:
-            result["gpu_hotspot_celsius"] = gpu_hotspot
-        if gpu_mem_temp is not None:
-            result["gpu_vram_temp_celsius"] = gpu_mem_temp
-
-        # Assessment
-        warnungen = []
-        ok_msgs = []
-        if isinstance(cpu_temp, float):
-            if cpu_temp > 95:
-                warnungen.append(f"🔥 CPU-Temperatur kritisch: {cpu_temp}°C!")
-            elif cpu_temp > 85:
-                warnungen.append(f"⚠️ CPU warm: {cpu_temp}°C")
-            else:
-                ok_msgs.append(f"✅ CPU: {cpu_temp}°C — ok")
-        if isinstance(gpu_temp, int):
-            if gpu_temp > 90:
-                warnungen.append(f"🔥 GPU-Temperatur kritisch: {gpu_temp}°C!")
-            elif gpu_temp > 83:
-                warnungen.append(f"⚠️ GPU warm: {gpu_temp}°C")
-            else:
-                ok_msgs.append(f"✅ GPU: {gpu_temp}°C — ok")
-
-        result["bewertung"] = (warnungen + ok_msgs) if (warnungen or ok_msgs) else [
-            "Temperaturmessung nicht verfügbar"
-        ]
-        result["hinweis"] = "GPU unter VR-Last: 70-83°C normal. Über 90°C = Throttling-Risiko."
-        return result
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def kill_background_processes(dry_run: bool = False) -> dict:
-    """Beendet bekannte Hintergrundprozesse die VR-Performance beeinträchtigen.
-
-    Ziele: Discord-Overlay, Xbox Game Bar, GeForce Experience Overlay,
-    Xbox DVR, Cortana, Windows Search UI, OneDrive Sync.
-
-    Args:
-        dry_run: True = zeigt nur was beendet würde, ohne Änderungen.
-
-    Returns:
-        beendet: Beendete Prozesse.
-        nicht_laufend: Prozesse die nicht aktiv waren.
-    """
-    # (process_name, display_name, safe_to_auto_kill)
-    VR_KILLERS = [
-        ("XboxGameBar",       "Xbox Game Bar",              True),
-        ("GameBarFTServer",   "Xbox Game Bar FT Server",    True),
-        ("XboxApp",           "Xbox App",                   True),
-        ("GameBar",           "Windows Game Bar",           True),
-        ("Cortana",           "Cortana",                    True),
-        ("SearchApp",         "Windows Search App",         True),
-        ("SearchUI",          "Windows Search UI",          True),
-        ("NvBackend",         "GeForce Experience Backend", True),
-        ("nvcontainer",       "Nvidia Container (GFE)",     True),
-        ("Discord",           "Discord",                    True),
-        ("OneDrive",          "OneDrive Sync",              True),
-        ("Teams",             "Microsoft Teams",            True),
-        ("slack",             "Slack",                      True),
-    ]
-    try:
-        beendet = []
-        nicht_laufend = []
-        fehler = []
-
-        for proc_name, display_name, _safe in VR_KILLERS:
-            check = _ps_json(
-                f"Get-Process -Name '{proc_name}' -ErrorAction SilentlyContinue "
-                f"| Select-Object ProcessName, Id"
-            )
-            if not check:
-                nicht_laufend.append(display_name)
-                continue
-
-            if dry_run:
-                beendet.append(f"[WÜRDE BEENDEN] {display_name}")
-            else:
-                try:
-                    _ps(f"Stop-Process -Name '{proc_name}' -Force -ErrorAction SilentlyContinue")
-                    beendet.append(f"✅ {display_name} beendet")
-                except Exception as ke:
-                    fehler.append(f"⚠️ {display_name}: {ke}")
-
-        # Also disable Xbox Game DVR
-        if not dry_run:
-            try:
-                _reg_add(r"HKCU\System\GameConfigStore", "GameDVR_Enabled", "REG_DWORD", "0")
-                _reg_add(
-                    r"HKCU\Software\Microsoft\Windows\CurrentVersion\GameDVR",
-                    "AppCaptureEnabled", "REG_DWORD", "0"
-                )
-                beendet.append("✅ Xbox Game DVR deaktiviert")
-            except Exception:
-                pass
-
-        killed_count = len([x for x in beendet if not x.startswith("[")])
-        return {
-            "dry_run": dry_run,
-            "beendet": beendet,
-            "nicht_laufend": nicht_laufend,
-            "fehler": fehler,
-            "zusammenfassung": (
-                f"{'[Simulation] ' if dry_run else ''}"
-                f"{killed_count} Prozesse beendet, {len(nicht_laufend)} nicht aktiv."
-            ),
-            "tipp": "Starte MSFS VR direkt nach diesem Tool für maximale Performance.",
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# ---------------------------------------------------------------------------
-# A6. MSFS Community / Official Folder Tools
-# ---------------------------------------------------------------------------
-
-@mcp.tool()
-def get_msfs_community_folder(usercfg_path: str = "") -> dict:
-    """Findet den MSFS Community-Ordner (Add-on Installationsverzeichnis).
-
-    Liest InstalledPackagesPath aus UserCfg.opt oder sucht in Standard-Pfaden.
-    Der Community-Ordner ist wo Add-ons (Flugzeuge, Szenerien, Liveries) landen.
-
-    Returns:
-        community_pfad: Absoluter Pfad.
-        addon_anzahl: Anzahl installierter Add-ons.
-    """
-    try:
-        cfg_path = _find_usercfg(usercfg_path)
-        community_path: Path | None = None
-
-        if cfg_path and cfg_path.exists():
-            text = cfg_path.read_text(encoding="utf-8", errors="replace")
-            for line in text.splitlines():
-                line = line.strip()
-                if line.startswith("InstalledPackagesPath"):
-                    parts = line.split(None, 1)
-                    if len(parts) > 1:
-                        ps = parts[1].strip().strip('"')
-                        community_path = Path(ps) / "Community"
-                        break
-
-        if not community_path:
-            detected = _detect_community_folder("")
-            if detected:
-                community_path = detected
-
-        if not community_path:
-            for candidate in [
-                Path(os.environ.get("LOCALAPPDATA", "")) / "Packages"
-                / "Microsoft.Limitless_8wekyb3d8bbwe" / "LocalCache" / "Packages" / "Community",
-                Path(os.environ.get("APPDATA", ""))
-                / "Microsoft Flight Simulator 2024" / "Packages" / "Community",
-                Path(os.environ.get("APPDATA", ""))
-                / "Microsoft Flight Simulator" / "Packages" / "Community",
-            ]:
-                if candidate.exists():
-                    community_path = candidate
-                    break
-
-        if not community_path:
-            return {
-                "fehler": "Community-Ordner nicht gefunden.",
-                "hinweis": "Starte MSFS einmal um den Community-Ordner zu erstellen.",
+            results["pimax"] = {
+                "status": "ok",
+                "zurückgesetzt": list(_VR_COLOR_NEUTRAL["pimax"].keys()),
             }
+        else:
+            results["pimax"] = {"status": "skipped", "grund": "Pimax nicht gefunden"}
 
-        addon_count = sum(1 for p in community_path.iterdir() if p.is_dir()) if community_path.exists() else 0
-
-        return {
-            "community_pfad": str(community_path),
-            "existiert": community_path.exists(),
-            "addon_anzahl": addon_count,
-            "hinweis": f"{addon_count} Add-ons gefunden. Nutze list_community_addons() für Details.",
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def list_community_addons(usercfg_path: str = "") -> dict:
-    """Listet alle installierten MSFS Add-ons im Community-Ordner.
-
-    Liest manifest.json um Name, Version, Hersteller und Typ zu ermitteln
-    (Flugzeug, Szenerie, Livery, etc.). Gibt Größe pro Add-on aus.
-
-    Returns:
-        addons: Liste mit Name, Version, Typ, Größe.
-        gesamt, größe_gesamt_gb.
-    """
-    try:
-        info = get_msfs_community_folder(usercfg_path)
-        if "fehler" in info or "error" in info:
-            return info
-
-        community_path = Path(info["community_pfad"])
-        if not community_path.exists():
-            return {"fehler": "Community-Ordner existiert nicht.", "pfad": str(community_path)}
-
-        addons = []
-        total_bytes = 0
-
-        for item in sorted(community_path.iterdir()):
-            if not item.is_dir():
-                continue
-
-            entry: dict = {
-                "ordner": item.name,
-                "name": item.name,
-                "version": "?",
-                "typ": "Unbekannt",
-                "hersteller": "?",
-                "größe_mb": "?",
-            }
-
-            manifest = item / "manifest.json"
-            if manifest.exists():
+    if reset_reshade:
+        ini = _find_reshade_ini(game_dir)
+        if ini:
+            preset_path = _find_preset_file(ini)
+            if preset_path:
+                all_effects = list(RESHADE_EFFECTS.keys())
+                _update_reshade_techniques(preset_path, enable=[], disable=all_effects)
                 try:
-                    mf = _json.loads(manifest.read_text(encoding="utf-8", errors="replace"))
-                    entry["name"] = mf.get("name", item.name)
-                    entry["version"] = mf.get("package_version", "?")
-                    entry["hersteller"] = mf.get("manufacturer", "?")
-                    ct = mf.get("content_type", "").lower()
-                    type_map = {
-                        "aircraft": "Flugzeug", "airplane": "Flugzeug",
-                        "scenery": "Szenerie", "livery": "Livery",
-                        "misc": "Sonstiges", "other": "Sonstiges",
-                    }
-                    entry["typ"] = type_map.get(ct, ct.capitalize() or "Sonstiges")
+                    preset_path.touch()
                 except Exception:
                     pass
-
-            # Size (top-level rglob, skip deep trees > 5 s)
-            try:
-                size = sum(f.stat().st_size for f in item.rglob("*") if f.is_file())
-                entry["größe_mb"] = round(size / 1024 / 1024, 1)
-                total_bytes += size
-            except Exception:
-                pass
-
-            addons.append(entry)
-
-        return {
-            "addons": addons,
-            "gesamt": len(addons),
-            "größe_gesamt_gb": round(total_bytes / 1024 ** 3, 2),
-            "community_pfad": str(community_path),
-            "tipp": "Inaktive Add-ons in 'Community.off'-Ordner verschieben um Ladezeit zu reduzieren.",
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def get_msfs_official_folder(usercfg_path: str = "") -> dict:
-    """Findet den MSFS Official-Ordner (Basis-Spiel und Marketplace-Inhalte).
-
-    Der Official-Ordner enthält von Asobo/Microsoft bereitgestellte Inhalte
-    und sollte NIEMALS manuell verändert werden.
-
-    Returns:
-        official_pfad: Absoluter Pfad.
-        pakete_gesamt: Anzahl offizieller Pakete.
-    """
-    try:
-        cfg_path = _find_usercfg(usercfg_path)
-        official_path: Path | None = None
-
-        if cfg_path and cfg_path.exists():
-            text = cfg_path.read_text(encoding="utf-8", errors="replace")
-            for line in text.splitlines():
-                line = line.strip()
-                if line.startswith("InstalledPackagesPath"):
-                    parts = line.split(None, 1)
-                    if len(parts) > 1:
-                        ps = parts[1].strip().strip('"')
-                        official_path = Path(ps) / "Official"
-                        break
-
-        if not official_path:
-            for candidate in [
-                Path(os.environ.get("LOCALAPPDATA", "")) / "Packages"
-                / "Microsoft.Limitless_8wekyb3d8bbwe" / "LocalCache" / "Packages" / "Official",
-                Path(os.environ.get("APPDATA", ""))
-                / "Microsoft Flight Simulator 2024" / "Packages" / "Official",
-                Path(os.environ.get("APPDATA", ""))
-                / "Microsoft Flight Simulator" / "Packages" / "Official",
-            ]:
-                if candidate.exists():
-                    official_path = candidate
-                    break
-
-        if not official_path or not official_path.exists():
-            return {
-                "fehler": "Official-Ordner nicht gefunden.",
-                "hinweis": "MSFS einmal starten um den Official-Ordner zu erstellen.",
-            }
-
-        publishers = [p for p in official_path.iterdir() if p.is_dir()]
-        total_pkgs = sum(
-            1 for pub in publishers for p in pub.iterdir() if p.is_dir()
-        )
-
-        return {
-            "official_pfad": str(official_path),
-            "existiert": True,
-            "verleger": [p.name for p in publishers],
-            "pakete_gesamt": total_pkgs,
-            "warnung": "Diesen Ordner NIEMALS manuell ändern — MSFS repariert sich sonst selbst!",
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# ---------------------------------------------------------------------------
-# A7. Network / Multiplayer
-# ---------------------------------------------------------------------------
-
-@mcp.tool()
-def get_network_info() -> dict:
-    """Netzwerk-Info für MSFS: Ping zu MSFS-Servern, Verbindungstyp, Latenz.
-
-    Nützlich um zu prüfen ob Live Traffic, Live Weather oder Multiplayer
-    durch Netzwerkprobleme beeinträchtigt werden.
-
-    Returns:
-        ping_ms: Latenz zu MSFS Azure-Servern und DNS-Referenzzielen.
-        adapter: Aktiver Netzwerk-Adapter (LAN/WLAN).
-        empfehlung: LAN vs. WLAN Hinweis.
-    """
-    try:
-        result: dict = {}
-
-        for name, host in [
-            ("azure_westeurope", "westeurope.cloudapp.azure.com"),
-            ("cloudflare_dns", "1.1.1.1"),
-            ("google_dns", "8.8.8.8"),
-        ]:
-            try:
-                ping_raw = _ps_json(
-                    f"Test-Connection -ComputerName '{host}' -Count 3 "
-                    f"-ErrorAction SilentlyContinue "
-                    f"| Select-Object @{{N='ms';E={{$_.ResponseTime}}}}"
-                )
-                if ping_raw:
-                    times = [float(p.get("ms") or 0) for p in ping_raw if p.get("ms") is not None]
-                    result[f"ping_{name}_ms"] = round(sum(times) / len(times), 1) if times else None
-                else:
-                    result[f"ping_{name}_ms"] = "Timeout"
-            except Exception as pe:
-                result[f"ping_{name}_ms"] = f"Fehler: {pe}"
-
-        # Active adapters
-        try:
-            adapters = _ps_json(
-                "Get-NetAdapter | Where-Object Status -eq 'Up' "
-                "| Select-Object Name, InterfaceDescription, LinkSpeed, Status "
-                "| Select-Object -First 3"
-            )
-            result["adapter"] = adapters if isinstance(adapters, list) else [adapters]
-        except Exception:
-            result["adapter"] = []
-
-        # LAN vs WLAN detection
-        wlan = any(
-            "wi-fi" in str(a.get("Name", "")).lower()
-            or "wlan" in str(a.get("Name", "")).lower()
-            or "wireless" in str(a.get("InterfaceDescription", "")).lower()
-            for a in (result.get("adapter") or [])
-        )
-        result["wlan_aktiv"] = wlan
-
-        goog = result.get("ping_google_dns_ms")
-        if isinstance(goog, float):
-            if goog < 20:
-                result["bewertung"] = "✅ Sehr gute Verbindung"
-            elif goog < 50:
-                result["bewertung"] = "✅ Gute Verbindung für MSFS Live-Dienste"
-            elif goog < 100:
-                result["bewertung"] = "⚠️ Mäßige Latenz — Live Weather/Traffic könnte verzögert laden"
+                results["reshade"] = {
+                    "status": "ok",
+                    "deaktivierte_effekte": all_effects,
+                    "preset_file": str(preset_path),
+                }
             else:
-                result["bewertung"] = "❌ Hohe Latenz — Live-Dienste eingeschränkt"
+                results["reshade"] = {"status": "skipped", "grund": "Kein Preset gefunden"}
         else:
-            result["bewertung"] = "Verbindungstest unvollständig"
-
-        if wlan:
-            result["wlan_hinweis"] = (
-                "⚠️ WLAN aktiv. Für MSFS VR empfohlen: Ethernet (LAN-Kabel) "
-                "für stabile Live Traffic, Live Weather und Multiplayer-Verbindung."
-            )
-
-        return result
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def set_msfs_multiplayer_settings(
-    live_traffic: str = "",
-    live_weather: bool | None = None,
-    multiplayer: str = "",
-    usercfg_path: str = "",
-) -> dict:
-    """Setzt MSFS Multiplayer- und Live-Dienste-Einstellungen in der UserCfg.opt.
-
-    Für VR kann das Reduzieren von Live Traffic und Multiplayer die CPU-Last
-    verringern und Stottern eliminieren.
-
-    Args:
-        live_traffic: Traffic-Dichte: 'off', 'low' (25%), 'medium' (50%), 'high' (100%).
-        live_weather: True = Live Weather an, False = Live Weather aus.
-        multiplayer: 'off', 'group_only', 'live_players'.
-        usercfg_path: Optional: Pfad zur UserCfg.opt.
-    """
-    try:
-        cfg_path = _find_usercfg(usercfg_path)
-        if not cfg_path or not cfg_path.exists():
-            return {"error": "UserCfg.opt nicht gefunden. MSFS einmal starten."}
-
-        overrides: dict = {}
-
-        traffic_map = {"off": "0", "low": "25", "medium": "50", "high": "100"}
-        if live_traffic:
-            key = live_traffic.lower().strip()
-            if key not in traffic_map:
-                return {"error": f"Ungültiger live_traffic: '{live_traffic}'. Gültig: {list(traffic_map)}"}
-            overrides["Traffic.AirTrafficDensity"] = traffic_map[key]
-            overrides["Traffic.AirlineTrafficEnabled"] = "0" if key == "off" else "1"
-            overrides["Traffic.GeneralAviationTrafficEnabled"] = "0" if key == "off" else "1"
-
-        if live_weather is not None:
-            overrides["Weather.WeatherDataSource"] = "1" if live_weather else "0"
-
-        multi_map = {
-            "off":          ("0", "0"),
-            "group_only":   ("1", "0"),
-            "live_players": ("1", "1"),
-        }
-        if multiplayer:
-            key = multiplayer.lower().strip()
-            if key not in multi_map:
-                return {"error": f"Ungültiger multiplayer: '{multiplayer}'. Gültig: {list(multi_map)}"}
-            mp_en, live_mp = multi_map[key]
-            overrides["Multiplayer.MultiplayerEnabled"] = mp_en
-            overrides["Multiplayer.LivePlayersEnabled"] = live_mp
-
-        if not overrides:
-            return {"error": "Keine Einstellungen angegeben. Nutze mind. einen Parameter."}
-
-        snapshot_id = _snapshot(cfg_path, "Before set_msfs_multiplayer_settings")
-        text = cfg_path.read_text(encoding="utf-8")
-        entries = _parse_usercfg(text)
-        new_entries, not_applied = _apply_overrides(entries, overrides)
-        cfg_path.write_text(_entries_to_text(new_entries), encoding="utf-8")
-
-        return {
-            "status": "ok",
-            "angewendet": {k: v for k, v in overrides.items() if k not in not_applied},
-            "nicht_gefunden": list(not_applied),
-            "snapshot": snapshot_id,
-            "hinweis": (
-                "Änderungen wirksam beim nächsten MSFS-Start. "
-                "Für VR empfohlen: live_traffic='low'/'off', multiplayer='off' oder 'group_only'."
-            ),
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# ---------------------------------------------------------------------------
-# A8. VR Comfort Tools
-# ---------------------------------------------------------------------------
-
-@mcp.tool()
-def get_vr_comfort_settings(usercfg_path: str = "") -> dict:
-    """Liest VR-Komfort-Einstellungen aus der MSFS UserCfg.opt.
-
-    Zeigt Motion Blur, Vignette, DLSS, Schatten- und Wolken-Qualität
-    mit konkreten Empfehlungen für Motion-Sickness-Reduktion.
-
-    Returns:
-        komfort_einstellungen: Aktuelle Werte + Empfehlung + Begründung.
-        alle_vr_einstellungen: Alle GraphicsVR.* Werte als Referenz.
-    """
-    try:
-        cfg_path = _find_usercfg(usercfg_path)
-        if not cfg_path or not cfg_path.exists():
-            return {"error": "UserCfg.opt nicht gefunden. MSFS einmal starten."}
-
-        current = _read_current_settings(cfg_path)
-
-        comfort_defs = {
-            "GraphicsVR.MotionBlur": {
-                "label": "Motion Blur (VR)",
-                "empfehlung": "0 (aus)",
-                "grund": "Motion Blur in VR verursacht häufig Motion Sickness",
-                "werte": {"0": "Aus", "1": "Normal", "2": "High"},
-            },
-            "GraphicsVR.Vignette": {
-                "label": "Vignette/Tunnelblick (VR)",
-                "empfehlung": "0 (aus) — individuell",
-                "grund": "Tunnelblick beim Drehen reduziert Motion Sickness, kann aber störend wirken",
-                "werte": {"0": "Aus", "1": "Niedrig", "2": "Mittel", "3": "Hoch"},
-            },
-            "Video.DLSS": {
-                "label": "DLSS",
-                "empfehlung": "2 (Balanced) oder 3 (Performance)",
-                "grund": "DLSS reduziert Shimmer/Aliasing in VR und erhöht FPS erheblich",
-                "werte": {"0": "Aus", "1": "Quality", "2": "Balanced", "3": "Performance", "4": "Ultra Performance"},
-            },
-            "GraphicsVR.ShadowQuality": {
-                "label": "Schatten-Qualität (VR)",
-                "empfehlung": "0-1 (Niedrig/Mittel) für bessere FPS",
-                "grund": "Schatten sind sehr GPU-intensiv in VR",
-                "werte": {"0": "Niedrig", "1": "Mittel", "2": "Hoch", "3": "Ultra"},
-            },
-            "GraphicsVR.CloudsQuality": {
-                "label": "Wolken-Qualität (VR)",
-                "empfehlung": "1-2 (Mittel/Hoch)",
-                "grund": "Ultra+ Wolken kosten in VR überproportional viel GPU",
-                "werte": {"0": "Niedrig", "1": "Mittel", "2": "Hoch", "3": "Ultra", "4": "Ultra+"},
-            },
-            "GraphicsVR.TextureResolution": {
-                "label": "Textur-Auflösung (VR)",
-                "empfehlung": "2-3 (Hoch/Ultra) — VRAM abhängig",
-                "grund": "Hochauflösende Texturen verbessern VR-Klarheit deutlich",
-                "werte": {"0": "Niedrig", "1": "Mittel", "2": "Hoch", "3": "Ultra"},
-            },
-            "GraphicsVR.TerrainLoD": {
-                "label": "Terrain LoD (VR)",
-                "empfehlung": "80-150 je nach GPU-Tier",
-                "grund": "Sehr hohe Terrain-LoD erhöht CPU-Last und kann Stottern verursachen",
-                "werte": {},
-            },
-        }
-
-        komfort = {}
-        for key, info in comfort_defs.items():
-            raw = current.get(key, "nicht gesetzt")
-            werte = info.get("werte", {})
-            display = werte.get(str(raw), raw) if werte else raw
-            komfort[key] = {
-                "label": info["label"],
-                "aktuell_roh": raw,
-                "aktuell_anzeige": display,
-                "empfehlung": info.get("empfehlung", ""),
-                "grund": info.get("grund", ""),
-            }
-
-        vr_all = {k: v for k, v in current.items() if k.startswith("GraphicsVR.")}
-
-        return {
-            "komfort_einstellungen": komfort,
-            "alle_vr_einstellungen": vr_all,
-            "tipp": (
-                "Anti-Motion-Sickness Priorität: Motion Blur AUS, DLSS aktivieren, "
-                "stabiles FPS > Frametime-Spikes vermeiden (Terrain-LoD reduzieren)."
-            ),
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# ---------------------------------------------------------------------------
-# A9. Logging & Diagnostics
-# ---------------------------------------------------------------------------
-
-@mcp.tool()
-def get_msfs_log(lines: int = 50) -> dict:
-    """Liest die letzten Zeilen des MSFS Flight Simulator Logs.
-
-    Nützlich um Abstürze, Fehler und Warnungen zu diagnostizieren.
-    MSFS schreibt Logs in AppData — sucht automatisch in allen bekannten Pfaden.
-
-    Args:
-        lines: Anzahl der letzten Zeilen (Standard: 50, Max: 500).
-
-    Returns:
-        log_inhalt: Letzte N Zeilen des Logs.
-        fehler_gefunden: Anzahl Fehler/Kritischer Einträge.
-    """
-    try:
-        lines = min(max(1, lines), 500)
-
-        log_candidates: list[Path] = []
-        for base in [
-            Path(os.environ.get("APPDATA", "")) / "Microsoft Flight Simulator 2024",
-            Path(os.environ.get("APPDATA", "")) / "Microsoft Flight Simulator",
-            Path(os.environ.get("LOCALAPPDATA", "")) / "Packages"
-            / "Microsoft.Limitless_8wekyb3d8bbwe" / "LocalCache",
-            Path(os.environ.get("LOCALAPPDATA", "")) / "Packages"
-            / "Microsoft.FlightSimulator_8wekyb3d8bbwe" / "LocalCache",
-        ]:
-            log_candidates.extend([
-                base / "FlightSimulator.CFG",
-                base / "logfile.log",
-                base / "FlightSimulator.log",
-            ])
-
-        log_path: Path | None = None
-        for candidate in log_candidates:
-            if candidate.exists() and candidate.is_file():
-                log_path = candidate
-                break
-
-        if not log_path:
-            # Try Windows Event Log
-            try:
-                ev = _ps_json(
-                    "Get-EventLog -LogName Application "
-                    "-Source '*FlightSimulator*','*MSFS*' "
-                    f"-Newest {min(lines, 50)} -ErrorAction SilentlyContinue "
-                    "| Select-Object TimeGenerated, EntryType, Message"
-                )
-                if ev:
-                    return {
-                        "log_typ": "windows_event_log",
-                        "einträge": ev,
-                        "hinweis": "MSFS Log-Datei nicht gefunden. Windows Event Log gezeigt.",
-                    }
-            except Exception:
-                pass
-            return {
-                "fehler": "MSFS Log-Datei nicht gefunden.",
-                "hinweis": "MSFS einmal starten um Logs zu generieren.",
-            }
-
-        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-            all_lines = f.readlines()
-        last = all_lines[-lines:]
-        log_text = "".join(last)
-
-        error_lines = [
-            l.strip() for l in last
-            if any(w in l.lower() for w in ["error", "critical", "crash", "exception", "fatal"])
-        ]
-        warn_lines = [l.strip() for l in last if "warning" in l.lower()]
-
-        return {
-            "log_pfad": str(log_path),
-            "zeilen_gelesen": len(last),
-            "log_inhalt": log_text,
-            "fehler_gefunden": len(error_lines),
-            "fehler_zeilen": error_lines[:10],
-            "warnungen_gefunden": len(warn_lines),
-            "zusammenfassung": (
-                f"{len(error_lines)} Fehler, {len(warn_lines)} Warnungen "
-                f"in den letzten {len(last)} Log-Zeilen."
-            ),
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def get_event_log_errors(hours: int = 1, source_filter: str = "") -> dict:
-    """Liest Windows Event Log Fehler der letzten N Stunden (GPU/MSFS/System).
-
-    Findet GPU-Treiberabstürze (nvlddmkm TDR), MSFS-Fehler, Direct3D-Probleme.
-    TDR-Fehler deuten auf instabile GPU-Übertaktung oder Treiberfehler hin.
-
-    Args:
-        hours: Zeitraum in Stunden (Standard: 1, Max: 24).
-        source_filter: Optionaler Quell-Filter (z.B. 'nvlddmkm').
-
-    Returns:
-        gpu_abstürze_tdr: Nvidia Timeout Detection Recovery Fehler.
-        msfs_fehler: MSFS-spezifische Fehler.
-        bewertung: Zusammenfassung.
-    """
-    try:
-        hours = min(max(1, hours), 24)
-
-        extra = f"-or $_.Source -like '*{source_filter}*'" if source_filter else ""
-
-        gpu_crashes = _ps_json(
-            f"""
-$since = (Get-Date).AddHours(-{hours})
-Get-EventLog -LogName System -EntryType Error -Newest 100 -ErrorAction SilentlyContinue |
-Where-Object {{ $_.TimeGenerated -gt $since -and
-    ($_.Source -like '*nvlddmkm*' -or $_.Source -like '*dxgkrnl*' -or
-     $_.Source -like '*dxgi*' -or $_.Source -like '*Display*' {extra}) }} |
-Select-Object TimeGenerated, Source, EventID,
-    @{{N='Message';E={{$_.Message.Substring(0,[Math]::Min(200,$_.Message.Length))}}}}
-"""
-        )
-
-        app_errors = _ps_json(
-            f"""
-$since = (Get-Date).AddHours(-{hours})
-Get-EventLog -LogName Application -EntryType Error -Newest 100 -ErrorAction SilentlyContinue |
-Where-Object {{ $_.TimeGenerated -gt $since -and
-    ($_.Source -like '*FlightSimulator*' -or $_.Source -like '*MSFS*' {extra}) }} |
-Select-Object TimeGenerated, Source, EventID,
-    @{{N='Message';E={{$_.Message.Substring(0,[Math]::Min(200,$_.Message.Length))}}}}
-"""
-        )
-
-        gpu_list = gpu_crashes if isinstance(gpu_crashes, list) else []
-        app_list = app_errors if isinstance(app_errors, list) else []
-
-        if gpu_list:
-            bewertung = f"❌ {len(gpu_list)} GPU-Treiberabstürze (TDR) in {hours}h — Treiber/OC prüfen!"
-        elif app_list:
-            bewertung = f"⚠️ {len(app_list)} MSFS-Fehler in {hours}h"
-        else:
-            bewertung = f"✅ Keine GPU- oder MSFS-Fehler in den letzten {hours}h"
-
-        return {
-            "zeitraum_stunden": hours,
-            "gpu_abstürze_tdr": gpu_list,
-            "msfs_fehler": app_list,
-            "bewertung": bewertung,
-            "tdr_hinweis": (
-                "nvlddmkm TDR = Nvidia Timeout Detection Recovery. "
-                "Ursachen: Übertaktung zu aggressiv, GPU-Unterspannung, Überhitzung, veralteter Treiber."
-            ) if gpu_list else "",
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def export_vr_diagnostic_report(output_path: str = "") -> dict:
-    """Exportiert vollständigen VR-Diagnose-Bericht als HTML auf den Desktop.
-
-    Sammelt Hardware, MSFS-Einstellungen, Pimax, OpenXR, SteamVR, Netzwerk
-    und Event-Log-Fehler und schreibt alles in eine übersichtliche HTML-Datei.
-
-    Args:
-        output_path: Optionaler Ausgabepfad. Standard: Desktop/VR_Diagnose_<datum>.html.
-
-    Returns:
-        bericht_pfad: Pfad zur erzeugten HTML-Datei.
-        abschnitte: Gesammelte Datenbereiche.
-    """
-    try:
-        now = datetime.datetime.now()
-        date_str = now.strftime("%Y-%m-%d_%H-%M")
-        if not output_path:
-            output_path = str(Path.home() / "Desktop" / f"VR_Diagnose_{date_str}.html")
-
-        out = Path(output_path)
-        sections: dict = {}
-        errs: list[str] = []
-
-        def _c(name: str, fn):
-            try:
-                sections[name] = fn()
-            except Exception as exc:
-                sections[name] = {"error": str(exc)}
-                errs.append(f"{name}: {exc}")
-
-        _c("hardware", get_detailed_hardware_profile)
-        _c("cpu", get_cpu_info)
-        _c("ram", get_ram_info)
-        _c("temperaturen", get_system_temps)
-        _c("openxr", get_openxr_runtime)
-        _c("steamvr", get_steamvr_settings)
-        _c("pimax", get_pimax_headset_info)
-        _c("render_auflösung", get_vr_render_resolution)
-        _c("netzwerk", get_network_info)
-        _c("msfs_prozess", get_msfs_process_info)
-        _c("community", get_msfs_community_folder)
-        _c("event_errors_24h", lambda: get_event_log_errors(hours=24))
-        _c("vr_diagnose", diagnose_vr_complete)
-
-        def _sec(title: str, data: dict) -> str:
-            rows = ""
-            for k, v in data.items():
-                if isinstance(v, (dict, list)):
-                    v_str = _json.dumps(v, ensure_ascii=False, indent=2)
-                    rows += f"<tr><td><b>{k}</b></td><td><pre>{v_str}</pre></td></tr>\n"
-                else:
-                    rows += f"<tr><td><b>{k}</b></td><td>{v}</td></tr>\n"
-            return (
-                f'<div class="section"><h2>{title}</h2>'
-                f"<table><tbody>{rows}</tbody></table></div>"
-            )
-
-        body = "\n".join(_sec(n, d) for n, d in sections.items())
-
-        html = f"""<!DOCTYPE html>
-<html lang="de"><head>
-<meta charset="UTF-8">
-<title>Game Copilot VR-Diagnose {date_str}</title>
-<style>
-  body{{font-family:'Segoe UI',Arial,sans-serif;background:#1a1a2e;color:#e0e0e0;padding:20px}}
-  h1{{color:#4ade80;border-bottom:2px solid #4ade80;padding-bottom:8px}}
-  h2{{color:#69daff;margin-top:24px}}
-  .section{{background:#16213e;border-radius:8px;padding:16px;margin-bottom:16px;border:1px solid #0f3460}}
-  table{{width:100%;border-collapse:collapse}}
-  td{{padding:5px 10px;border-bottom:1px solid #0f3460;vertical-align:top}}
-  td:first-child{{width:220px;color:#a0aec0;white-space:nowrap}}
-  pre{{font-size:11px;white-space:pre-wrap;margin:0;color:#cbd5e0}}
-  .footer{{text-align:center;color:#4a5568;margin-top:32px;font-size:12px}}
-</style></head><body>
-<h1>🎮 Game Copilot — VR-Diagnose-Bericht</h1>
-<p>Erstellt: <b>{now.strftime("%d.%m.%Y %H:%M:%S")}</b> &nbsp;|&nbsp; Version: <b>3.6.0</b></p>
-{body}
-<div class="footer">Erstellt von Game Copilot MCP Server v3.6.0</div>
-</body></html>"""
-
-        out.write_text(html, encoding="utf-8")
-
-        return {
-            "status": "ok",
-            "bericht_pfad": str(out),
-            "erstellt_am": now.strftime("%d.%m.%Y %H:%M"),
-            "abschnitte": list(sections.keys()),
-            "fehler_beim_sammeln": errs if errs else "Keine",
-            "hinweis": f"HTML-Bericht gespeichert: {out}",
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# ---------------------------------------------------------------------------
-# B. get_msfs_current_settings — Read ALL current MSFS settings
-# ---------------------------------------------------------------------------
-
-@mcp.tool()
-def get_msfs_current_settings(usercfg_path: str = "", section_filter: str = "") -> dict:
-    """Liest ALLE aktuellen MSFS Grafik- und VR-Einstellungen aus der UserCfg.opt.
-
-    Essentiell für Before/After-Vergleiche nach Optimierungen.
-    Gibt alle Schlüssel mit Rohwert, lesbarem Wert und Label zurück.
-
-    Args:
-        usercfg_path: Optional: Pfad zur UserCfg.opt.
-        section_filter: Filter nach Kategorie-Präfix (z.B. 'GraphicsVR', 'Video').
-                        Leer = alle Einstellungen.
-
-    Returns:
-        einstellungen: Alle Einstellungen gruppiert nach Kategorie.
-        cfg_pfad, letztes_änderungsdatum, gesamt_einstellungen.
-    """
-    try:
-        cfg_path = _find_usercfg(usercfg_path)
-        if not cfg_path or not cfg_path.exists():
-            return {
-                "error": "UserCfg.opt nicht gefunden.",
-                "hinweis": "Starte MSFS einmal um die Konfigurationsdatei zu erstellen.",
-            }
-
-        current = _read_current_settings(cfg_path)
-        grouped: dict[str, dict] = {}
-
-        for key, value in sorted(current.items()):
-            if section_filter and not key.lower().startswith(section_filter.lower()):
-                continue
-            parts = key.split(".", 1)
-            group = parts[0] if len(parts) > 1 else "Sonstige"
-            if group not in grouped:
-                grouped[group] = {}
-            defn = SETTING_DEFS.get(key, {})
-            grouped[group][key] = {
-                "roh": value,
-                "anzeige": defn.get("values", {}).get(str(value), str(value)),
-                "label": defn.get("label", key),
-            }
-
-        stat = cfg_path.stat()
-        mod_time = datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%d.%m.%Y %H:%M:%S")
-
-        return {
-            "cfg_pfad": str(cfg_path),
-            "letztes_änderungsdatum": mod_time,
-            "gesamt_einstellungen": len(current),
-            "kategorien": list(grouped.keys()),
-            "einstellungen": grouped,
-            "hinweis": (
-                f"Alle {len(current)} MSFS-Einstellungen gelesen. "
-                "section_filter='GraphicsVR' für nur VR-Einstellungen."
-            ),
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# ---------------------------------------------------------------------------
-# NEW TOOLS — v3.6.1 additions
-# ---------------------------------------------------------------------------
-
-
-@mcp.tool()
-def get_msfs_weather_settings(usercfg_path: str = "") -> dict:
-    """Liest aktuelle MSFS Wetter-Einstellungen aus der UserCfg.opt.
-
-    Wann aufrufen: Wenn der User fragt ob Live Weather aktiv ist, ob Wolken
-    aktiviert sind, oder welche Wetter-Konfiguration MSFS gerade hat.
-    Typische Trigger: 'Wetter', 'Live Weather', 'Wolken', 'Weather'.
-
-    Args:
-        usercfg_path: Optional: Pfad zur UserCfg.opt. Leer = automatische Suche.
-
-    Returns:
-        live_weather_aktiv: bool — True wenn Live Weather aus MSFS-Servern.
-        wetter_datenquelle: '0' = statisch, '1' = Live, '2' = manuell.
-        wolken_qualitaet: Aktueller Wert der Wolken-Qualitätsstufe.
-        wolken_menge: Dichte/Menge der Wolken.
-        sichtweite_km: Konfigurierte Sichtweite in km.
-        hinweis: Empfehlung für VR-Performance.
-    """
-    try:
-        cfg_path = _find_usercfg(usercfg_path)
-        if not cfg_path or not cfg_path.exists():
-            return {
-                "error": "UserCfg.opt nicht gefunden.",
-                "hinweis": "MSFS einmal starten um die Konfiguration zu erstellen.",
-            }
-
-        current = _read_current_settings(cfg_path)
-
-        data_source = current.get("Weather.WeatherDataSource", "1")
-        live_weather = data_source == "1"
-        cloud_quality = current.get("GraphicsVR.CloudQuality",
-                                    current.get("Graphics.CloudQuality", "N/A"))
-        cloud_draw_distance = current.get("Weather.CloudDrawDistance", "N/A")
-        visibility_km = current.get("Weather.VisibilityDistance", "N/A")
-        wind_effects = current.get("Weather.WindEffectsEnabled", "N/A")
-
-        source_labels = {"0": "Statisch (kein Live)", "1": "Live Weather (Server)", "2": "Manuell/Custom"}
-        quality_labels = {"0": "Aus", "1": "Niedrig", "2": "Mittel", "3": "Hoch", "4": "Ultra"}
-
-        vr_hinweis = (
-            "Für VR-Performance: Live Weather (1) erhöht CPU-Last. "
-            "Wolken-Qualität 1-2 empfohlen für VR. "
-            "Cloud Draw Distance reduzieren verbessert Framerate."
-        )
-
-        return {
-            "live_weather_aktiv": live_weather,
-            "wetter_datenquelle_roh": data_source,
-            "wetter_datenquelle": source_labels.get(data_source, data_source),
-            "wolken_qualitaet_roh": cloud_quality,
-            "wolken_qualitaet": quality_labels.get(str(cloud_quality), str(cloud_quality)),
-            "wolken_sichtweite": cloud_draw_distance,
-            "sichtweite_km": visibility_km,
-            "wind_effekte": wind_effects,
-            "cfg_pfad": str(cfg_path),
-            "hinweis": vr_hinweis,
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def set_msfs_weather_settings(
-    live_weather: bool | None = None,
-    cloud_quality: int | None = None,
-    usercfg_path: str = "",
-) -> dict:
-    """Setzt MSFS Wetter-Einstellungen in der UserCfg.opt.
-
-    Wann aufrufen: Wenn der User Live Weather ein-/ausschalten will,
-    die Wolkenqualität für VR-Performance optimieren möchte, oder explizit
-    nach Wetter-Optimierung fragt.
-    Trigger: 'Live Weather aus', 'Wolken reduzieren', 'Wetter optimieren'.
-
-    NUR nach expliziter User-Bestätigung aufrufen (schreibt Konfiguration).
-
-    Args:
-        live_weather: True = Live Weather aktivieren, False = deaktivieren.
-        cloud_quality: Wolken-Qualität 0-4 (0=Aus, 1=Niedrig, 2=Mittel, 3=Hoch, 4=Ultra).
-                       Für VR empfohlen: 1 oder 2.
-        usercfg_path: Optional: Pfad zur UserCfg.opt.
-
-    Returns:
-        status, angewendet, snapshot (für Rollback), hinweis.
-    """
-    try:
-        cfg_path = _find_usercfg(usercfg_path)
-        if not cfg_path or not cfg_path.exists():
-            return {"error": "UserCfg.opt nicht gefunden. MSFS einmal starten."}
-
-        overrides: dict = {}
-
-        if live_weather is not None:
-            overrides["Weather.WeatherDataSource"] = "1" if live_weather else "0"
-
-        if cloud_quality is not None:
-            if not 0 <= cloud_quality <= 4:
-                return {"error": "cloud_quality muss zwischen 0 und 4 liegen."}
-            overrides["GraphicsVR.CloudQuality"] = str(cloud_quality)
-            overrides["Graphics.CloudQuality"] = str(cloud_quality)
-
-        if not overrides:
-            return {"error": "Keine Parameter angegeben. Nutze live_weather oder cloud_quality."}
-
-        snapshot_id = _snapshot(cfg_path, "Before set_msfs_weather_settings")
-        text = cfg_path.read_text(encoding="utf-8")
-        entries = _parse_usercfg(text)
-        new_entries, not_applied = _apply_overrides(entries, overrides)
-        cfg_path.write_text(_entries_to_text(new_entries), encoding="utf-8")
-
-        quality_labels = {"0": "Aus", "1": "Niedrig", "2": "Mittel", "3": "Hoch", "4": "Ultra"}
-        return {
-            "status": "ok",
-            "angewendet": {k: v for k, v in overrides.items() if k not in not_applied},
-            "nicht_gefunden": list(not_applied),
-            "snapshot_id": snapshot_id,
-            "live_weather": ("Aktiv" if live_weather else "Deaktiviert") if live_weather is not None else "Unverändert",
-            "wolken_qualitaet": quality_labels.get(str(cloud_quality), str(cloud_quality)) if cloud_quality is not None else "Unverändert",
-            "hinweis": "Änderungen wirksam beim nächsten MSFS-Start. Rollback: restore_msfs_graphics.",
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def get_msfs_traffic_settings(usercfg_path: str = "") -> dict:
-    """Liest aktuelle MSFS Traffic-Einstellungen (KI-Flugzeuge, Online-Traffic).
-
-    Wann aufrufen: Wenn der User nach Traffic-Dichte, KI-Flugzeugen,
-    Online-Multiplayer-Flugzeugen fragt, oder wenn VR-Performance durch
-    Traffic limitiert sein könnte.
-    Trigger: 'Traffic', 'KI Flugzeuge', 'AI traffic', 'Multiplayer Dichte'.
-
-    Args:
-        usercfg_path: Optional: Pfad zur UserCfg.opt.
-
-    Returns:
-        traffic_dichte: Prozentsatz KI-Flugverkehr (0-100).
-        airline_traffic: bool — Airline-KI aktiv.
-        ga_traffic: bool — Kleinflugzeug-KI aktiv.
-        multiplayer_aktiv: bool.
-        live_players: bool — Online-Spieler sichtbar.
-        vr_empfehlung: Empfohlene Werte für VR-Performance.
-    """
-    try:
-        cfg_path = _find_usercfg(usercfg_path)
-        if not cfg_path or not cfg_path.exists():
-            return {
-                "error": "UserCfg.opt nicht gefunden.",
-                "hinweis": "MSFS einmal starten.",
-            }
-
-        current = _read_current_settings(cfg_path)
-
-        traffic_density = current.get("Traffic.AirTrafficDensity", "50")
-        airline_enabled = current.get("Traffic.AirlineTrafficEnabled", "1") == "1"
-        ga_enabled = current.get("Traffic.GeneralAviationTrafficEnabled", "1") == "1"
-        mp_enabled = current.get("Multiplayer.MultiplayerEnabled", "1") == "1"
-        live_players = current.get("Multiplayer.LivePlayersEnabled", "1") == "1"
-        ground_density = current.get("Traffic.GroundAircraftDensity", "N/A")
-        boat_density = current.get("Traffic.BoatTrafficDensity", "N/A")
-
-        try:
-            density_int = int(traffic_density)
-            if density_int == 0:
-                traffic_level = "Aus (VR-optimal)"
-            elif density_int <= 25:
-                traffic_level = "Niedrig (gut für VR)"
-            elif density_int <= 50:
-                traffic_level = "Mittel (akzeptabel)"
-            else:
-                traffic_level = "Hoch (CPU-intensiv, nicht VR-optimal)"
-        except ValueError:
-            traffic_level = traffic_density
-
-        return {
-            "traffic_dichte_prozent": traffic_density,
-            "traffic_level": traffic_level,
-            "airline_traffic_aktiv": airline_enabled,
-            "ga_traffic_aktiv": ga_enabled,
-            "boden_traffic": ground_density,
-            "boot_traffic": boat_density,
-            "multiplayer_aktiv": mp_enabled,
-            "live_players_sichtbar": live_players,
-            "cfg_pfad": str(cfg_path),
-            "vr_empfehlung": (
-                "Für VR: traffic_dichte 0-25%, airline/GA traffic aus oder niedrig, "
-                "Multiplayer auf 'group_only'. Reduziert CPU-Last signifikant."
-            ),
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def get_vr_headset_connected() -> dict:
-    """Erkennt ob und welches VR-Headset gerade verbunden/aktiv ist.
-
-    Wann aufrufen: Wenn der User fragt ob sein VR-Headset erkannt wird,
-    bevor VR gestartet wird, oder bei VR-Verbindungsproblemen.
-    Trigger: 'Headset erkannt', 'VR Headset verbunden', 'VR nicht erkannt',
-    'Pimax gefunden', 'SteamVR status'.
-
-    Returns:
-        headset_gefunden: bool.
-        headset_typ: 'Pimax', 'SteamVR Generic', 'WMR', 'Oculus/Meta', 'Unbekannt'.
-        aktive_prozesse: Liste erkannter VR-Prozesse.
-        openxr_runtime: Aktuell registrierte OpenXR-Runtime (aus Registry).
-        empfehlung: Nächster Schritt wenn kein Headset gefunden.
-    """
-    import subprocess
-
-    vr_processes = {
-        # Pimax
-        "pimax_client.exe":    "Pimax Client",
-        "pimax_runtime.exe":   "Pimax Runtime",
-        "pimaxclient.exe":     "Pimax Client",
-        "pimaxruntime.exe":    "Pimax Runtime",
-        "pvrservice.exe":      "Pimax VR Service",
-        # SteamVR
-        "vrserver.exe":        "SteamVR Server",
-        "vrstartup.exe":       "SteamVR Startup",
-        "vrcompositor.exe":    "SteamVR Compositor",
-        "vrmonitor.exe":       "SteamVR Monitor",
-        # WMR / OpenXR Tools
-        "mixedreality.exe":    "WMR Portal",
-        "holographicshell.exe":"WMR Shell",
-        # Meta / Oculus
-        "oculusclient.exe":    "Meta/Oculus Client",
-        "ovrserver.exe":       "Oculus VR Server",
-        "ovrservice.exe":      "Oculus Service",
-        # OpenXR
-        "openxrexplorer.exe":  "OpenXR Explorer",
-    }
-
-    found: list[dict] = []
-
-    try:
-        result = subprocess.run(
-            ["tasklist", "/fo", "csv", "/nh"],
-            capture_output=True, text=True, timeout=5
-        )
-        running = {line.split(",")[0].strip('"').lower() for line in result.stdout.splitlines() if line}
-        for proc, label in vr_processes.items():
-            if proc in running:
-                found.append({"prozess": proc, "bezeichnung": label})
-    except Exception:
-        pass
-
-    # Detect headset family
-    names = {f["bezeichnung"] for f in found}
-    if any("Pimax" in n for n in names):
-        headset_typ = "Pimax"
-    elif any("SteamVR" in n for n in names):
-        headset_typ = "SteamVR Generic"
-    elif any("WMR" in n for n in names):
-        headset_typ = "Windows Mixed Reality"
-    elif any("Oculus" in n or "Meta" in n for n in names):
-        headset_typ = "Meta/Oculus"
-    else:
-        headset_typ = "Nicht erkannt"
-
-    # Read active OpenXR runtime from registry
-    openxr_runtime = "Unbekannt"
-    try:
-        import winreg
-        key = winreg.OpenKey(
-            winreg.HKEY_LOCAL_MACHINE,
-            r"SOFTWARE\Khronos\OpenXR\1",
-        )
-        val, _ = winreg.QueryValueEx(key, "ActiveRuntime")
-        openxr_runtime = str(val)
-        winreg.CloseKey(key)
-    except Exception:
-        pass
-
-    headset_gefunden = len(found) > 0
-
-    empfehlung = ""
-    if not headset_gefunden:
-        empfehlung = (
-            "Kein VR-Headset erkannt. Prüfe: "
-            "1) Pimax Client starten (Startmenü → Pimax), "
-            "2) SteamVR starten (Steam → SteamVR), "
-            "3) USB-Verbindung und Treiber prüfen."
-        )
-
-    return {
-        "headset_gefunden": headset_gefunden,
-        "headset_typ": headset_typ,
-        "aktive_vr_prozesse": found,
-        "anzahl_prozesse": len(found),
-        "openxr_runtime": openxr_runtime,
-        "empfehlung": empfehlung,
-    }
-
-
-@mcp.tool()
-def restart_steamvr() -> dict:
-    """Beendet und startet SteamVR neu.
-
-    Wann aufrufen: Wenn SteamVR abgestürzt ist, eingefroren ist,
-    der User 'SteamVR neustarten' sagt, oder nach VR-Einstellungsänderungen
-    die einen Neustart erfordern.
-    Trigger: 'SteamVR neustart', 'SteamVR hängt', 'SteamVR neu starten'.
-
-    NUR nach expliziter User-Bestätigung aufrufen — beendet laufende VR-Session.
-
-    Returns:
-        status, beendete_prozesse, gestartet, steamvr_pfad, hinweis.
-    """
-    import subprocess
-    import time
-
-    steamvr_processes = [
-        "vrserver.exe",
-        "vrcompositor.exe",
-        "vrdashboard.exe",
-        "vrmonitor.exe",
-        "vrstartup.exe",
-        "vrwebhelper.exe",
-        "vrservice.exe",
-    ]
-
-    # Step 1: Kill all SteamVR processes
-    killed = []
-    for proc in steamvr_processes:
-        try:
-            result = subprocess.run(
-                ["taskkill", "/f", "/im", proc],
-                capture_output=True, text=True, timeout=5
-            )
-            if result.returncode == 0:
-                killed.append(proc)
-        except Exception:
-            pass
-
-    if killed:
-        time.sleep(2)  # Give OS time to clean up
-
-    # Step 2: Find SteamVR startup executable
-    steamvr_paths = [
-        r"C:\Program Files (x86)\Steam\steamapps\common\SteamVR\bin\win64\vrstartup.exe",
-        r"C:\Program Files\Steam\steamapps\common\SteamVR\bin\win64\vrstartup.exe",
-    ]
-
-    # Check registry for Steam install path
-    try:
-        import winreg
-        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Valve\Steam")
-        steam_path, _ = winreg.QueryValueEx(key, "InstallPath")
-        winreg.CloseKey(key)
-        registry_path = os.path.join(
-            steam_path, "steamapps", "common", "SteamVR", "bin", "win64", "vrstartup.exe"
-        )
-        steamvr_paths.insert(0, registry_path)
-    except Exception:
-        pass
-
-    vrstartup = next((p for p in steamvr_paths if os.path.exists(p)), None)
-
-    # Step 3: Start SteamVR
-    started = False
-    if vrstartup:
-        try:
-            subprocess.Popen(
-                [vrstartup],
-                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
-            )
-            started = True
-        except Exception as start_err:
-            return {
-                "status": "error",
-                "beendete_prozesse": killed,
-                "fehler": f"Konnte SteamVR nicht starten: {start_err}",
-                "steamvr_pfad": vrstartup,
-            }
-    else:
-        return {
-            "status": "warning",
-            "beendete_prozesse": killed,
-            "gestartet": False,
-            "hinweis": (
-                "SteamVR-Prozesse beendet, aber vrstartup.exe nicht gefunden. "
-                "SteamVR manuell über Steam starten."
-            ),
-        }
+            results["reshade"] = {"status": "skipped", "grund": "ReShade nicht gefunden"}
 
     return {
         "status": "ok",
-        "beendete_prozesse": killed,
-        "anzahl_beendet": len(killed),
-        "gestartet": started,
-        "steamvr_pfad": vrstartup,
-        "hinweis": "SteamVR wird neu gestartet. Bitte 10-15 Sekunden warten.",
+        "ergebnis": results,
+        "hinweis": (
+            "Alle Farbeinstellungen auf neutral zurückgesetzt. "
+            "OpenXR: wirksam bei nächstem VR-Start. "
+            "ReShade + Pimax: sofort wirksam. "
+            "Verwende apply_vr_color_profile um GPU-optimierte Farben anzuwenden."
+        ),
     }
 
 
 @mcp.tool()
-def get_gpu_overclock_status() -> dict:
-    """Prüft ob die GPU aktuell übertaktet ist (via MSI Afterburner Registry oder NVML).
+def check_nvidia_mcp_server_update() -> dict:
+    """Check whether a newer version of the nvidia-mcp SERVER SOFTWARE itself (this MCP server, file: server.py) is available on GitHub.
 
-    Wann aufrufen: Wenn der User fragt ob seine GPU übertaktet ist,
-    bei GPU-Stabilitätsproblemen, oder vor Treiberinstallation.
-    Trigger: 'Übertaktung', 'OC Status', 'GPU Boost', 'Afterburner', 'overclock'.
+    USE THIS when the user asks any of:
+      - "Gibt es ein neues Update für den MCP-Server / nvidia-mcp / diesen Server?"
+      - "Is there a new version of the MCP server?"
+      - "Check for nvidia-mcp updates"
+      - "Server aktualisieren?"
 
-    Returns:
-        übertaktet: bool.
-        kern_offset_mhz: Aktueller Kern-Takt-Offset (MSI Afterburner).
-        speicher_offset_mhz: Speicher-Takt-Offset.
-        afterburner_gefunden: bool — MSI Afterburner installiert.
-        basis_takt_mhz: GPU Basistakt (NVML).
-        aktueller_takt_mhz: Aktuell gemessener Takt (NVML).
-        hinweis: Empfehlung für Stabilität.
+    DO NOT USE THIS for: NVIDIA graphics driver updates (use check_and_install_driver),
+    Windows Updates, MSFS patches, ReShade updates, game updates, or any other software.
+    This tool only checks the GitHub Releases of the nvidia-mcp server itself.
+
+    Note: when running inside GameCopilot, the host application also updates this server
+    automatically on each launch — the user does not need to run install_nvidia_mcp_server_update
+    manually unless running this MCP server standalone.
+
+    Returns: {"status": "current" | "update_available" | "error", "current_version": "...", "latest_version": "...", ...}
     """
-    afterburner_found = False
-    core_offset = 0
-    mem_offset = 0
-    ab_profile = "N/A"
-
-    # Check MSI Afterburner via Registry
-    try:
-        import winreg
-        ab_key_path = r"SOFTWARE\WOW6432Node\MSI\Afterburner"
-        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, ab_key_path)
-        afterburner_found = True
-
-        # Try to read current overclocking profile
-        try:
-            core_offset_val, _ = winreg.QueryValueEx(key, "CoreClockOffset")
-            core_offset = int(core_offset_val)
-        except Exception:
-            pass
-        try:
-            mem_offset_val, _ = winreg.QueryValueEx(key, "MemoryClockOffset")
-            mem_offset = int(mem_offset_val)
-        except Exception:
-            pass
-        try:
-            profile_val, _ = winreg.QueryValueEx(key, "LastUsedProfile")
-            ab_profile = str(profile_val)
-        except Exception:
-            pass
-
-        winreg.CloseKey(key)
-    except Exception:
-        pass
-
-    # Get base and actual clocks via NVML
-    base_clock = 0
-    current_clock = 0
-    vram_clock = 0
-    nvml_error = ""
-
-    try:
-        import pynvml  # type: ignore
-        pynvml.nvmlInit()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-
-        try:
-            base_clock = pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_GRAPHICS)
-        except Exception:
-            pass
-        try:
-            current_clock = pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_SM)
-        except Exception:
-            pass
-        try:
-            vram_clock = pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_MEM)
-        except Exception:
-            pass
-
-        pynvml.nvmlShutdown()
-    except Exception as e:
-        nvml_error = str(e)
-
-    # Determine OC status
-    is_overclocked = (
-        (afterburner_found and (abs(core_offset) > 0 or abs(mem_offset) > 0))
-    )
-
-    if is_overclocked:
-        hinweis = (
-            f"GPU ist übertaktet: Core +{core_offset} MHz, Mem +{mem_offset} MHz. "
-            "Bei Instabilität (Abstürze, TDR) OC in MSI Afterburner zurücksetzen."
-        )
-    elif afterburner_found:
-        hinweis = "MSI Afterburner gefunden, aber kein aktiver Offset erkannt. GPU läuft auf Stock-Takten."
-    else:
-        hinweis = (
-            "MSI Afterburner nicht gefunden. "
-            "GPU-Übertaktungsstatus kann nicht ohne Afterburner geprüft werden. "
-            "NVML-Taktdaten zeigen Echtzeit-Boost-Frequenz."
-        )
-
-    return {
-        "übertaktet": is_overclocked,
-        "afterburner_gefunden": afterburner_found,
-        "kern_offset_mhz": core_offset,
-        "speicher_offset_mhz": mem_offset,
-        "afterburner_profil": ab_profile,
-        "aktueller_kern_takt_mhz": current_clock,
-        "aktueller_speicher_takt_mhz": vram_clock,
-        "nvml_fehler": nvml_error if nvml_error else None,
-        "hinweis": hinweis,
-    }
+    return _updater_check()
 
 
 @mcp.tool()
-def set_windows_theme(dark: bool = True) -> dict:
-    """Schaltet Windows Dark Mode / Light Mode um.
+def install_nvidia_mcp_server_update() -> dict:
+    """Download and install the newest version of the nvidia-mcp SERVER SOFTWARE itself (this MCP server, file: server.py).
 
-    Wann aufrufen: Wenn der User Windows auf Dark-Mode oder Light-Mode umschalten möchte.
-    Trigger: 'Dark Mode', 'Light Mode', 'Windows Farbe', 'Thema ändern'.
+    USE THIS when the user asks to update the MCP server:
+      - "Update den MCP-Server / installiere die neue Version"
+      - "Install nvidia-mcp update"
 
-    Args:
-        dark: True = Dark Mode aktivieren, False = Light Mode aktivieren.
+    DO NOT USE THIS for: NVIDIA graphics drivers, Windows Updates, or any other software.
+    This tool only updates the nvidia-mcp server itself.
 
-    Returns:
-        status: "ok" | "error"
-        modus: "dark" | "light"
-        hinweis: Erklärung.
+    The new version becomes active on the next server restart. The previous server.py is
+    saved as server.py.bak for rollback. SHA256 of the download is verified before swap.
+
+    Note: when running inside GameCopilot, this is normally handled automatically by the
+    host on each launch — only call this for an immediate manual update.
     """
-    try:
-        import winreg
-        key_path = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
-        value = 0 if dark else 1  # 0 = Dark, 1 = Light
-        with winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER, key_path,
-            0, winreg.KEY_SET_VALUE
-        ) as key:
-            winreg.SetValueEx(key, "AppsUseLightTheme", 0, winreg.REG_DWORD, value)
-            winreg.SetValueEx(key, "SystemUsesLightTheme", 0, winreg.REG_DWORD, value)
-        return {
-            "status": "ok",
-            "modus": "dark" if dark else "light",
-            "hinweis": (
-                "Dark Mode aktiviert. Einige Apps benötigen einen Neustart."
-                if dark else
-                "Light Mode aktiviert. Einige Apps benötigen einen Neustart."
-            ),
-        }
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
+    return _updater_apply()
 
 
 @mcp.tool()
-def get_msfs_installed_version() -> dict:
-    """Liest die installierte MSFS 2024-Version aus dem System (Registry oder EXE).
+def get_nvidia_mcp_server_version() -> dict:
+    """Return the version of the running nvidia-mcp SERVER SOFTWARE itself.
 
-    Wann aufrufen: Wenn der User fragt welche MSFS-Version installiert ist,
-    oder vor einem Update-Check.
-    Trigger: 'MSFS Version', 'welche Version', 'FS2024 installiert'.
+    USE THIS when the user asks: "Welche Version vom MCP-Server läuft?",
+    "What nvidia-mcp version am I running?", "MCP-Server-Version".
 
-    Returns:
-        version: Versionsnummer als String, z.B. "1.5.12.0".
-        quelle: Woher die Version stammt ("registry" | "exe" | "unbekannt").
-        pfad: Installationspfad (falls gefunden).
+    DO NOT USE THIS for the NVIDIA driver version, GPU info, or any other software version.
     """
-    version = "unbekannt"
-    quelle = "unbekannt"
-    pfad = ""
-
-    # 1. Try Steam registry
-    try:
-        import winreg
-        steam_apps_key = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, steam_apps_key) as base:
-            for i in range(winreg.QueryInfoKey(base)[0]):
-                try:
-                    sub_name = winreg.EnumKey(base, i)
-                    with winreg.OpenKey(base, sub_name) as sub:
-                        try:
-                            display_name, _ = winreg.QueryValueEx(sub, "DisplayName")
-                            if "Microsoft Flight Simulator" in str(display_name) and "2024" in str(display_name):
-                                try:
-                                    v, _ = winreg.QueryValueEx(sub, "DisplayVersion")
-                                    version = str(v)
-                                    quelle = "registry"
-                                except Exception:
-                                    pass
-                                try:
-                                    loc, _ = winreg.QueryValueEx(sub, "InstallLocation")
-                                    pfad = str(loc)
-                                except Exception:
-                                    pass
-                                break
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-    # 2. Try reading version from the EXE
-    if version == "unbekannt":
-        import os
-        candidates = [
-            r"C:\XboxGames\Microsoft Flight Simulator 2024\Content\FlightSimulator.exe",
-            r"C:\Program Files\WindowsApps\Microsoft.Limitless_1.0.0.0_x64__8wekyb3d8bbwe\FlightSimulator.exe",
-        ]
-        # Check Steam path from registry
-        try:
-            import winreg
-            with winreg.OpenKey(
-                winreg.HKEY_LOCAL_MACHINE,
-                r"SOFTWARE\WOW6432Node\Valve\Steam"
-            ) as k:
-                steam_path, _ = winreg.QueryValueEx(k, "InstallPath")
-                candidates.append(os.path.join(
-                    str(steam_path),
-                    "steamapps", "common",
-                    "Microsoft Flight Simulator 2024",
-                    "FlightSimulator.exe"
-                ))
-        except Exception:
-            pass
-
-        for exe in candidates:
-            if os.path.isfile(exe):
-                pfad = exe
-                try:
-                    import win32api  # type: ignore
-                    info = win32api.GetFileVersionInfo(exe, "\\")
-                    ms = info["FileVersionMS"]
-                    ls = info["FileVersionLS"]
-                    version = f"{ms >> 16}.{ms & 0xFFFF}.{ls >> 16}.{ls & 0xFFFF}"
-                    quelle = "exe"
-                except Exception:
-                    version = "gefunden (Version nicht lesbar)"
-                    quelle = "exe"
-                break
-
-    return {
-        "version": version,
-        "quelle": quelle,
-        "pfad": pfad,
-        "hinweis": "MSFS 2024 Version erfolgreich gelesen." if version != "unbekannt"
-                   else "Version konnte nicht ermittelt werden. MSFS möglicherweise nicht installiert.",
-    }
-
-
-@mcp.tool()
-def set_cpu_priority_msfs(priority: str = "high") -> dict:
-    """Setzt die CPU-Prozesspriorität von MSFS auf High oder Realtime.
-
-    Wann aufrufen: Wenn der User mehr FPS will oder MSFS auf niedrige
-    CPU-Priorität eingestellt ist. Nur wenn MSFS läuft.
-    Trigger: 'MSFS Priorität', 'CPU Priorität erhöhen', 'High Priority'.
-
-    Args:
-        priority: "high" (empfohlen) | "realtime" (vorsichtig verwenden) | "normal".
-
-    Returns:
-        status: "ok" | "error"
-        prioritaet: Gesetzte Priorität.
-        pid: Prozess-ID von MSFS.
-    """
-    import subprocess
-    priority_map = {
-        "realtime": "Realtime",
-        "high":     "High",
-        "normal":   "Normal",
-        "abovenormal": "AboveNormal",
-    }
-    wmi_priority = priority_map.get(priority.lower(), "High")
-
-    # Find MSFS process
-    ps_find = (
-        "Get-Process | Where-Object { $_.Name -match 'FlightSimulator' } "
-        "| Select-Object -First 1 -ExpandProperty Id"
-    )
-    try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps_find],
-            capture_output=True, text=True, timeout=10
-        )
-        pid_str = result.stdout.strip()
-        if not pid_str:
-            return {
-                "status": "error",
-                "error": "MSFS läuft nicht. Bitte MSFS zuerst starten.",
-            }
-        pid = int(pid_str)
-    except Exception as e:
-        return {"status": "error", "error": f"Prozess-Suche fehlgeschlagen: {e}"}
-
-    # Set priority via WMI
-    ps_set = (
-        f"$proc = Get-Process -Id {pid}; "
-        f"$proc.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::{wmi_priority}; "
-        f"Write-Output 'OK'"
-    )
-    try:
-        res = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps_set],
-            capture_output=True, text=True, timeout=10
-        )
-        if "OK" in res.stdout:
-            return {
-                "status": "ok",
-                "prioritaet": wmi_priority,
-                "pid": pid,
-                "hinweis": (
-                    f"MSFS CPU-Priorität auf {wmi_priority} gesetzt (PID {pid}). "
-                    "Gilt bis zum nächsten MSFS-Neustart."
-                ),
-            }
-        return {"status": "error", "error": res.stderr.strip() or "Unbekannter Fehler"}
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
-
-
-@mcp.tool()
-def get_msfs_addon_count(community_path: str = "") -> dict:
-    """Zählt die Anzahl der Add-ons im MSFS Community-Ordner (schnelle Version).
-
-    Wann aufrufen: Wenn der User wissen will wie viele Add-ons installiert sind,
-    ohne die komplette Liste zu laden.
-    Trigger: 'Addon Anzahl', 'wie viele Mods', 'Community Ordner Größe'.
-
-    Args:
-        community_path: Optionaler Pfad zum Community-Ordner. Wird automatisch erkannt falls leer.
-
-    Returns:
-        anzahl: Anzahl der Add-on-Ordner.
-        pfad: Genutzter Community-Ordner-Pfad.
-        gesamt_groesse_mb: Gesamtgröße in MB.
-    """
-    import os
-
-    if not community_path:
-        # Auto-detect community folder
-        candidates = [
-            os.path.join(os.environ.get("APPDATA", ""), "Microsoft Flight Simulator 2024", "Packages", "Community"),
-            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft Flight Simulator 2024", "Packages", "Community"),
-        ]
-        community_path = next((p for p in candidates if os.path.isdir(p)), "")
-
-    if not community_path or not os.path.isdir(community_path):
-        return {
-            "status": "error",
-            "error": "Community-Ordner nicht gefunden.",
-            "hinweis": "Bitte community_path angeben.",
-        }
-
-    try:
-        entries = [e for e in os.scandir(community_path) if e.is_dir()]
-        anzahl = len(entries)
-
-        # Quick size estimate (only top-level)
-        total_bytes = sum(e.stat().st_size for e in os.scandir(community_path))
-        groesse_mb = round(total_bytes / (1024 * 1024), 1)
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
-
-    return {
-        "status": "ok",
-        "anzahl": anzahl,
-        "pfad": community_path,
-        "gesamt_groesse_mb": groesse_mb,
-        "hinweis": f"{anzahl} Add-ons im Community-Ordner gefunden.",
-    }
-
-
-@mcp.tool()
-def set_steamvr_supersampling(value: float = 1.0) -> dict:
-    """Setzt den SteamVR Supersampling-Wert (renderResolution / supersampleScale).
-
-    Wann aufrufen: Wenn der User direkt die Renderauflösung in SteamVR ändern will.
-    Trigger: 'SteamVR Supersampling', 'SS Wert', 'Renderauflösung SteamVR'.
-
-    Args:
-        value: Supersampling-Faktor, z.B. 1.0 = 100%, 1.5 = 150%, 2.0 = 200%.
-               Empfohlen: 1.0–1.5 für Pimax MSFS VR.
-
-    Returns:
-        status: "ok" | "error"
-        neuer_wert: Gesetzter SS-Wert.
-    """
-    return set_steamvr_setting(setting="supersampling", value=str(value))
-
-
-@mcp.tool()
-def get_pimax_play_version() -> dict:
-    """Liest die installierte Pimax Play / PiTool Version aus Registry oder EXE.
-
-    Wann aufrufen: Wenn der User nach der Pimax-Software-Version fragt,
-    oder vor Firmware-Updates.
-    Trigger: 'Pimax Play Version', 'PiTool Version', 'Pimax Software'.
-
-    Returns:
-        version: Versionsnummer als String.
-        software: "Pimax Play" | "PiTool" | "unbekannt".
-        pfad: Installationspfad.
-    """
-    import os
-
-    version = "unbekannt"
-    software = "unbekannt"
-    pfad = ""
-
-    try:
-        import winreg
-
-        # 1. Try Pimax Play
-        for key_path in [
-            r"SOFTWARE\Pimax\PimaxPlay",
-            r"SOFTWARE\WOW6432Node\Pimax\PimaxPlay",
-        ]:
-            try:
-                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as k:
-                    try:
-                        v, _ = winreg.QueryValueEx(k, "Version")
-                        version = str(v)
-                    except Exception:
-                        pass
-                    try:
-                        loc, _ = winreg.QueryValueEx(k, "InstallDir")
-                        pfad = str(loc)
-                    except Exception:
-                        pass
-                    software = "Pimax Play"
-                    break
-            except Exception:
-                pass
-
-        # 2. Try PiTool
-        if software == "unbekannt":
-            for key_path in [
-                r"SOFTWARE\Pimax\PiTool",
-                r"SOFTWARE\WOW6432Node\Pimax\PiTool",
-            ]:
-                try:
-                    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as k:
-                        try:
-                            v, _ = winreg.QueryValueEx(k, "Version")
-                            version = str(v)
-                        except Exception:
-                            pass
-                        try:
-                            loc, _ = winreg.QueryValueEx(k, "InstallDir")
-                            pfad = str(loc)
-                        except Exception:
-                            pass
-                        software = "PiTool"
-                        break
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-    # 3. Fallback: check common EXE paths
-    if software == "unbekannt":
-        exe_candidates = [
-            r"C:\Program Files\Pimax\PimaxPlay\PimaxPlay.exe",
-            r"C:\Program Files\Pimax\PimaxClient\pimaxui\PimaxClient.exe",
-            r"C:\Program Files (x86)\PiTool\PiServiceLauncher.exe",
-        ]
-        for exe in exe_candidates:
-            if os.path.isfile(exe):
-                pfad = exe
-                software = "Pimax Play" if "PimaxPlay" in exe else "PiTool"
-                version = "gefunden (Version nicht lesbar)"
-                break
-
-    return {
-        "version": version,
-        "software": software,
-        "pfad": pfad,
-        "hinweis": f"{software} {version} gefunden." if software != "unbekannt"
-                   else "Keine Pimax-Software gefunden. Pimax Play oder PiTool installieren.",
-    }
-
-
-@mcp.tool()
-def take_vr_screenshot() -> dict:
-    """Löst einen MSFS-Screenshot per Tastendruck aus (F12 / PrintScreen).
-
-    Wann aufrufen: Wenn der User einen Screenshot machen möchte während MSFS läuft.
-    Trigger: 'Screenshot', 'Foto machen', 'Bild aufnehmen'.
-
-    Returns:
-        status: "ok" | "error"
-        taste: Genutzte Taste.
-        hinweis: Wo der Screenshot gespeichert wird.
-    """
-    import subprocess
-
-    # Check if MSFS is running first
-    ps_check = "Get-Process | Where-Object { $_.Name -match 'FlightSimulator' } | Measure-Object | Select-Object -ExpandProperty Count"
-    try:
-        r = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps_check],
-            capture_output=True, text=True, timeout=8
-        )
-        count = int(r.stdout.strip() or "0")
-        if count == 0:
-            return {
-                "status": "error",
-                "error": "MSFS läuft nicht. Screenshot nicht möglich.",
-            }
-    except Exception as e:
-        return {"status": "error", "error": f"Prozess-Check fehlgeschlagen: {e}"}
-
-    # Send PrintScreen key to the focused window
-    ps_key = (
-        "Add-Type -AssemblyName System.Windows.Forms; "
-        "[System.Windows.Forms.SendKeys]::SendWait('{PRTSC}'); "
-        "Write-Output 'OK'"
-    )
-    try:
-        res = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps_key],
-            capture_output=True, text=True, timeout=10
-        )
-        if "OK" in res.stdout:
-            return {
-                "status": "ok",
-                "taste": "PrintScreen",
-                "hinweis": (
-                    "Screenshot-Taste gesendet. Das Bild wird in MSFS unter "
-                    "Dokumente\\Microsoft Flight Simulator 2024\\Screenshots gespeichert."
-                ),
-            }
-        return {"status": "error", "error": res.stderr.strip()}
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
-
-
-@mcp.tool()
-def open_msfs_devmode(enable: bool = True, usercfg_path: str = "") -> dict:
-    """Aktiviert oder deaktiviert den MSFS Developer Mode in UserCfg.opt.
-
-    Wann aufrufen: Wenn der User den Developer Mode ein- oder ausschalten will
-    (z.B. für FPS-Anzeige in MSFS oder Add-on-Entwicklung).
-    Trigger: 'DevMode', 'Developer Mode', 'FPS Zähler MSFS', 'Entwicklermodus'.
-
-    Args:
-        enable: True = DevMode aktivieren, False = deaktivieren.
-        usercfg_path: Optionaler Pfad zu UserCfg.opt.
-
-    Returns:
-        status: "ok" | "error"
-        dev_mode: Neuer Wert ("1" oder "0").
-    """
-    cfg_path = _find_usercfg(usercfg_path)
-    if not cfg_path or not cfg_path.exists():
-        return {
-            "status": "error",
-            "error": "UserCfg.opt nicht gefunden. MSFS muss mindestens einmal gestartet worden sein.",
-        }
-
-    try:
-        content = cfg_path.read_text(encoding="utf-8", errors="replace")
-        new_value = "1" if enable else "0"
-
-        import re as _re
-        if _re.search(r'DevMode\s+\d', content):
-            new_content = _re.sub(r'(DevMode\s+)\d', rf'\g<1>{new_value}', content)
-        else:
-            # Append DevMode setting
-            new_content = content.rstrip() + f"\nDevMode {new_value}\n"
-
-        cfg_path.write_text(new_content, encoding="utf-8")
-        _invalidate_usercfg_cache()
-
-        return {
-            "status": "ok",
-            "dev_mode": new_value,
-            "pfad": str(cfg_path),
-            "hinweis": (
-                "Developer Mode aktiviert. In MSFS: Optionen → Allgemein → Entwicklermodus. "
-                "Ermöglicht FPS-Overlay (Strg+F in MSFS)."
-                if enable else
-                "Developer Mode deaktiviert."
-            ),
-        }
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
-
-
-@mcp.tool()
-def get_frame_generation_status(usercfg_path: str = "") -> dict:
-    """Prüft ob DLSS Frame Generation oder FSR Frame Generation in MSFS aktiviert ist.
-
-    Wann aufrufen: Wenn der User nach Frame Generation fragt oder FG-Probleme
-    diagnostiziert werden sollen.
-    Trigger: 'Frame Generation', 'DLSS FG', 'FSR FG', 'Framegen Status'.
-
-    Returns:
-        frame_generation_aktiv: bool.
-        dlss_modus: Aktueller DLSS-Modus.
-        upscaling_typ: "DLSS" | "FSR" | "XeSS" | "deaktiviert".
-    """
-    cfg_path = _find_usercfg(usercfg_path)
-    if not cfg_path or not cfg_path.exists():
-        return {
-            "status": "error",
-            "error": "UserCfg.opt nicht gefunden.",
-        }
-
-    try:
-        import re as _re
-        content = cfg_path.read_text(encoding="utf-8", errors="replace")
-
-        # Frame generation flag
-        fg_match = _re.search(r'FrameGeneration\s+(\d+)', content)
-        fg_aktiv = fg_match and fg_match.group(1) == "1"
-
-        # Upscaling type (DLSS=1, FSR=2, XeSS=3, TAA=0)
-        up_match = _re.search(r'UpscalingMode\s+(\d+)', content)
-        up_code = int(up_match.group(1)) if up_match else -1
-        upscaling_map = {0: "TAA (kein Upscaling)", 1: "DLSS", 2: "FSR", 3: "XeSS", -1: "unbekannt"}
-        upscaling_typ = upscaling_map.get(up_code, "unbekannt")
-
-        # DLSS mode (Quality=0, Balanced=1, Performance=2, Ultra Performance=3)
-        dlss_match = _re.search(r'DlssQualityMode\s+(\d+)', content)
-        dlss_code = int(dlss_match.group(1)) if dlss_match else -1
-        dlss_map = {0: "Quality", 1: "Balanced", 2: "Performance", 3: "Ultra Performance", -1: "unbekannt"}
-        dlss_modus = dlss_map.get(dlss_code, "unbekannt")
-
-        return {
-            "status": "ok",
-            "frame_generation_aktiv": bool(fg_aktiv),
-            "upscaling_typ": upscaling_typ,
-            "dlss_modus": dlss_modus if upscaling_typ == "DLSS" else "—",
-            "hinweis": (
-                f"Frame Generation ist {'aktiviert' if fg_aktiv else 'deaktiviert'}. "
-                f"Upscaling: {upscaling_typ}."
-            ),
-        }
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
-
-
-@mcp.tool()
-def set_frame_generation(enable: bool = True, usercfg_path: str = "") -> dict:
-    """Aktiviert oder deaktiviert MSFS Frame Generation (DLSS FG / FSR FG).
-
-    Wann aufrufen: Wenn der User Frame Generation ein- oder ausschalten will.
-    MSFS muss neu gestartet werden damit die Änderung wirkt.
-    Trigger: 'Frame Generation aktivieren', 'FG einschalten', 'DLSS FG aus'.
-
-    Args:
-        enable: True = Frame Generation aktivieren, False = deaktivieren.
-        usercfg_path: Optionaler Pfad zu UserCfg.opt.
-
-    Returns:
-        status: "ok" | "error"
-        frame_generation: Neuer Wert ("1" oder "0").
-    """
-    cfg_path = _find_usercfg(usercfg_path)
-    if not cfg_path or not cfg_path.exists():
-        return {
-            "status": "error",
-            "error": "UserCfg.opt nicht gefunden.",
-        }
-
-    try:
-        import re as _re
-        content = cfg_path.read_text(encoding="utf-8", errors="replace")
-        new_value = "1" if enable else "0"
-
-        if _re.search(r'FrameGeneration\s+\d', content):
-            new_content = _re.sub(
-                r'(FrameGeneration\s+)\d',
-                rf'\g<1>{new_value}',
-                content
-            )
-        else:
-            new_content = content.rstrip() + f"\nFrameGeneration {new_value}\n"
-
-        cfg_path.write_text(new_content, encoding="utf-8")
-        _invalidate_usercfg_cache()
-
-        return {
-            "status": "ok",
-            "frame_generation": new_value,
-            "pfad": str(cfg_path),
-            "hinweis": (
-                "Frame Generation aktiviert. MSFS neu starten damit die Änderung wirkt. "
-                "Benötigt DLSS oder FSR als Upscaling-Modus."
-                if enable else
-                "Frame Generation deaktiviert. MSFS neu starten."
-            ),
-        }
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
-
-
-# ---------------------------------------------------------------------------
-# ReShade — complete support optimised for MSFS VR
-# ---------------------------------------------------------------------------
-
-import configparser as _rs_configparser
-import glob as _glob
-import shutil as _sh
-import struct as _struct
-
-_RESHADE_MSFS_PATHS: list[Path] = [
-    # MSFS 2024 MS Store
-    Path(os.environ.get("LOCALAPPDATA", ""))
-    / "Packages/Microsoft.Limitless_8wekyb3d8bbwe/LocalCache",
-    # MSFS 2020 MS Store
-    Path(os.environ.get("LOCALAPPDATA", ""))
-    / "Packages/Microsoft.FlightSimulator_8wekyb3d8bbwe/LocalCache",
-    # MSFS 2024 Steam
-    Path("C:/Program Files (x86)/Steam/steamapps/common/MicrosoftFlightSimulator2024"),
-    # MSFS 2020 Steam
-    Path("C:/Program Files (x86)/Steam/steamapps/common/MicrosoftFlightSimulator"),
-    # Boxed / retail
-    Path("C:/Program Files/Microsoft Flight Simulator 2024"),
-    Path("C:/Program Files/Microsoft Flight Simulator"),
-]
-
-# Wildcard paths resolved via glob
-_RESHADE_GLOB_PATTERNS: list[str] = [
-    "C:/Program Files/WindowsApps/Microsoft.Limitless_*",
-    "C:/Program Files/WindowsApps/Microsoft.FlightSimulator_*",
-]
-
-# Effects whose names hint at high GPU cost
-_RESHADE_HEAVY_EFFECTS = {"rtgi", "dof", "ssr", "mxao", "adof", "godrays", "bloom"}
-_RESHADE_LIGHT_EFFECTS = {"cas", "lut", "smaa", "fxaa", "levels", "colorcorrection",
-                          "clarity", "vibrance", "curves"}
-
-
-def _rs_locate_ini() -> "Path | None":
-    """Search all known MSFS install locations for ReShade.ini."""
-    candidates: list[Path] = list(_RESHADE_MSFS_PATHS)
-    for pattern in _RESHADE_GLOB_PATTERNS:
-        try:
-            candidates.extend(Path(p) for p in _glob.glob(pattern))
-        except Exception:
-            pass
-
-    for base in candidates:
-        ini = base / "ReShade.ini"
-        if ini.exists():
-            return ini
-
-    # Fallback: scan APPDATA / LOCALAPPDATA trees one level deep
-    for env_var in ("LOCALAPPDATA", "APPDATA"):
-        root = Path(os.environ.get(env_var, ""))
-        if not root.exists():
-            continue
-        for child in root.iterdir():
-            ini = child / "ReShade.ini"
-            if ini.exists():
-                return ini
-    return None
-
-
-def _rs_load_ini() -> "tuple[_rs_configparser.ConfigParser, Path | None]":
-    """Return (parsed ConfigParser, path).  Path is None if not found."""
-    path = _rs_locate_ini()
-    cp = _rs_configparser.ConfigParser(strict=False, allow_no_value=True)
-    cp.optionxform = str  # preserve case
-    if path and path.exists():
-        try:
-            cp.read(str(path), encoding="utf-8")
-        except Exception:
-            cp.read(str(path), encoding="latin-1")
-    return cp, path
-
-
-def _rs_save_ini(cp: "_rs_configparser.ConfigParser", path: Path) -> None:
-    """Backup then overwrite ReShade.ini from configparser."""
-    try:
-        _sh.copy2(str(path), str(path.with_suffix(".bak")))
-    except Exception:
-        pass
-    with open(str(path), "w", encoding="utf-8") as fh:
-        cp.write(fh)
-
-
-def _rs_list_presets(ini_path: "Path | None" = None) -> list[Path]:
-    """Return list of .ini preset files near the ReShade install."""
-    if ini_path is None:
-        ini_path = _rs_locate_ini()
-    if ini_path is None:
-        return []
-    base = ini_path.parent
-    presets: list[Path] = []
-    for candidate in base.iterdir():
-        if candidate.suffix.lower() == ".ini" and candidate.name != "ReShade.ini":
-            presets.append(candidate)
-    # Also check a "reshade-presets" sub-folder
-    preset_dir = base / "reshade-presets"
-    if preset_dir.is_dir():
-        presets.extend(preset_dir.glob("*.ini"))
-    return presets
-
-
-def _get_file_version(dll_path: Path) -> str:
-    """Read PE file version string from a DLL (Windows only)."""
-    try:
-        import ctypes
-        from ctypes import wintypes
-        ver_size = ctypes.windll.version.GetFileVersionInfoSizeW(str(dll_path), None)
-        if not ver_size:
-            return "unknown"
-        buf = ctypes.create_string_buffer(ver_size)
-        ctypes.windll.version.GetFileVersionInfoW(str(dll_path), None, ver_size, buf)
-        sub_block = "\\".encode("utf-16-le")
-        lp_buffer = ctypes.c_void_p()
-        pu_len = ctypes.c_uint()
-        ctypes.windll.version.VerQueryValueW(
-            buf, "\\", ctypes.byref(lp_buffer), ctypes.byref(pu_len)
-        )
-        if pu_len.value >= 20:
-            ms = _struct.unpack_from("<I", (ctypes.c_char * 4).from_address(lp_buffer.value + 8))[0]
-            ls = _struct.unpack_from("<I", (ctypes.c_char * 4).from_address(lp_buffer.value + 12))[0]
-            return f"{ms >> 16}.{ms & 0xFFFF}.{ls >> 16}.{ls & 0xFFFF}"
-    except Exception:
-        pass
-    return "unknown"
-
-
-def _effect_cost(name: str) -> str:
-    lo = name.lower()
-    if any(h in lo for h in _RESHADE_HEAVY_EFFECTS):
-        return "high"
-    if any(l in lo for l in _RESHADE_LIGHT_EFFECTS):
-        return "low"
-    return "medium"
-
-
-def _parse_techniques(techniques_str: str) -> list[str]:
-    """Split a ReShade Techniques= value into individual effect names."""
-    if not techniques_str:
-        return []
-    parts = [t.strip() for t in techniques_str.replace(",", "@").split("@") if t.strip()]
-    # Each part can be "EffectName" or "EffectName@file.fx" — keep the name part
-    names = []
-    for p in parts:
-        names.append(p.split("@")[0] if "@" in p else p)
-    return names
-
-
-@mcp.tool()
-def get_reshade_status() -> dict:
-    """Checks whether ReShade is installed for MSFS and returns a quick status overview.
-
-    Wann aufrufen: Wenn der User fragt ob ReShade installiert ist, wie ReShade läuft,
-    oder ob ReShade für VR konfiguriert ist.
-    Trigger: 'ReShade Status', 'ist ReShade installiert', 'ReShade check'.
-
-    Returns:
-        installed: bool
-        ini_path: str
-        version: ReShade DLL version string
-        current_preset: active preset file name
-        performance_mode: bool
-        depth_reversed_configured: bool (RESHADE_DEPTH_INPUT_IS_REVERSED=1)
-        active_effects_count: int
-        effects_folder_count: int — number of .fx files found
-    """
-    try:
-        cp, ini_path = _rs_load_ini()
-
-        if ini_path is None or not ini_path.exists():
-            return {
-                "installed": False,
-                "ini_path": None,
-                "message": "ReShade.ini not found in any known MSFS install path.",
-            }
-
-        base = ini_path.parent
-        # Detect version from DLL
-        version = "unknown"
-        for dll_name in ("dxgi.dll", "d3d11.dll", "openxr_api_layer.dll"):
-            dll = base / dll_name
-            if dll.exists():
-                version = _get_file_version(dll)
-                break
-
-        general = cp["GENERAL"] if cp.has_section("GENERAL") else {}
-        depth = cp["DEPTH"] if cp.has_section("DEPTH") else {}
-
-        preset_path_raw = general.get("PresetPath", "")
-        preset_name = Path(preset_path_raw).name if preset_path_raw else "none"
-
-        perf_mode = general.get("PerformanceMode", "0") == "1"
-
-        # Check preprocessor for depth reversed flag
-        preprocessor = general.get("PreprocessorDefinitions", "")
-        depth_reversed = "RESHADE_DEPTH_INPUT_IS_REVERSED=1" in preprocessor
-
-        # Count .fx shaders
-        fx_count = len(list(base.rglob("*.fx")))
-
-        # Count active effects from current preset
-        active_count = 0
-        if preset_path_raw:
-            preset_p = Path(preset_path_raw)
-            if not preset_p.is_absolute():
-                preset_p = base / preset_path_raw
-            if preset_p.exists():
-                pcp = _rs_configparser.ConfigParser(strict=False)
-                pcp.optionxform = str
-                try:
-                    pcp.read(str(preset_p), encoding="utf-8")
-                except Exception:
-                    pass
-                for sec in pcp.sections():
-                    techs = pcp.get(sec, "Techniques", fallback="")
-                    active_count += len(_parse_techniques(techs))
-
-        return {
-            "installed": True,
-            "ini_path": str(ini_path),
-            "version": version,
-            "current_preset": preset_name,
-            "performance_mode": perf_mode,
-            "depth_reversed_configured": depth_reversed,
-            "active_effects_count": active_count,
-            "effects_folder_count": fx_count,
-            "vr_ready": perf_mode and depth_reversed,
-            "recommendation": (
-                "ReShade is well configured for VR."
-                if perf_mode and depth_reversed
-                else "Run optimize_reshade_for_vr() for optimal MSFS VR performance."
-            ),
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def get_reshade_settings() -> dict:
-    """Read all current ReShade.ini settings and the active preset's effect list.
-
-    Wann aufrufen: Wenn der User die aktuellen ReShade-Einstellungen sehen will
-    oder wissen will welche Effekte aktiv sind.
-    Trigger: 'ReShade Einstellungen', 'ReShade settings', 'welche ReShade Effekte'.
-
-    Returns full [GENERAL], [DEPTH], any [VR]/[OPENXR] section, plus active preset effects.
-    """
-    try:
-        cp, ini_path = _rs_load_ini()
-        if ini_path is None:
-            return {"error": "ReShade.ini not found."}
-
-        result: dict = {"ini_path": str(ini_path), "sections": {}}
-        for section in cp.sections():
-            result["sections"][section] = dict(cp[section])
-
-        # Parse active preset
-        general = cp["GENERAL"] if cp.has_section("GENERAL") else {}
-        preset_raw = general.get("PresetPath", "")
-        preset_info: dict = {"path": preset_raw, "effects": []}
-        if preset_raw:
-            preset_p = Path(preset_raw)
-            if not preset_p.is_absolute():
-                preset_p = ini_path.parent / preset_raw
-            if preset_p.exists():
-                pcp = _rs_configparser.ConfigParser(strict=False)
-                pcp.optionxform = str
-                try:
-                    pcp.read(str(preset_p), encoding="utf-8")
-                except Exception:
-                    pass
-                for sec in pcp.sections():
-                    techs_str = pcp.get(sec, "Techniques", fallback="")
-                    for eff in _parse_techniques(techs_str):
-                        preset_info["effects"].append({
-                            "name": eff,
-                            "cost": _effect_cost(eff),
-                        })
-                preset_info["effect_count"] = len(preset_info["effects"])
-
-        result["active_preset"] = preset_info
-        return result
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def set_reshade_performance_mode(enabled: bool) -> dict:
-    """Enable or disable ReShade performance mode (strongly recommended ON for VR).
-
-    Performance mode compiles shaders once and hides the overlay — critical for VR FPS.
-    Disabling allows live shader editing but costs significant GPU time.
-
-    Wann aufrufen: Wenn der User ReShade Performance-Modus ein- oder ausschalten will,
-    oder wenn VR-Performance durch ReShade beeinträchtigt ist.
-    Trigger: 'ReShade Performance Modus', 'ReShade schneller machen', 'ReShade VR Performance'.
-
-    Args:
-        enabled: True = performance mode ON (recommended for VR), False = OFF.
-
-    Returns:
-        status, previous value, new value, recommendation.
-    """
-    try:
-        cp, ini_path = _rs_load_ini()
-        if ini_path is None:
-            return {"error": "ReShade.ini not found."}
-
-        if not cp.has_section("GENERAL"):
-            cp.add_section("GENERAL")
-
-        prev = cp.get("GENERAL", "PerformanceMode", fallback="0")
-        cp.set("GENERAL", "PerformanceMode", "1" if enabled else "0")
-        _rs_save_ini(cp, ini_path)
-
-        return {
-            "status": "ok",
-            "previous_value": prev,
-            "new_value": "1" if enabled else "0",
-            "performance_mode_enabled": enabled,
-            "recommendation": (
-                "Performance mode ON — ReShade will not impact VR frame-time during flight."
-                if enabled
-                else "Performance mode OFF — shader editing enabled but VR FPS may drop."
-            ),
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def get_reshade_presets() -> dict:
-    """List all available ReShade preset files and their enabled effects.
-
-    Wann aufrufen: Wenn der User wissen will welche ReShade Presets vorhanden sind
-    oder zwischen Presets wechseln will.
-    Trigger: 'ReShade Presets', 'ReShade Profile', 'welche ReShade Presets gibt es'.
-
-    Returns list of presets with: name, path, active, effect_count, file_size_kb, effects.
-    """
-    try:
-        cp, ini_path = _rs_load_ini()
-        if ini_path is None:
-            return {"error": "ReShade.ini not found."}
-
-        general = cp["GENERAL"] if cp.has_section("GENERAL") else {}
-        active_path = general.get("PresetPath", "")
-
-        presets = _rs_list_presets(ini_path)
-        result_list = []
-
-        for p in presets:
-            pcp = _rs_configparser.ConfigParser(strict=False)
-            pcp.optionxform = str
-            try:
-                pcp.read(str(p), encoding="utf-8")
-            except Exception:
-                continue
-
-            effects = []
-            for sec in pcp.sections():
-                techs_str = pcp.get(sec, "Techniques", fallback="")
-                for eff in _parse_techniques(techs_str):
-                    effects.append({"name": eff, "cost": _effect_cost(eff)})
-
-            is_active = (
-                str(p.resolve()) == str(Path(active_path).resolve())
-                if active_path
-                else False
-            )
-
-            result_list.append({
-                "name": p.stem,
-                "path": str(p),
-                "active": is_active,
-                "effect_count": len(effects),
-                "file_size_kb": round(p.stat().st_size / 1024, 1),
-                "effects": effects,
-            })
-
-        return {
-            "preset_count": len(result_list),
-            "active_preset": Path(active_path).name if active_path else "none",
-            "presets": result_list,
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def set_reshade_preset(preset_name: str) -> dict:
-    """Switch ReShade to a different preset by name (without .ini extension).
-
-    Wann aufrufen: Wenn der User das ReShade Preset wechseln will.
-    Trigger: 'ReShade Preset wechseln', 'ReShade Profil laden', 'ReShade auf X umschalten'.
-
-    Args:
-        preset_name: Name of the preset (stem, e.g. 'VR_Light' or 'GameCopilot_VR').
-
-    Returns:
-        status, previous preset, new preset path.
-    """
-    try:
-        cp, ini_path = _rs_load_ini()
-        if ini_path is None:
-            return {"error": "ReShade.ini not found."}
-
-        presets = _rs_list_presets(ini_path)
-        match = None
-        for p in presets:
-            if p.stem.lower() == preset_name.lower() or p.name.lower() == preset_name.lower():
-                match = p
-                break
-
-        if match is None:
-            available = [p.stem for p in presets]
-            return {
-                "error": f"Preset '{preset_name}' not found.",
-                "available_presets": available,
-            }
-
-        if not cp.has_section("GENERAL"):
-            cp.add_section("GENERAL")
-
-        prev = cp.get("GENERAL", "PresetPath", fallback="none")
-        cp.set("GENERAL", "PresetPath", str(match))
-        _rs_save_ini(cp, ini_path)
-
-        return {
-            "status": "ok",
-            "previous_preset": Path(prev).name if prev != "none" else "none",
-            "new_preset": match.name,
-            "new_preset_path": str(match),
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def optimize_reshade_for_vr() -> dict:
-    """Optimize all ReShade settings for maximum VR performance in MSFS.
-
-    Sets performance mode ON, fixes depth buffer for MSFS, disables the overlay,
-    and provides GPU-tier-specific effect recommendations.
-
-    Wann aufrufen: Wenn der User ReShade für VR optimieren will, VR-Performance
-    durch ReShade leidet, oder ReShade in VR einstellen will.
-    Trigger: 'ReShade für VR optimieren', 'ReShade VR einstellen',
-             'ReShade performance VR', 'ReShade optimieren MSFS'.
-
-    Returns:
-        status, changes applied, GPU tier, recommended effects to disable.
-    """
-    try:
-        cp, ini_path = _rs_load_ini()
-        if ini_path is None:
-            return {"error": "ReShade.ini not found. Is ReShade installed for MSFS?"}
-
-        changes: list[str] = []
-
-        # Ensure sections exist
-        for sec in ("GENERAL", "DEPTH"):
-            if not cp.has_section(sec):
-                cp.add_section(sec)
-                changes.append(f"Created [{sec}] section")
-
-        # 1. Performance mode
-        if cp.get("GENERAL", "PerformanceMode", fallback="0") != "1":
-            cp.set("GENERAL", "PerformanceMode", "1")
-            changes.append("PerformanceMode = 1 (was 0)")
-
-        # 2. Depth buffer settings for MSFS
-        # Both keys exist across different ReShade versions — set both for compatibility
-        if cp.get("DEPTH", "DepthCopyBeforeClears", fallback="0") != "1":
-            cp.set("DEPTH", "DepthCopyBeforeClears", "1")
-            changes.append("DepthCopyBeforeClears = 1")
-
-        if cp.get("DEPTH", "CopyDepthBufferBeforeClears", fallback="0") != "1":
-            cp.set("DEPTH", "CopyDepthBufferBeforeClears", "1")
-            changes.append("CopyDepthBufferBeforeClears = 1")
-
-        if cp.get("DEPTH", "UseAspectRatioHeuristics", fallback="1") != "0":
-            cp.set("DEPTH", "UseAspectRatioHeuristics", "0")
-            changes.append("UseAspectRatioHeuristics = 0")
-
-        # 3. Preprocessor: RESHADE_DEPTH_INPUT_IS_REVERSED=1
-        existing_pre = cp.get("GENERAL", "PreprocessorDefinitions", fallback="")
-        pre_parts = [p.strip() for p in existing_pre.split(",") if p.strip()] if existing_pre else []
-        # Remove any existing RESHADE_DEPTH_INPUT_IS_REVERSED entry
-        pre_parts = [p for p in pre_parts if not p.startswith("RESHADE_DEPTH_INPUT_IS_REVERSED")]
-        pre_parts.append("RESHADE_DEPTH_INPUT_IS_REVERSED=1")
-        new_pre = ",".join(pre_parts)
-        if new_pre != existing_pre:
-            cp.set("GENERAL", "PreprocessorDefinitions", new_pre)
-            changes.append("PreprocessorDefinitions: RESHADE_DEPTH_INPUT_IS_REVERSED=1 added")
-
-        # 4. Suppress tutorial overlay
-        if cp.get("GENERAL", "TutorialProgress", fallback="0") != "4":
-            cp.set("GENERAL", "TutorialProgress", "4")
-            changes.append("TutorialProgress = 4 (overlay suppressed)")
-
-        # 5. Write
-        _rs_save_ini(cp, ini_path)
-
-        # 6. GPU-tier recommendations
-        tier = "unknown"
-        effect_advice: list[str] = []
-        try:
-            pynvml.nvmlInit()
-            try:
-                h = pynvml.nvmlDeviceGetHandleByIndex(0)
-                name = pynvml.nvmlDeviceGetName(h)
-                if isinstance(name, bytes):
-                    name = name.decode()
-                mem = pynvml.nvmlDeviceGetMemoryInfo(h)
-                vram_gb = mem.total / 1024 ** 3
-                tier = _classify_vr_tier(vram_gb, name, 8, 16)
-            finally:
-                pynvml.nvmlShutdown()
-        except Exception:
-            tier = "unknown"
-
-        if tier in ("low", "mid"):
-            effect_advice = [
-                "Disable RTGI, MXAO, DOF, SSR — too expensive for VR on your GPU tier.",
-                "Keep only CAS (sharpening) and LUT (colour grading) for best results.",
-                "Consider using the GameCopilot_VR preset (create_reshade_vr_preset).",
-            ]
-        elif tier == "mid_high":
-            effect_advice = [
-                "Disable RTGI and MXAO — too expensive.",
-                "SMAA, CAS, LUT are safe to use.",
-            ]
-        else:  # high / ultra / unknown
-            effect_advice = [
-                "Most effects are fine; avoid RTGI/MXAO in heavy VR scenarios.",
-                "Monitor GPU frame time — keep it below 11 ms for 90 Hz VR.",
-            ]
-
-        # 7. Create / update visual quality preset for beautiful VR image
-        visual_result: dict = {}
-        try:
-            _vr_tier = tier if tier in _RS_VISUAL_PROFILES else None
-            visual_result = create_reshade_vr_visual_preset(
-                style="auto", gpu_override=_vr_tier
-            )
-        except Exception as _ve:
-            visual_result = {"note": f"Visual preset creation skipped: {_ve}"}
-
-        return {
-            "status": "ok",
-            "ini_path": str(ini_path),
-            "changes_applied": changes,
-            "gpu_tier": tier,
-            "effect_recommendations": effect_advice,
-            "visual_preset": visual_result,
-            "summary": (
-                f"{len(changes)} change(s) applied. "
-                "ReShade is now optimised for MSFS VR with visual quality preset. "
-                "Restart MSFS for changes to take effect."
-            ),
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def get_reshade_effects() -> dict:
-    """List all installed ReShade shader effects with enabled status and estimated GPU cost.
-
-    Wann aufrufen: Wenn der User wissen will welche ReShade Effekte installiert sind,
-    welche Effekte aktiv sind, oder welche Effekte Performance kosten.
-    Trigger: 'ReShade Effekte', 'ReShade Shader Liste', 'welche ReShade Effekte aktiv'.
-
-    Returns list of effects: name, file, enabled_in_current_preset, cost (low/medium/high).
-    """
-    try:
-        cp, ini_path = _rs_load_ini()
-        if ini_path is None:
-            return {"error": "ReShade.ini not found."}
-
-        base = ini_path.parent
-        # Collect .fx files
-        fx_files: list[Path] = list(base.rglob("*.fx"))
-
-        # Get enabled effects from active preset
-        enabled_names: set[str] = set()
-        general = cp["GENERAL"] if cp.has_section("GENERAL") else {}
-        preset_raw = general.get("PresetPath", "")
-        if preset_raw:
-            preset_p = Path(preset_raw)
-            if not preset_p.is_absolute():
-                preset_p = base / preset_raw
-            if preset_p.exists():
-                pcp = _rs_configparser.ConfigParser(strict=False)
-                pcp.optionxform = str
-                try:
-                    pcp.read(str(preset_p), encoding="utf-8")
-                except Exception:
-                    pass
-                for sec in pcp.sections():
-                    for eff in _parse_techniques(pcp.get(sec, "Techniques", fallback="")):
-                        enabled_names.add(eff.lower())
-
-        effects = []
-        for fx in fx_files:
-            name = fx.stem
-            effects.append({
-                "name": name,
-                "file": fx.name,
-                "relative_path": str(fx.relative_to(base)),
-                "enabled_in_preset": name.lower() in enabled_names,
-                "cost": _effect_cost(name),
-            })
-
-        effects.sort(key=lambda e: (0 if e["enabled_in_preset"] else 1, e["name"]))
-
-        return {
-            "total_effects": len(effects),
-            "enabled_count": sum(1 for e in effects if e["enabled_in_preset"]),
-            "effects": effects,
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def enable_reshade_technique(technique_name: str, enabled: bool) -> dict:
-    """Enable or disable a specific ReShade effect in the currently active preset.
-
-    Wann aufrufen: Wenn der User einen bestimmten ReShade-Effekt aktivieren oder
-    deaktivieren will.
-    Trigger: 'ReShade Effekt aktivieren', 'ReShade RTGI deaktivieren',
-             'CAS einschalten ReShade', 'Effekt ausschalten ReShade'.
-
-    Args:
-        effect_name: Effect name, e.g. 'CAS', 'RTGI', 'DOF', 'SMAA'.
-        enabled: True = enable, False = disable.
-
-    Returns:
-        status, effect_name, new state, preset updated.
-    """
-    try:
-        cp, ini_path = _rs_load_ini()
-        if ini_path is None:
-            return {"error": "ReShade.ini not found."}
-
-        general = cp["GENERAL"] if cp.has_section("GENERAL") else {}
-        preset_raw = general.get("PresetPath", "")
-        if not preset_raw:
-            return {"error": "No active preset configured in ReShade.ini."}
-
-        preset_p = Path(preset_raw)
-        if not preset_p.is_absolute():
-            preset_p = ini_path.parent / preset_raw
-        if not preset_p.exists():
-            return {"error": f"Preset file not found: {preset_p}"}
-
-        pcp = _rs_configparser.ConfigParser(strict=False)
-        pcp.optionxform = str
-        try:
-            pcp.read(str(preset_p), encoding="utf-8")
-        except Exception:
-            pcp.read(str(preset_p), encoding="latin-1")
-
-        # Find the section that holds Techniques (usually first section)
-        target_section = pcp.sections()[0] if pcp.sections() else None
-        if target_section is None:
-            pcp.add_section("default")
-            target_section = "default"
-
-        raw_techs = pcp.get(target_section, "Techniques", fallback="")
-        techs = [t.strip() for t in raw_techs.split(",") if t.strip()] if raw_techs else []
-
-        # Remove existing entry for this effect (case-insensitive)
-        remaining = [t for t in techs if not t.lower().startswith(technique_name.lower())]
-        was_enabled = len(remaining) < len(techs)
-
-        if enabled:
-            # Add the effect (look for its .fx file for the full token)
-            base = ini_path.parent
-            fx_matches = list(base.rglob(f"{technique_name}.fx"))
-            if fx_matches:
-                token = f"{technique_name}@{fx_matches[0].name}"
-            else:
-                token = technique_name
-            remaining.append(token)
-
-        pcp.set(target_section, "Techniques", ",".join(remaining))
-
-        try:
-            _sh.copy2(str(preset_p), str(preset_p.with_suffix(".bak")))
-        except Exception:
-            pass
-        with open(str(preset_p), "w", encoding="utf-8") as fh:
-            pcp.write(fh)
-
-        return {
-            "status": "ok",
-            "effect": technique_name,
-            "was_enabled": was_enabled,
-            "now_enabled": enabled,
-            "preset": preset_p.name,
-            "techniques_count": len(remaining),
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def create_reshade_vr_preset() -> dict:
-    """Create an optimised VR preset 'GameCopilot_VR' and activate it in ReShade.
-
-    Enables only VR-friendly effects (CAS sharpening, LUT colour grading, SMAA AA).
-    Disables all performance-heavy effects (RTGI, DOF, SSR, MXAO, heavy Bloom).
-
-    Wann aufrufen: Wenn der User ein optimiertes VR-Preset erstellen will oder
-    fragt wie man ReShade für VR am besten einstellt.
-    Trigger: 'ReShade VR Preset erstellen', 'optimiertes ReShade Preset',
-             'GameCopilot VR Preset', 'ReShade VR Profil'.
-
-    Returns:
-        status, preset_path, effects_enabled, previous_preset.
-    """
-    try:
-        cp, ini_path = _rs_load_ini()
-        if ini_path is None:
-            return {"error": "ReShade.ini not found."}
-
-        base = ini_path.parent
-        preset_path = base / "GameCopilot_VR.ini"
-
-        # Find available VR-friendly fx files
-        vr_effects: list[str] = []
-        for fx_stem in ("CAS", "LUT", "SMAA"):
-            matches = list(base.rglob(f"{fx_stem}.fx"))
-            if matches:
-                vr_effects.append(f"{fx_stem}@{matches[0].name}")
-            else:
-                vr_effects.append(fx_stem)
-
-        preset_content = (
-            "# GameCopilot VR Preset — optimised for MSFS VR\n"
-            "# Created by Game Copilot\n\n"
-            "[TECHNIQUE_SORT]\n"
-            f"Techniques={','.join(vr_effects)}\n\n"
-        )
-
-        try:
-            if preset_path.exists():
-                _sh.copy2(str(preset_path), str(preset_path.with_suffix(".bak")))
-        except Exception:
-            pass
-
-        preset_path.write_text(preset_content, encoding="utf-8")
-
-        # Activate it
-        if not cp.has_section("GENERAL"):
-            cp.add_section("GENERAL")
-        prev_preset = cp.get("GENERAL", "PresetPath", fallback="none")
-        cp.set("GENERAL", "PresetPath", str(preset_path))
-        _rs_save_ini(cp, ini_path)
-
-        return {
-            "status": "ok",
-            "preset_path": str(preset_path),
-            "effects_enabled": vr_effects,
-            "previous_preset": Path(prev_preset).name if prev_preset != "none" else "none",
-            "note": (
-                "GameCopilot_VR preset created and activated. "
-                "Restart MSFS to apply. Only lightweight VR-safe effects are enabled."
-            ),
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def diagnose_reshade_vr() -> dict:
-    """Full ReShade VR diagnostic for MSFS — checks installation, config, and active effects.
-
-    Returns a prioritised list of warnings and actionable recommendations.
-
-    Wann aufrufen: Wenn der User VR-Probleme mit ReShade hat, ReShade diagnostizieren will,
-    oder fragt ob ReShade korrekt für VR konfiguriert ist.
-    Trigger: 'ReShade VR Diagnose', 'ReShade überprüfen', 'ReShade Probleme VR',
-             'warum ist ReShade langsam VR', 'ReShade debug'.
-
-    Returns:
-        overall_health: 'good' | 'warning' | 'critical'
-        checks: list of individual check results
-        recommendations: prioritised list of actions
-    """
-    try:
-        cp, ini_path = _rs_load_ini()
-
-        checks: list[dict] = []
-        recommendations: list[str] = []
-
-        # 1. Installation check
-        if ini_path is None or not ini_path.exists():
-            return {
-                "overall_health": "critical",
-                "checks": [{"name": "ReShade installed", "passed": False,
-                             "detail": "ReShade.ini not found in any MSFS path."}],
-                "recommendations": [
-                    "Install ReShade from https://reshade.me into your MSFS exe folder.",
-                    "Run the ReShade installer and point it to FlightSimulator.exe.",
-                ],
-            }
-        checks.append({"name": "ReShade installed", "passed": True,
-                        "detail": str(ini_path)})
-
-        general = cp["GENERAL"] if cp.has_section("GENERAL") else {}
-        depth = cp["DEPTH"] if cp.has_section("DEPTH") else {}
-
-        # 2. DLL injection method check — MSFS 2024 must use dxgi.dll (DX12)
-        base = ini_path.parent
-        _dll_found = None
-        for _dll_candidate in ("dxgi.dll", "d3d11.dll", "d3d12.dll", "opengl32.dll"):
-            if (base / _dll_candidate).exists():
-                _dll_found = _dll_candidate
-                break
-        _openxr_layer = (base / "openxr_api_layer.json").exists()
-        _dxgi_ok = _dll_found == "dxgi.dll"
-        checks.append({
-            "name": "Correct DLL injection (dxgi.dll)",
-            "passed": _dxgi_ok,
-            "detail": (
-                f"dxgi.dll present — correct for MSFS 2024 (DX12)." if _dxgi_ok
-                else f"Found: {_dll_found or 'none'} — MSFS 2024 requires dxgi.dll. "
-                     "Re-install ReShade and select DirectX 10/11/12."
-            ),
-        })
-        if not _dxgi_ok:
-            recommendations.append(
-                "[HIGH] Wrong injection DLL — reinstall ReShade, choose DirectX 10/11/12 "
-                "(creates dxgi.dll). Current: " + (_dll_found or "none found") + "."
-            )
-        if _openxr_layer:
-            checks.append({
-                "name": "OpenXR layer present",
-                "passed": True,
-                "detail": "openxr_api_layer.json found — OpenXR add-on layer active.",
-            })
-
-        # 4. Performance mode
-        perf = general.get("PerformanceMode", "0") == "1"
-        checks.append({"name": "Performance mode ON", "passed": perf,
-                        "detail": "PerformanceMode=" + ("1" if perf else "0 (OFF — hurts VR FPS!)")})
-        if not perf:
-            recommendations.append(
-                "[HIGH] Enable performance mode: set_reshade_performance_mode(True) "
-                "— saves 3-8 ms per frame in VR."
-            )
-
-        # 5. Depth buffer reversed for MSFS
-        preprocessor = general.get("PreprocessorDefinitions", "")
-        depth_ok = "RESHADE_DEPTH_INPUT_IS_REVERSED=1" in preprocessor
-        checks.append({"name": "Depth buffer reversed (MSFS)", "passed": depth_ok,
-                        "detail": "RESHADE_DEPTH_INPUT_IS_REVERSED=1" + (" set" if depth_ok else " MISSING")})
-        if not depth_ok:
-            recommendations.append(
-                "[HIGH] Depth buffer not reversed — depth-based effects (DOF, MXAO) "
-                "will look wrong. Run optimize_reshade_for_vr()."
-            )
-
-        # 4. DepthCopyBeforeClears
-        dcbc = depth.get("DepthCopyBeforeClears", "0") == "1"
-        checks.append({"name": "DepthCopyBeforeClears", "passed": dcbc,
-                        "detail": "Needed for correct depth in MSFS"})
-        if not dcbc:
-            recommendations.append(
-                "[MEDIUM] Set DepthCopyBeforeClears=1 in [DEPTH] for correct depth buffer access."
-            )
-
-        # 5. Overlay / tutorial suppressed
-        tutorial_done = general.get("TutorialProgress", "0") == "4"
-        checks.append({"name": "Overlay suppressed", "passed": tutorial_done,
-                        "detail": "TutorialProgress=" + general.get("TutorialProgress", "0")})
-        if not tutorial_done:
-            recommendations.append(
-                "[LOW] ReShade tutorial overlay may appear in VR — run optimize_reshade_for_vr()."
-            )
-
-        # 6. Heavy effects in active preset
-        preset_raw = general.get("PresetPath", "")
-        heavy_active: list[str] = []
-        if preset_raw:
-            preset_p = Path(preset_raw)
-            if not preset_p.is_absolute():
-                preset_p = ini_path.parent / preset_raw
-            if preset_p.exists():
-                pcp = _rs_configparser.ConfigParser(strict=False)
-                pcp.optionxform = str
-                try:
-                    pcp.read(str(preset_p), encoding="utf-8")
-                except Exception:
-                    pass
-                for sec in pcp.sections():
-                    for eff in _parse_techniques(pcp.get(sec, "Techniques", fallback="")):
-                        if _effect_cost(eff) == "high":
-                            heavy_active.append(eff)
-
-        heavy_ok = len(heavy_active) == 0
-        checks.append({
-            "name": "No heavy effects active",
-            "passed": heavy_ok,
-            "detail": (
-                "No high-cost effects in preset." if heavy_ok
-                else f"Heavy effects active: {', '.join(heavy_active)}"
-            ),
-        })
-        if not heavy_ok:
-            recommendations.append(
-                f"[HIGH] Disable expensive effects: {', '.join(heavy_active)}. "
-                "These can add 5-20 ms per eye in VR. Use set_reshade_effect() or create_reshade_vr_preset()."
-            )
-
-        # 7. UseAspectRatioHeuristics
-        arh = depth.get("UseAspectRatioHeuristics", "1")
-        arh_ok = arh == "0"
-        checks.append({"name": "AspectRatioHeuristics disabled", "passed": arh_ok,
-                        "detail": "Should be 0 for VR; currently " + arh})
-        if not arh_ok:
-            recommendations.append(
-                "[MEDIUM] Set UseAspectRatioHeuristics=0 — heuristics interfere with VR depth detection."
-            )
-
-        # 8. Visual quality analysis: sharpness + color depth + Bildqualitäts-Score
-        sharpness_val: "float | None" = None
-        active_color_efx: list[str] = []
-        if preset_raw:
-            _vq_path = Path(preset_raw)
-            if not _vq_path.is_absolute():
-                _vq_path = ini_path.parent / preset_raw
-            if _vq_path.exists():
-                try:
-                    _vq_cp = _rs_configparser.ConfigParser(strict=False)
-                    _vq_cp.optionxform = str
-                    _vq_cp.read(str(_vq_path), encoding="utf-8")
-                    # CAS sharpness value
-                    try:
-                        sharpness_val = float(
-                            _vq_cp.get("CAS.fx", "CAS_SHARPENING_AMOUNT", fallback="")
-                        )
-                    except (ValueError, TypeError):
-                        pass
-                    # All active techniques → filter for color effects
-                    _all_techs: set[str] = set()
-                    for _vsec in _vq_cp.sections():
-                        for _vt in _parse_techniques(
-                            _vq_cp.get(_vsec, "Techniques", fallback="")
-                        ):
-                            _all_techs.add(_vt)
-                    _color_names = {"LiftGammaGain", "ColorMatrix", "Curves", "LUT",
-                                    "Vibrance", "Tonemap"}
-                    active_color_efx = sorted(_all_techs & _color_names)
-                except Exception:
-                    pass
-
-        if sharpness_val is None:
-            sharpness_rating = "unbekannt (CAS nicht aktiv)"
-        elif sharpness_val < 0.30:
-            sharpness_rating = "zu niedrig — Bild wirkt unscharf (<0.30)"
-        elif sharpness_val > 0.75:
-            sharpness_rating = "zu hoch — Halos/Ringing möglich (>0.75)"
-        else:
-            sharpness_rating = "gut"
-
-        if not active_color_efx:
-            color_rating = "keine Farbkorrektur aktiv"
-        elif len(active_color_efx) >= 3:
-            color_rating = "vollständige Farbkorrektur"
-        elif len(active_color_efx) >= 2:
-            color_rating = "gute Farbkorrektur"
-        else:
-            color_rating = "minimale Farbkorrektur"
-
-        # Sharpness/color recommendations
-        if sharpness_val is not None and sharpness_val < 0.30:
-            recommendations.append(
-                "[LOW] CAS-Schärfe zu niedrig (<0.30) — Bild wirkt unscharf. "
-                "Verwende tune_reshade_sharpness('medium') oder 'high'."
-            )
-        if sharpness_val is not None and sharpness_val > 0.75:
-            recommendations.append(
-                "[LOW] CAS-Schärfe sehr hoch (>0.75) — Halos/Ringing möglich. "
-                "Verwende tune_reshade_sharpness('high')."
-            )
-        if not active_color_efx:
-            recommendations.append(
-                "[LOW] Keine Farbkorrektur aktiv — bessere Bildqualität mit "
-                "create_reshade_vr_visual_preset() oder tune_reshade_colors()."
-            )
-
-        # Bildqualitäts-Score 0–100
-        _qs = 0
-        if perf:          _qs += 15
-        if depth_ok:      _qs += 10
-        if heavy_ok:      _qs += 15
-        if dcbc:          _qs += 5
-        if arh_ok:        _qs += 5
-        if tutorial_done: _qs += 3
-        if preset_raw:    _qs += 2
-        if sharpness_val is not None and 0.30 <= sharpness_val <= 0.75:
-            _qs += 20
-        elif sharpness_val is not None:
-            _qs += 5
-        _qs += min(20, len(active_color_efx) * 5)
-        image_quality_score = min(100, _qs)
-
-        passed = sum(1 for c in checks if c["passed"])
-        total = len(checks)
-        if passed == total:
-            health = "good"
-        elif passed >= total - 2:
-            health = "warning"
-        else:
-            health = "critical"
-
-        return {
-            "overall_health": health,
-            "passed_checks": passed,
-            "total_checks": total,
-            "checks": checks,
-            "recommendations": recommendations,
-            "sharpness_value": sharpness_val,
-            "sharpness_rating": sharpness_rating,
-            "color_rating": color_rating,
-            "active_color_effects": active_color_efx,
-            "image_quality_score": image_quality_score,
-            "quick_fix": (
-                "Run optimize_reshade_for_vr() to fix all critical issues automatically."
-                if health != "good"
-                else "ReShade is well configured for MSFS VR."
-            ),
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# ---------------------------------------------------------------------------
-# ReShade Visual Quality System — GPU-tier profiles + visual tuning tools
-# ---------------------------------------------------------------------------
-
-# ── Per-tier visual profiles ──────────────────────────────────────────────
-
-_RS_VISUAL_PROFILES: dict = {
-    "ultra": {  # RTX 4090, 7900 XTX — can afford everything beautiful
-        "description": "Ultra-Qualität: Filmische Farbgebung, starkes Sharpening, volle Farbkorrektur + Vibrance/Clarity/Deband",
-        "techniques": ["CAS", "LUT", "SMAA", "Levels", "Curves", "ColorMatrix", "LiftGammaGain",
-                       "Vibrance", "Clarity", "FilmGrain", "Deband"],
-        "disabled_techniques": ["RTGI", "DOF", "MotionBlur"],
-        "parameters": {
-            "CAS": {"CAS_SHARPENING_AMOUNT": 0.65},
-            "Levels": {"BlackPoint": 5, "WhitePoint": 245},
-            "Curves": {"Mode": 0, "Formula": 4, "Contrast": 0.25},
-            "LiftGammaGain": {
-                # Cool/blue shadows (atmospheric scattering depth cue)
-                # Warm R/G midtones, MSFS tends cool/desaturated
-                # Near-white highlights — don't blow out HDR-like sky
-                "RGB_Lift":  [0.997, 0.998, 1.018],
-                "RGB_Gamma": [1.010, 1.006, 0.990],
-                "RGB_Gain":  [1.006, 1.002, 0.997],
-            },
-            "ColorMatrix": {
-                # Enhanced greens for terrain; slightly boosted blues for sky
-                "ColorMatrix_Red":   [0.860, 0.140, 0.000],
-                "ColorMatrix_Green": [0.040, 0.938, 0.022],
-                "ColorMatrix_Blue":  [0.000, 0.042, 0.958],
-                "Strength": 0.35,
-            },
-            # Vibrance: hue-safe saturation boost (won't shift sky/skin tones)
-            "Vibrance": {"Vibrance_Intensity": 0.15},
-            # Clarity: midtone microcontrast — scenery "pops" without oversharpening
-            "Clarity": {"Clarity_BlendMode": 2, "Clarity_Strength": 0.20},
-            # FilmGrain: tiny amount reduces VR screen-door effect perception
-            "FilmGrain": {"FilmGrain_Intensity": 0.020},
-            # Deband: removes colour banding in VR sky gradients
-            "Deband": {"Deband_Threshold": 64, "Deband_Range": 16},
-        },
-    },
-    "high": {  # RTX 4080, 4070 Ti — good quality, some restraint
-        "description": "High-Qualität: Klare Farben, gutes Sharpening, leichte Atmosphäre + Vibrance/Deband",
-        "techniques": ["CAS", "LUT", "SMAA", "Levels", "LiftGammaGain", "Vibrance", "Deband"],
-        "disabled_techniques": ["RTGI", "DOF", "ColorMatrix", "Curves", "Clarity", "FilmGrain"],
-        "parameters": {
-            "CAS": {"CAS_SHARPENING_AMOUNT": 0.55},
-            "Levels": {"BlackPoint": 8, "WhitePoint": 248},
-            "LiftGammaGain": {
-                # Cool shadows, warm midtones, clean highlights
-                "RGB_Lift":  [0.998, 0.999, 1.012],
-                "RGB_Gamma": [1.007, 1.004, 0.992],
-                "RGB_Gain":  [1.004, 1.001, 0.998],
-            },
-            "Vibrance": {"Vibrance_Intensity": 0.15},
-            "Deband": {"Deband_Threshold": 64, "Deband_Range": 16},
-        },
-    },
-    "mid_high": {  # RTX 3080, 4070 — balanced, still beautiful
-        "description": "Ausgewogen: Sharpening + Tonemap + Deband, VR-optimiert",
-        "techniques": ["CAS", "LUT", "SMAA", "Levels", "Tonemap", "Deband"],
-        "disabled_techniques": ["RTGI", "DOF", "ColorMatrix", "LiftGammaGain", "Curves",
-                                 "Vibrance", "Clarity", "FilmGrain"],
-        "parameters": {
-            "CAS": {"CAS_SHARPENING_AMOUNT": 0.50},
-            "Levels": {"BlackPoint": 10, "WhitePoint": 245},
-            # Tonemap: gentle exposure/saturation lift — better than Levels alone
-            "Tonemap": {"Gamma": 1.0, "Exposure": 0.0, "Saturation": 0.10,
-                        "Bleach": 0.0, "Defog": 0.0},
-            "Deband": {"Deband_Threshold": 64, "Deband_Range": 16},
-        },
-    },
-    "mid": {  # RTX 3070, RX 6700 XT — minimal but impactful
-        "description": "Effizient: CAS Sharpening + Tonemap + Deband, kaum FPS-Kosten",
-        "techniques": ["CAS", "Tonemap", "Deband"],
-        "disabled_techniques": ["RTGI", "DOF", "ColorMatrix", "LiftGammaGain", "SMAA", "Curves",
-                                 "LUT", "Levels", "Vibrance", "Clarity", "FilmGrain"],
-        "parameters": {
-            "CAS": {"CAS_SHARPENING_AMOUNT": 0.40},
-            "Tonemap": {"Gamma": 1.0, "Exposure": 0.0, "Saturation": 0.10,
-                        "Bleach": 0.0, "Defog": 0.0},
-            "Deband": {"Deband_Threshold": 64, "Deband_Range": 16},
-        },
-    },
-    "low": {  # RTX 3060 and below
-        "description": "Minimal: CAS Sharpening + Deband, maximale Performance",
-        "techniques": ["CAS", "Deband"],
-        "disabled_techniques": ["RTGI", "DOF", "ColorMatrix", "LiftGammaGain", "SMAA", "Curves",
-                                 "LUT", "Levels", "Vibrance", "Clarity", "FilmGrain", "Tonemap"],
-        "parameters": {
-            "CAS": {"CAS_SHARPENING_AMOUNT": 0.35},
-            "Deband": {"Deband_Threshold": 64, "Deband_Range": 16},
-        },
-    },
-}
-
-
-# ── Visual helpers ─────────────────────────────────────────────────────────
-
-def _rs_detect_hdr() -> bool:
-    """Return True if MSFS / Windows HDR is likely active.
-
-    Checks (in order):
-    1. Windows HDR registry flag (AdvancedColorEnabled) for the primary display.
-    2. MSFS UserCfg.opt GraphicsVR/HDR key.
-    Falls back to False on any error.
-    """
-    try:
-        import winreg
-        # Windows 11/10 HDR registry path
-        _hdr_paths = [
-            (winreg.HKEY_LOCAL_MACHINE,
-             r"SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Configuration"),
-        ]
-        # A lighter check: DisplayAdvancedColorInfo via PowerShell would be ideal,
-        # but we can query the simpler EnableHDR DWM key on Win11
-        try:
-            with winreg.OpenKey(
-                winreg.HKEY_CURRENT_USER,
-                r"Software\Microsoft\Windows\CurrentVersion\VideoSettings",
-            ) as k:
-                val, _ = winreg.QueryValueEx(k, "EnableHDROutput")
-                if val == 1:
-                    return True
-        except OSError:
-            pass
-
-        # Also check MSFS UserCfg.opt for HDR flag
-        _cfg_paths = [
-            Path(os.environ.get("APPDATA", "")) / "Microsoft Flight Simulator 2024" / "UserCfg.opt",
-            Path(os.environ.get("LOCALAPPDATA", ""))
-            / "Packages/Microsoft.Limitless_8wekyb3d8bbwe/LocalCache/UserCfg.opt",
-            Path(os.environ.get("APPDATA", "")) / "Microsoft Flight Simulator" / "UserCfg.opt",
-        ]
-        for _p in _cfg_paths:
-            if _p.exists():
-                try:
-                    txt = _p.read_text(encoding="utf-8", errors="ignore")
-                    # MSFS uses "Hdr 1" in UserCfg.opt
-                    if "\nHdr 1" in txt or "\r\nHdr 1" in txt:
-                        return True
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    return False
-
-
-def _rs_detect_gpu_tier() -> str:
-    """Detect GPU tier using pynvml, falling back to 'mid'."""
-    try:
-        pynvml.nvmlInit()
-        try:
-            h = pynvml.nvmlDeviceGetHandleByIndex(0)
-            name = pynvml.nvmlDeviceGetName(h)
-            if isinstance(name, bytes):
-                name = name.decode()
-            mem = pynvml.nvmlDeviceGetMemoryInfo(h)
-            vram_gb = mem.total / 1024 ** 3
-        finally:
-            pynvml.nvmlShutdown()
-        return _classify_vr_tier(vram_gb, name, 8, 16)
-    except Exception:
-        return "mid"
-
-
-def _rs_write_visual_preset(profile: dict, preset_path: "Path") -> None:
-    """Create/overwrite a ReShade preset .ini with technique list and exact parameter values.
-
-    ReShade preset format:
-        [TECHNIQUE_SORT]
-        Techniques=CAS,LUT,...
-
-        [CAS.fx]
-        CAS_SHARPENING_AMOUNT=0.650000
-
-        [LiftGammaGain.fx]
-        RGB_Lift=1.000000 1.000000 1.010000
-    """
-    import configparser as _rcp
-
-    cp = _rcp.RawConfigParser()
-    cp.optionxform = str  # preserve case
-
-    # Top section: enabled techniques only
-    cp.add_section("TECHNIQUE_SORT")
-    cp.set("TECHNIQUE_SORT", "Techniques", ",".join(profile["techniques"]))
-
-    # Per-technique parameter sections
-    for tech, params in profile.get("parameters", {}).items():
-        sec_name = f"{tech}.fx"
-        cp.add_section(sec_name)
-        for key, val in params.items():
-            if isinstance(val, list):
-                formatted = " ".join(f"{v:.6f}" for v in val)
-            elif isinstance(val, float):
-                formatted = f"{val:.6f}"
-            else:
-                formatted = str(val)
-            cp.set(sec_name, key, formatted)
-
-    # Backup existing file
-    try:
-        if preset_path.exists():
-            _sh.copy2(str(preset_path), str(preset_path.with_suffix(".bak")))
-    except Exception:
-        pass
-
-    preset_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(str(preset_path), "w", encoding="utf-8") as fh:
-        fh.write("# GameCopilot Visual VR Preset\n")
-        fh.write("# Auto-generated by Game Copilot — do not edit manually\n\n")
-        cp.write(fh)
-
-
-def _rs_apply_style_overrides(profile: dict, style: str) -> dict:
-    """Return a deep copy of *profile* with style-specific parameter overrides applied."""
-    import copy
-    p = copy.deepcopy(profile)
-    params = p.setdefault("parameters", {})
-
-    if style == "cinematic":
-        # Warm shadows, stronger contrast, cinematic S-curve
-        lgg = params.setdefault("LiftGammaGain", {})
-        lgg["RGB_Lift"]  = [1.000, 0.998, 1.015]
-        lgg["RGB_Gamma"] = [0.975, 0.980, 1.000]
-        lgg["RGB_Gain"]  = [1.015, 1.008, 1.000]
-        curves = params.setdefault("Curves", {})
-        curves["Mode"] = 0
-        curves["Formula"] = 4
-        curves["Contrast"] = 0.35
-        for eff in ("LiftGammaGain", "Curves"):
-            if eff not in p["techniques"]:
-                p["techniques"].append(eff)
-
-    elif style == "sharp":
-        cas = params.setdefault("CAS", {})
-        cas["CAS_SHARPENING_AMOUNT"] = min(
-            0.80, float(cas.get("CAS_SHARPENING_AMOUNT", 0.50)) + 0.10
-        )
-        if "SMAA" not in p["techniques"]:
-            p["techniques"].append("SMAA")
-
-    elif style == "natural":
-        # Gentle Levels, very subtle LiftGammaGain — almost invisible touch
-        lv = params.setdefault("Levels", {})
-        lv["BlackPoint"] = 3
-        lv["WhitePoint"] = 252
-        lgg = params.setdefault("LiftGammaGain", {})
-        lgg["RGB_Lift"]  = [1.000, 1.000, 1.002]
-        lgg["RGB_Gamma"] = [0.995, 0.997, 1.000]
-        lgg["RGB_Gain"]  = [1.002, 1.001, 1.000]
-        for eff in ("Levels", "LiftGammaGain"):
-            if eff not in p["techniques"]:
-                p["techniques"].append(eff)
-
-    elif style == "vivid":
-        # Stronger ColorMatrix saturation boost
-        cm = params.setdefault("ColorMatrix", {})
-        cm["ColorMatrix_Red"]   = [0.840, 0.160, 0.000]
-        cm["ColorMatrix_Green"] = [0.040, 0.930, 0.030]
-        cm["ColorMatrix_Blue"]  = [0.000, 0.040, 0.960]
-        cm["Strength"] = 0.50
-        if "ColorMatrix" not in p["techniques"]:
-            p["techniques"].append("ColorMatrix")
-
-    # Deduplicate technique list, preserving order
-    seen: set = set()
-    unique: list = []
-    for t in p["techniques"]:
-        if t not in seen:
-            seen.add(t)
-            unique.append(t)
-    p["techniques"] = unique
-    return p
-
-
-def _rs_read_preset_params(preset_path: "Path") -> dict:
-    """Read a ReShade preset .ini and return {section: {key: value}} dict."""
-    import configparser as _rcp
-    cp = _rcp.RawConfigParser()
-    cp.optionxform = str
-    try:
-        cp.read(str(preset_path), encoding="utf-8")
-    except Exception:
-        try:
-            cp.read(str(preset_path), encoding="latin-1")
-        except Exception:
-            return {}
-    return {sec: dict(cp[sec]) for sec in cp.sections()}
-
-
-def _rs_get_active_preset_path(ini_path: "Path") -> "Path | None":
-    """Return the currently active ReShade preset Path, or None."""
-    import configparser as _rcp
-    cp = _rcp.RawConfigParser()
-    cp.optionxform = str
-    try:
-        cp.read(str(ini_path), encoding="utf-8")
-    except Exception:
-        return None
-    general = cp["GENERAL"] if cp.has_section("GENERAL") else {}
-    preset_raw = general.get("PresetPath", "")
-    if not preset_raw:
-        return None
-    p = Path(preset_raw)
-    if not p.is_absolute():
-        p = ini_path.parent / preset_raw
-    return p if p.exists() else None
-
-
-def _rs_patch_preset_param(preset_path: "Path", section: str, key: str, value: str) -> bool:
-    """Patch a single key=value in a preset .ini section. Returns True on success."""
-    import configparser as _rcp
-    cp = _rcp.RawConfigParser()
-    cp.optionxform = str
-    try:
-        cp.read(str(preset_path), encoding="utf-8")
-    except Exception:
-        return False
-    if not cp.has_section(section):
-        cp.add_section(section)
-    cp.set(section, key, value)
-    try:
-        _sh.copy2(str(preset_path), str(preset_path.with_suffix(".bak")))
-    except Exception:
-        pass
-    with open(str(preset_path), "w", encoding="utf-8") as fh:
-        cp.write(fh)
-    return True
-
-
-# ── New visual quality MCP tools ───────────────────────────────────────────
-
-@mcp.tool()
-def create_reshade_vr_visual_preset(
-    style: str = "auto",
-    gpu_override: "str | None" = None,
-) -> dict:
-    """Erstellt ein perfekt abgestimmtes ReShade VR-Preset für maximale Bildqualität.
-
-    Analysiert die GPU automatisch und wählt das passende Qualitätsprofil.
-    Schreibt alle Shader-Parameter (CAS, LUT, Levels, LiftGammaGain, ColorMatrix, Curves)
-    präzise in die Preset-Datei — kein manuelles Einstellen nötig.
-
-    Wann aufrufen: 'ReShade VR Preset erstellen', 'perfektes Bild einstellen',
-    'Farben optimieren', 'schärfer machen', 'besseres Bild in VR',
-    'GameCopilot VR Preset', 'ReShade VR Profil', 'optimiertes ReShade Preset'.
-
-    Args:
-        style: Visueller Stil — 'auto'|'cinematic'|'sharp'|'natural'|'vivid'
-               auto      = GPU-Tier-Standardwerte
-               cinematic = warme Schatten, starke Kontraste, filmischer Look
-               sharp     = maximale Schärfe (+0.10 CAS), SMAA hinzu
-               natural   = sanfte Farbkorrektur, minimaler Eingriff
-               vivid     = verstärkte Sättigung via ColorMatrix
-        gpu_override: GPU-Tier erzwingen — 'ultra'|'high'|'mid_high'|'mid'|'low'
-
-    Returns:
-        status, preset_path, gpu_tier, profile_description, techniques_enabled,
-        techniques_disabled, parameters_written, previous_preset
-    """
-    try:
-        cp, ini_path = _rs_load_ini()
-        if ini_path is None:
-            return {"error": "ReShade.ini nicht gefunden. Ist ReShade installiert?"}
-
-        # Detect or override tier
-        tier = (
-            gpu_override
-            if gpu_override in _RS_VISUAL_PROFILES
-            else _rs_detect_gpu_tier()
-        )
-        profile = _RS_VISUAL_PROFILES[tier]
-
-        # Apply style overrides (deep copy so profile dict is unchanged)
-        if style and style not in ("auto", ""):
-            profile = _rs_apply_style_overrides(profile, style)
-
-        # HDR awareness: if HDR is active, CAS adds visible ringing and Levels
-        # clamps the extended range — dial both back
-        import copy as _copy_mod
-        hdr_active = _rs_detect_hdr()
-        hdr_note = ""
-        if hdr_active:
-            profile = _copy_mod.deepcopy(profile)
-            params = profile.setdefault("parameters", {})
-            cas_params = params.setdefault("CAS", {})
-            original_cas = float(cas_params.get("CAS_SHARPENING_AMOUNT", 0.50))
-            cas_params["CAS_SHARPENING_AMOUNT"] = round(max(0.20, original_cas - 0.15), 2)
-            # Remove Levels — HDR pipeline handles black/white point natively
-            if "Levels" in profile.get("techniques", []):
-                profile["techniques"] = [t for t in profile["techniques"] if t != "Levels"]
-                profile.setdefault("disabled_techniques", [])
-                if "Levels" not in profile["disabled_techniques"]:
-                    profile["disabled_techniques"].append("Levels")
-            hdr_note = (
-                f" [HDR erkannt: CAS {original_cas:.2f}→{cas_params['CAS_SHARPENING_AMOUNT']:.2f},"
-                " Levels deaktiviert (HDR übernimmt Tonwerte nativ)]"
-            )
-
-        # Build preset path inside reshade-presets sub-folder
-        base = ini_path.parent
-        preset_dir = base / "reshade-presets"
-        preset_dir.mkdir(exist_ok=True)
-        preset_path = preset_dir / "GameCopilot_VR_Visual.ini"
-
-        _rs_write_visual_preset(profile, preset_path)
-
-        # Point ReShade.ini to this preset
-        if not cp.has_section("GENERAL"):
-            cp.add_section("GENERAL")
-        prev_preset = cp.get("GENERAL", "PresetPath", fallback="none")
-        cp.set("GENERAL", "PresetPath", str(preset_path))
-        _rs_save_ini(cp, ini_path)
-
-        # Summarise parameters for the return value
-        params_written: dict = {}
-        for tech, vals in profile.get("parameters", {}).items():
-            params_written[tech] = {
-                k: (
-                    " ".join(f"{v:.6f}" for v in val)
-                    if isinstance(val, list)
-                    else f"{val:.6f}"
-                    if isinstance(val, float)
-                    else str(val)
-                )
-                for k, val in vals.items()
-            }
-
-        return {
-            "status": "ok",
-            "preset_path": str(preset_path),
-            "gpu_tier": tier,
-            "style": style or "auto",
-            "hdr_active": hdr_active,
-            "profile_description": profile["description"],
-            "techniques_enabled": profile["techniques"],
-            "techniques_disabled": profile.get("disabled_techniques", []),
-            "parameters_written": params_written,
-            "previous_preset": Path(prev_preset).name if prev_preset != "none" else "none",
-            "note": (
-                f"GameCopilot_VR_Visual ({tier}, {style or 'auto'}) erstellt und aktiviert."
-                + hdr_note + " "
-                "MSFS neu starten um Änderungen zu sehen. "
-                "Falls sofort sichtbar: Home-Taste → ReShade-Overlay → Preset neu laden."
-            ),
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def tune_reshade_sharpness(level: str) -> dict:
-    """Passe die ReShade CAS-Schärfe im aktiven Preset an.
-
-    Wann aufrufen: 'schärfer machen', 'weniger scharf', 'Schärfe anpassen',
-    'CAS Wert ändern', 'Bild zu unscharf', 'Bild zu scharf'.
-
-    Args:
-        level: 'low'|'medium'|'high'|'ultra'
-               low=0.25 (weich), medium=0.45 (ausgewogen), high=0.65 (scharf), ultra=0.80 (max)
-
-    Returns:
-        status, level, previous_value, new_value, preset_updated
-    """
-    try:
-        level_map = {"low": 0.25, "medium": 0.45, "high": 0.65, "ultra": 0.80}
-        if level not in level_map:
-            return {
-                "error": f"Ungültiger Level '{level}'. Gültig: {', '.join(level_map)}",
-                "hint": "low=0.25 (weich), medium=0.45, high=0.65, ultra=0.80",
-            }
-
-        new_val = level_map[level]
-        ini_path = _rs_locate_ini()
-        if ini_path is None:
-            return {"error": "ReShade.ini nicht gefunden."}
-
-        preset_path = _rs_get_active_preset_path(ini_path)
-        if preset_path is None:
-            return {
-                "error": "Kein aktives Preset gefunden.",
-                "hint": "Erstelle zuerst ein Preset mit create_reshade_vr_visual_preset().",
-            }
-
-        # Read current value for reporting
-        existing = _rs_read_preset_params(preset_path)
-        prev_raw = existing.get("CAS.fx", {}).get("CAS_SHARPENING_AMOUNT", "unbekannt")
-
-        success = _rs_patch_preset_param(
-            preset_path, "CAS.fx", "CAS_SHARPENING_AMOUNT", f"{new_val:.6f}"
-        )
-        if not success:
-            return {"error": "Konnte Preset-Datei nicht schreiben."}
-
-        return {
-            "status": "ok",
-            "level": level,
-            "previous_value": prev_raw,
-            "new_value": f"{new_val:.6f}",
-            "preset": preset_path.name,
-            "note": (
-                f"CAS Schärfe auf '{level}' ({new_val:.2f}) gesetzt. "
-                "ReShade übernimmt Änderungen automatisch; "
-                "falls nicht: Home-Taste → ReShade-Overlay → Preset neu laden."
-            ),
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def tune_reshade_colors(
-    saturation: str = "normal",
-    warmth: str = "neutral",
-    contrast: str = "normal",
-) -> dict:
-    """Passe ReShade Farben individuell an — Sättigung, Farbtemperatur, Kontrast.
-
-    Schreibt direkt die LiftGammaGain, ColorMatrix und Curves Parameter im aktiven Preset.
-
-    Wann aufrufen: 'Farben wärmer machen', 'mehr Sättigung', 'mehr Kontrast',
-    'Farben anpassen', 'kältere Farben', 'wärmere Farben', 'Bild zu blass',
-    'Bild zu flach', 'Farben lebendiger'.
-
-    Args:
-        saturation: 'low'|'normal'|'high'|'vivid'   — Farbsättigung via ColorMatrix
-        warmth:     'cool'|'neutral'|'warm'          — Farbtemperatur via LiftGammaGain
-        contrast:   'flat'|'normal'|'punchy'         — Kontrast via Curves
-
-    Returns:
-        status, saturation, warmth, contrast, parameters_written, preset_updated
-    """
-    try:
-        valid = {
-            "saturation": ("low", "normal", "high", "vivid"),
-            "warmth": ("cool", "neutral", "warm"),
-            "contrast": ("flat", "normal", "punchy"),
-        }
-        errors = [
-            f"{k} muss eines von {v} sein — got '{eval(k)}'"
-            for k, v in valid.items()
-            if eval(k) not in v
-        ]
-        if errors:
-            return {"error": "; ".join(errors)}
-
-        ini_path = _rs_locate_ini()
-        if ini_path is None:
-            return {"error": "ReShade.ini nicht gefunden."}
-
-        preset_path = _rs_get_active_preset_path(ini_path)
-        if preset_path is None:
-            return {
-                "error": "Kein aktives Preset gefunden.",
-                "hint": "Erstelle zuerst ein Preset mit create_reshade_vr_visual_preset().",
-            }
-
-        params_written: dict = {}
-
-        # ── LiftGammaGain — warmth ─────────────────────────────────────────
-        warmth_lgg: dict = {
-            "cool": {
-                "RGB_Lift":  [1.000, 1.000, 1.020],
-                "RGB_Gamma": [0.990, 0.992, 1.010],
-                "RGB_Gain":  [0.995, 0.998, 1.015],
-            },
-            "neutral": {
-                "RGB_Lift":  [1.000, 1.000, 1.000],
-                "RGB_Gamma": [1.000, 1.000, 1.000],
-                "RGB_Gain":  [1.000, 1.000, 1.000],
-            },
-            "warm": {
-                "RGB_Lift":  [1.010, 1.005, 1.000],
-                "RGB_Gamma": [1.008, 1.002, 0.990],
-                "RGB_Gain":  [1.015, 1.008, 0.995],
-            },
-        }
-        for key, vals in warmth_lgg[warmth].items():
-            fmt = " ".join(f"{v:.6f}" for v in vals)
-            _rs_patch_preset_param(preset_path, "LiftGammaGain.fx", key, fmt)
-            params_written[f"LiftGammaGain.fx/{key}"] = fmt
-
-        # ── ColorMatrix — saturation ───────────────────────────────────────
-        sat_cm: dict = {
-            "low": {
-                "ColorMatrix_Red":   [0.700, 0.200, 0.100],
-                "ColorMatrix_Green": [0.100, 0.800, 0.100],
-                "ColorMatrix_Blue":  [0.050, 0.150, 0.800],
-                "Strength": 0.20,
-            },
-            "normal": {
-                "ColorMatrix_Red":   [0.900, 0.100, 0.000],
-                "ColorMatrix_Green": [0.050, 0.950, 0.000],
-                "ColorMatrix_Blue":  [0.000, 0.050, 0.950],
-                "Strength": 0.25,
-            },
-            "high": {
-                "ColorMatrix_Red":   [0.860, 0.140, 0.000],
-                "ColorMatrix_Green": [0.050, 0.930, 0.020],
-                "ColorMatrix_Blue":  [0.000, 0.060, 0.940],
-                "Strength": 0.40,
-            },
-            "vivid": {
-                "ColorMatrix_Red":   [0.840, 0.160, 0.000],
-                "ColorMatrix_Green": [0.040, 0.940, 0.020],
-                "ColorMatrix_Blue":  [0.000, 0.040, 0.960],
-                "Strength": 0.55,
-            },
-        }
-        for key, val in sat_cm[saturation].items():
-            fmt = " ".join(f"{v:.6f}" for v in val) if isinstance(val, list) else f"{val:.6f}"
-            _rs_patch_preset_param(preset_path, "ColorMatrix.fx", key, fmt)
-            params_written[f"ColorMatrix.fx/{key}"] = fmt
-
-        # ── Curves — contrast ──────────────────────────────────────────────
-        contrast_curves: dict = {
-            "flat":   {"Mode": "0", "Formula": "4", "Contrast": "0.050000"},
-            "normal": {"Mode": "0", "Formula": "4", "Contrast": "0.200000"},
-            "punchy": {"Mode": "0", "Formula": "4", "Contrast": "0.400000"},
-        }
-        for key, val in contrast_curves[contrast].items():
-            _rs_patch_preset_param(preset_path, "Curves.fx", key, val)
-            params_written[f"Curves.fx/{key}"] = val
-
-        return {
-            "status": "ok",
-            "saturation": saturation,
-            "warmth": warmth,
-            "contrast": contrast,
-            "preset": preset_path.name,
-            "parameters_written": params_written,
-            "note": (
-                f"Farben angepasst: Sättigung={saturation}, Wärme={warmth}, Kontrast={contrast}. "
-                "ReShade übernimmt Änderungen automatisch; "
-                "falls nicht: Home-Taste → ReShade-Overlay → Preset neu laden."
-            ),
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def get_reshade_visual_analysis() -> dict:
-    """Analysiert das aktuelle ReShade-Setup und gibt konkrete Verbesserungsvorschläge.
-
-    Berechnet einen Bildqualitäts-Score (0–100) basierend auf GPU-Tier, aktiven Effekten,
-    Schärfewert und Farbkorrektur-Konfiguration.
-
-    Wann aufrufen: 'ReShade Bildqualität analysieren', 'ReShade überprüfen',
-    'wie sieht mein ReShade aus', 'ReShade Verbesserungen', 'Bildqualität prüfen'.
-
-    Returns:
-        current_tier, tier_description, current_preset, active_effects,
-        expected_effects_for_tier, missing_effects, heavy_effects_active,
-        sharpness_value, sharpness_rating, color_rating, active_color_effects,
-        image_quality_score (0–100), performance_mode, recommendations
-    """
-    try:
-        cp, ini_path = _rs_load_ini()
-        if ini_path is None:
-            return {"error": "ReShade.ini nicht gefunden."}
-
-        tier = _rs_detect_gpu_tier()
-        profile = _RS_VISUAL_PROFILES[tier]
-        expected_techniques = set(profile["techniques"])
-
-        general = cp["GENERAL"] if cp.has_section("GENERAL") else {}
-        perf_mode = general.get("PerformanceMode", "0") == "1"
-        preset_raw = general.get("PresetPath", "")
-        preset_name = Path(preset_raw).name if preset_raw else "none"
-
-        active_techniques: set[str] = set()
-        sharpness_val: "float | None" = None
-
-        if preset_raw:
-            preset_p = Path(preset_raw)
-            if not preset_p.is_absolute():
-                preset_p = ini_path.parent / preset_raw
-            if preset_p.exists():
-                pdata = _rs_read_preset_params(preset_p)
-                for sec_vals in pdata.values():
-                    if isinstance(sec_vals, dict):
-                        for t in _parse_techniques(sec_vals.get("Techniques", "")):
-                            active_techniques.add(t)
-                # CAS sharpness
-                try:
-                    sharpness_val = float(
-                        pdata.get("CAS.fx", {}).get("CAS_SHARPENING_AMOUNT", "")
-                    )
-                except (ValueError, TypeError):
-                    pass
-
-        missing_effects = sorted(expected_techniques - active_techniques)
-        heavy_active = [t for t in active_techniques if _effect_cost(t) == "high"]
-
-        # Sharpness rating
-        if sharpness_val is None:
-            sharpness_rating = "unbekannt (CAS nicht aktiv oder Wert nicht lesbar)"
-        elif sharpness_val < 0.30:
-            sharpness_rating = "zu niedrig — Bild wirkt unscharf (<0.30)"
-        elif sharpness_val > 0.75:
-            sharpness_rating = "zu hoch — Halos/Ringing möglich (>0.75)"
-        else:
-            sharpness_rating = "gut"
-
-        # Color depth — includes Vibrance (hue-safe saturation) in scoring
-        _color_names = {"LiftGammaGain", "ColorMatrix", "Curves", "LUT", "Vibrance", "Tonemap"}
-        active_color = sorted(active_techniques & _color_names)
-        if not active_color:
-            color_rating = "keine Farbkorrektur aktiv"
-        elif len(active_color) >= 3:
-            color_rating = "vollständige Farbkorrektur"
-        elif len(active_color) >= 2:
-            color_rating = "gute Farbkorrektur"
-        else:
-            color_rating = "minimale Farbkorrektur"
-
-        # Image quality score 0–100
-        score = 0
-        preprocessor = general.get("PreprocessorDefinitions", "")
-        depth_ok = "RESHADE_DEPTH_INPUT_IS_REVERSED=1" in preprocessor
-        if perf_mode:   score += 15
-        if depth_ok:    score += 10
-        if not heavy_active: score += 15
-        coverage = len(expected_techniques & active_techniques) / max(len(expected_techniques), 1)
-        score += int(coverage * 35)
-        if sharpness_val is not None and 0.30 <= sharpness_val <= 0.75:
-            score += 15
-        elif sharpness_val is not None:
-            score += 5
-        score += min(10, len(active_color) * 3)
-        score = min(100, score)
-
-        # Recommendations
-        recommendations: list[str] = []
-        if not perf_mode:
-            recommendations.append(
-                "[KRITISCH] Performance Mode deaktiviert — ReShade kostet VR-FPS. "
-                "Aktiviere mit set_reshade_performance_mode(True)."
-            )
-        if heavy_active:
-            recommendations.append(
-                f"[HOCH] Schwere Effekte aktiv ({', '.join(heavy_active)}) — in VR vermeiden!"
-            )
-        if missing_effects:
-            recommendations.append(
-                f"[MITTEL] Für {tier}-Tier empfohlene Effekte fehlen: "
-                f"{', '.join(missing_effects)}. "
-                "Erstelle Preset mit create_reshade_vr_visual_preset()."
-            )
-        if sharpness_val is not None and sharpness_val < 0.30:
-            recommendations.append(
-                "[NIEDRIG] CAS-Wert zu niedrig — verwende tune_reshade_sharpness('medium') "
-                "oder 'high'."
-            )
-        if sharpness_val is not None and sharpness_val > 0.75:
-            recommendations.append(
-                "[NIEDRIG] CAS-Wert sehr hoch — Halos möglich. "
-                "Verwende tune_reshade_sharpness('high')."
-            )
-        if not active_color:
-            recommendations.append(
-                "[NIEDRIG] Keine Farbkorrektur aktiv — bessere Farben mit "
-                "tune_reshade_colors() oder create_reshade_vr_visual_preset()."
-            )
-        if not recommendations:
-            recommendations.append("ReShade ist optimal für VR konfiguriert!")
-
-        return {
-            "current_tier": tier,
-            "tier_description": profile["description"],
-            "current_preset": preset_name,
-            "active_effects": sorted(active_techniques),
-            "expected_effects_for_tier": sorted(expected_techniques),
-            "missing_effects": missing_effects,
-            "heavy_effects_active": heavy_active,
-            "sharpness_value": sharpness_val,
-            "sharpness_rating": sharpness_rating,
-            "color_rating": color_rating,
-            "active_color_effects": active_color,
-            "image_quality_score": score,
-            "performance_mode": perf_mode,
-            "recommendations": recommendations,
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def apply_reshade_style(style: str) -> dict:
-    """Wende einen visuellen Stil auf das aktuell aktive ReShade Preset an.
-
-    Schreibt direkt die passenden Parameter-Werte in die Preset-Datei.
-    ReShade übernimmt die Änderungen automatisch (kein Neustart nötig).
-
-    Wann aufrufen: 'filmischer Look', 'Nachtmodus ReShade', 'Sonnenuntergang-Farben',
-    'schärferes Bild', 'lebendige Farben', 'natürliche Farben', 'wärmeres Bild',
-    'kälteres Bild', 'Tageslicht-Preset'.
-
-    Args:
-        style: 'cinematic'|'sharp'|'natural'|'vivid'|'night'|'day'|'sunset'|'dawn'|'dusk'
-               cinematic = filmische Kontraste, warme Schatten
-               sharp     = maximale Schärfe (CAS 0.75), klare Kanten
-               natural   = natürliche Farben, minimaler Eingriff
-               vivid     = lebendige Farben, hohe Sättigung
-               night     = dunkleres Bild, kältere Töne (Nachtflüge)
-               day       = helles Bild, leicht warm (Tagflüge)
-               sunset    = orange/goldene Töne (Abendflüge)
-               dawn      = warmes Morgenlicht, aufhellend (Morgenflüge)
-               dusk      = kühles Blau-Violett (Dämmerungsflüge)
-
-    Returns:
-        status, style, parameters_changed, preset_updated
-    """
-    try:
-        valid_styles = ("cinematic", "sharp", "natural", "vivid", "night", "day", "sunset",
-                        "dawn", "dusk")
-        if style not in valid_styles:
-            return {
-                "error": f"Ungültiger Stil '{style}'.",
-                "valid_styles": list(valid_styles),
-            }
-
-        ini_path = _rs_locate_ini()
-        if ini_path is None:
-            return {"error": "ReShade.ini nicht gefunden."}
-
-        preset_path = _rs_get_active_preset_path(ini_path)
-        if preset_path is None:
-            return {
-                "error": "Kein aktives Preset gefunden.",
-                "hint": "Erstelle zuerst ein Preset mit create_reshade_vr_visual_preset().",
-            }
-
-        # Style parameter tables: {(section, key): value_string}
-        style_params: dict = {
-            "cinematic": {
-                ("LiftGammaGain.fx", "RGB_Lift"):  "1.000000 0.998000 1.015000",
-                ("LiftGammaGain.fx", "RGB_Gamma"): "0.975000 0.980000 1.000000",
-                ("LiftGammaGain.fx", "RGB_Gain"):  "1.015000 1.008000 1.000000",
-                ("Curves.fx", "Mode"):              "0",
-                ("Curves.fx", "Formula"):           "4",
-                ("Curves.fx", "Contrast"):          "0.350000",
-                ("CAS.fx", "CAS_SHARPENING_AMOUNT"): "0.600000",
-            },
-            "sharp": {
-                ("CAS.fx", "CAS_SHARPENING_AMOUNT"): "0.750000",
-            },
-            "natural": {
-                ("Levels.fx", "BlackPoint"):         "3",
-                ("Levels.fx", "WhitePoint"):         "252",
-                ("LiftGammaGain.fx", "RGB_Lift"):    "1.000000 1.000000 1.002000",
-                ("LiftGammaGain.fx", "RGB_Gamma"):   "0.995000 0.997000 1.000000",
-                ("LiftGammaGain.fx", "RGB_Gain"):    "1.002000 1.001000 1.000000",
-                ("Curves.fx", "Contrast"):           "0.100000",
-            },
-            "vivid": {
-                ("ColorMatrix.fx", "ColorMatrix_Red"):   "0.840000 0.160000 0.000000",
-                ("ColorMatrix.fx", "ColorMatrix_Green"): "0.040000 0.930000 0.030000",
-                ("ColorMatrix.fx", "ColorMatrix_Blue"):  "0.000000 0.040000 0.960000",
-                ("ColorMatrix.fx", "Strength"):          "0.500000",
-            },
-            "night": {
-                ("Levels.fx", "BlackPoint"):             "15",
-                ("Levels.fx", "WhitePoint"):             "230",
-                ("LiftGammaGain.fx", "RGB_Lift"):        "0.995000 0.998000 1.020000",
-                ("LiftGammaGain.fx", "RGB_Gamma"):       "0.988000 0.992000 1.008000",
-                ("LiftGammaGain.fx", "RGB_Gain"):        "0.992000 0.995000 1.010000",
-                ("Curves.fx", "Contrast"):               "0.300000",
-                ("CAS.fx", "CAS_SHARPENING_AMOUNT"):     "0.500000",
-            },
-            "day": {
-                ("Levels.fx", "BlackPoint"):             "5",
-                ("Levels.fx", "WhitePoint"):             "248",
-                ("LiftGammaGain.fx", "RGB_Lift"):        "1.005000 1.002000 1.000000",
-                ("LiftGammaGain.fx", "RGB_Gamma"):       "1.005000 1.003000 0.995000",
-                ("LiftGammaGain.fx", "RGB_Gain"):        "1.010000 1.006000 0.998000",
-                ("Curves.fx", "Contrast"):               "0.180000",
-                ("CAS.fx", "CAS_SHARPENING_AMOUNT"):     "0.550000",
-            },
-            "sunset": {
-                ("LiftGammaGain.fx", "RGB_Lift"):        "1.020000 1.010000 0.990000",
-                ("LiftGammaGain.fx", "RGB_Gamma"):       "1.025000 1.008000 0.975000",
-                ("LiftGammaGain.fx", "RGB_Gain"):        "1.030000 1.015000 0.980000",
-                ("ColorMatrix.fx", "ColorMatrix_Red"):   "0.870000 0.130000 0.000000",
-                ("ColorMatrix.fx", "ColorMatrix_Green"): "0.060000 0.910000 0.030000",
-                ("ColorMatrix.fx", "ColorMatrix_Blue"):  "0.000000 0.060000 0.940000",
-                ("ColorMatrix.fx", "Strength"):          "0.450000",
-                ("Curves.fx", "Contrast"):               "0.280000",
-                ("CAS.fx", "CAS_SHARPENING_AMOUNT"):     "0.580000",
-            },
-            # Dawn: warm, brightening — early morning golden light, soft contrast
-            "dawn": {
-                ("Levels.fx", "BlackPoint"):             "3",
-                ("Levels.fx", "WhitePoint"):             "250",
-                ("LiftGammaGain.fx", "RGB_Lift"):        "1.012000 1.006000 0.995000",
-                ("LiftGammaGain.fx", "RGB_Gamma"):       "1.018000 1.010000 0.985000",
-                ("LiftGammaGain.fx", "RGB_Gain"):        "1.025000 1.012000 0.988000",
-                ("Curves.fx", "Contrast"):               "0.150000",
-                ("CAS.fx", "CAS_SHARPENING_AMOUNT"):     "0.520000",
-            },
-            # Dusk: cool twilight blue with slightly compressed tones
-            "dusk": {
-                ("Levels.fx", "BlackPoint"):             "10",
-                ("Levels.fx", "WhitePoint"):             "235",
-                ("LiftGammaGain.fx", "RGB_Lift"):        "0.996000 0.998000 1.018000",
-                ("LiftGammaGain.fx", "RGB_Gamma"):       "0.990000 0.992000 1.012000",
-                ("LiftGammaGain.fx", "RGB_Gain"):        "0.993000 0.996000 1.012000",
-                ("Curves.fx", "Contrast"):               "0.250000",
-                ("CAS.fx", "CAS_SHARPENING_AMOUNT"):     "0.520000",
-            },
-        }
-
-        changes: dict = {}
-        for (section, key), val in style_params[style].items():
-            _rs_patch_preset_param(preset_path, section, key, val)
-            changes[f"{section}/{key}"] = val
-
-        return {
-            "status": "ok",
-            "style": style,
-            "preset": preset_path.name,
-            "parameters_changed": changes,
-            "note": (
-                f"Stil '{style}' auf '{preset_path.name}' angewendet. "
-                "ReShade übernimmt Änderungen automatisch; "
-                "falls nicht: Home-Taste → ReShade-Overlay → Preset neu laden."
-            ),
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# ---------------------------------------------------------------------------
-# ReShade — new tools: time-of-day, addons, backup/restore, custom profiles
-# ---------------------------------------------------------------------------
-
-@mcp.tool()
-def auto_apply_reshade_for_time(hour: "int | None" = None) -> dict:
-    """Passt ReShade automatisch an die aktuelle Tageszeit an.
-
-    Wählt automatisch den passenden visuellen Stil basierend auf der Uhrzeit
-    und wendet ihn auf das aktive Preset an.
-
-    Wann aufrufen: 'ReShade für jetzt anpassen', 'Tageszeit ReShade',
-    'automatischer Modus', 'ReShade Nacht/Tag/Sonnenuntergang automatisch'.
-
-    Args:
-        hour: Stunde (0–23). Wenn None, wird die aktuelle Systemzeit verwendet.
-
-    Returns:
-        status, hour_used, time_period, style_applied, parameters_changed
-    """
-    try:
-        import datetime
-        if hour is None:
-            hour = datetime.datetime.now().hour
-        hour = int(hour) % 24
-
-        # Map hour to time period and style
-        if 0 <= hour <= 5:
-            period, style = "night", "night"
-        elif 6 <= hour <= 8:
-            period, style = "dawn", "dawn"
-        elif 9 <= hour <= 16:
-            period, style = "day", "day"
-        elif 17 <= hour <= 19:
-            period, style = "sunset", "sunset"
-        elif 20 <= hour <= 21:
-            period, style = "dusk", "dusk"
-        else:  # 22–23
-            period, style = "night", "night"
-
-        result = apply_reshade_style(style)
-        if "error" in result:
-            return result
-
-        return {
-            "status": "ok",
-            "hour_used": hour,
-            "time_period": period,
-            "style_applied": style,
-            "parameters_changed": result.get("parameters_changed", {}),
-            "preset": result.get("preset", ""),
-            "note": (
-                f"Tageszeit {hour:02d}:xx → Periode '{period}' → Stil '{style}' angewendet. "
-                + result.get("note", "")
-            ),
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def get_reshade_addons() -> dict:
-    """Listet alle installierten ReShade .addon-Dateien im MSFS-Ordner auf.
-
-    ReShade 5.x+ unterstützt .addon-Dateien für erweiterte Funktionen (z.B. VR-Addons,
-    OpenXR-Integration). Zeigt Name und Vorhandensein jedes Addons.
-
-    Wann aufrufen: 'ReShade Addons', 'welche Addons sind installiert',
-    'ReShade VR Addon', 'reshade-vr Addon'.
-
-    Returns:
-        addon_files: list of addon names found
-        addon_dir: directory searched
-        vr_addon_present: bool (reshade-vr or similar detected)
-    """
-    try:
-        ini_path = _rs_locate_ini()
-        if ini_path is None:
-            return {"error": "ReShade.ini nicht gefunden."}
-
-        base = ini_path.parent
-        addon_files: list[dict] = []
-        vr_addon_present = False
-
-        for f in sorted(base.rglob("*.addon")):
-            name = f.name
-            addon_files.append({
-                "name": name,
-                "path": str(f),
-                "size_kb": round(f.stat().st_size / 1024, 1),
-            })
-            if any(kw in name.lower() for kw in ("vr", "openxr", "openvr", "fsr")):
-                vr_addon_present = True
-
-        return {
-            "status": "ok",
-            "addon_dir": str(base),
-            "addon_count": len(addon_files),
-            "addon_files": addon_files,
-            "vr_addon_present": vr_addon_present,
-            "note": (
-                "Keine .addon-Dateien gefunden. ReShade 5+ benötigt .addon-Dateien für "
-                "erweiterte VR-Unterstützung." if not addon_files
-                else f"{len(addon_files)} Addon(s) gefunden."
-                     + (" VR-Addon erkannt." if vr_addon_present else "")
-            ),
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def check_reshade_vr_compatibility() -> dict:
-    """Prüft ob die installierte ReShade-Version VR (OpenXR) vollständig unterstützt.
-
-    ReShade 5.0+ wird für volle OpenXR/VR-Unterstützung benötigt.
-    Liest die DLL-Version von dxgi.dll und vergleicht mit der Mindestanforderung.
-
-    Wann aufrufen: 'ReShade VR kompatibel', 'welche ReShade Version',
-    'ReShade OpenXR Support', 'ReShade Version prüfen'.
-
-    Returns:
-        installed_version, version_ok (>=5.0), dll_found, recommendations
-    """
-    try:
-        ini_path = _rs_locate_ini()
-        if ini_path is None:
-            return {"error": "ReShade.ini nicht gefunden."}
-
-        base = ini_path.parent
-        dll_path: "Path | None" = None
-        dll_name = "none"
-        for candidate in ("dxgi.dll", "d3d11.dll", "d3d12.dll"):
-            p = base / candidate
-            if p.exists():
-                dll_path = p
-                dll_name = candidate
-                break
-
-        if dll_path is None:
-            return {
-                "status": "warning",
-                "installed_version": "unknown",
-                "dll_found": "none",
-                "version_ok": False,
-                "recommendations": [
-                    "Keine ReShade DLL gefunden. Reinstalliere ReShade von https://reshade.me.",
-                ],
-            }
-
-        version_str = _get_file_version(dll_path)
-
-        # Parse major version
-        version_ok = False
-        major = 0
-        try:
-            parts = version_str.split(".")
-            major = int(parts[0])
-            version_ok = major >= 5
-        except Exception:
-            pass
-
-        recommendations: list[str] = []
-        if not version_ok:
-            recommendations.append(
-                f"ReShade {version_str} ist veraltet — für volle VR/OpenXR-Unterstützung "
-                "wird ReShade 5.0+ benötigt. Aktualisiere auf https://reshade.me."
-            )
-        else:
-            recommendations.append(
-                f"ReShade {version_str} unterstützt VR/OpenXR vollständig."
-            )
-
-        # Check for addon support (5.x feature)
-        addon_support = major >= 5
-        if addon_support:
-            addon_count = len(list(base.rglob("*.addon")))
-            if addon_count == 0:
-                recommendations.append(
-                    "ReShade 5+ Addon-Support verfügbar, aber keine .addon-Dateien gefunden. "
-                    "Erwäge reshade-vr Addon für bessere OpenXR-Integration."
-                )
-
-        return {
-            "status": "ok",
-            "dll_found": dll_name,
-            "dll_path": str(dll_path),
-            "installed_version": version_str,
-            "major_version": major,
-            "version_ok": version_ok,
-            "addon_support": addon_support,
-            "vr_recommendation": (
-                "VR-kompatibel: ReShade 5+ unterstützt OpenXR und addon-basierte VR-Features."
-                if version_ok
-                else "Update empfohlen: ReShade <5.0 hat eingeschränkte VR/OpenXR-Unterstützung."
-            ),
-            "recommendations": recommendations,
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def backup_reshade_preset(preset_name: str = "") -> dict:
-    """Erstellt ein Backup des aktuell aktiven ReShade-Presets mit Datum im Dateinamen.
-
-    Kopiert das aktive Preset als 'PresetName_backup_YYYYMMDD.ini' in denselben Ordner.
-
-    Wann aufrufen: 'ReShade Preset sichern', 'Preset Backup erstellen',
-    'aktuelles Preset speichern', 'ReShade Sicherung'.
-
-    Args:
-        preset_name: Optionaler Name für das Backup (leer = Name des aktiven Presets).
-
-    Returns:
-        status, source_preset, backup_path, backup_name
-    """
-    try:
-        import datetime
-        ini_path = _rs_locate_ini()
-        if ini_path is None:
-            return {"error": "ReShade.ini nicht gefunden."}
-
-        preset_path = _rs_get_active_preset_path(ini_path)
-        if preset_path is None:
-            return {
-                "error": "Kein aktives Preset gefunden.",
-                "hint": "Erstelle zuerst ein Preset mit create_reshade_vr_visual_preset().",
-            }
-
-        ts = datetime.datetime.now().strftime("%Y%m%d")
-        base_name = preset_name.strip() if preset_name.strip() else preset_path.stem
-        # Sanitise
-        base_name = "".join(c for c in base_name if c.isalnum() or c in ("_", "-"))
-        backup_name = f"{base_name}_backup_{ts}.ini"
-        backup_path = preset_path.parent / backup_name
-
-        # Avoid overwriting existing backup in same day — add suffix
-        _suffix = 0
-        while backup_path.exists():
-            _suffix += 1
-            backup_path = preset_path.parent / f"{base_name}_backup_{ts}_{_suffix}.ini"
-
-        _sh.copy2(str(preset_path), str(backup_path))
-
-        return {
-            "status": "ok",
-            "source_preset": preset_path.name,
-            "backup_path": str(backup_path),
-            "backup_name": backup_path.name,
-            "note": f"Backup erstellt: {backup_path.name}",
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def list_reshade_preset_backups() -> dict:
-    """Listet alle verfügbaren ReShade-Preset-Backups mit Datum auf.
-
-    Sucht nach *_backup_*.ini-Dateien im reshade-presets-Ordner.
-
-    Wann aufrufen: 'ReShade Backups anzeigen', 'welche Preset-Backups gibt es',
-    'ReShade Sicherungen Liste'.
-
-    Returns:
-        backups: list of backup files with name and date
-    """
-    try:
-        ini_path = _rs_locate_ini()
-        if ini_path is None:
-            return {"error": "ReShade.ini nicht gefunden."}
-
-        base = ini_path.parent
-        search_dirs = [base, base / "reshade-presets"]
-        backups: list[dict] = []
-        import re as _re
-        _pattern = _re.compile(r"_backup_(\d{8})", _re.IGNORECASE)
-
-        for d in search_dirs:
-            if not d.is_dir():
-                continue
-            for f in sorted(d.glob("*_backup_*.ini")):
-                m = _pattern.search(f.stem)
-                date_str = m.group(1) if m else "unknown"
-                backups.append({
-                    "name": f.name,
-                    "path": str(f),
-                    "date": date_str,
-                    "size_kb": round(f.stat().st_size / 1024, 1),
-                })
-
-        return {
-            "status": "ok",
-            "backup_count": len(backups),
-            "backups": backups,
-            "note": (
-                "Keine Backups gefunden. Erstelle eines mit backup_reshade_preset()."
-                if not backups
-                else f"{len(backups)} Backup(s) gefunden."
-            ),
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def restore_reshade_preset(backup_name: str) -> dict:
-    """Stellt ein ReShade-Preset aus einem Backup wieder her und aktiviert es.
-
-    Kopiert die Backup-Datei als aktives Preset und setzt ReShade.ini auf dieses Preset.
-
-    Wann aufrufen: 'ReShade Preset wiederherstellen', 'Backup laden',
-    'ReShade auf alten Stand zurücksetzen'.
-
-    Args:
-        backup_name: Name der Backup-Datei (mit oder ohne .ini).
-
-    Returns:
-        status, restored_from, preset_path, activated
-    """
-    try:
-        ini_path = _rs_locate_ini()
-        if ini_path is None:
-            return {"error": "ReShade.ini nicht gefunden."}
-
-        base = ini_path.parent
-        # Find the backup file
-        if not backup_name.lower().endswith(".ini"):
-            backup_name += ".ini"
-
-        backup_path: "Path | None" = None
-        for d in (base, base / "reshade-presets"):
-            candidate = d / backup_name
-            if candidate.exists():
-                backup_path = candidate
-                break
-
-        if backup_path is None:
-            # Try case-insensitive search
-            for d in (base, base / "reshade-presets"):
-                if not d.is_dir():
-                    continue
-                for f in d.iterdir():
-                    if f.name.lower() == backup_name.lower():
-                        backup_path = f
-                        break
-                if backup_path:
-                    break
-
-        if backup_path is None:
-            backups = list_reshade_preset_backups()
-            return {
-                "error": f"Backup '{backup_name}' nicht gefunden.",
-                "available_backups": [b["name"] for b in backups.get("backups", [])],
-            }
-
-        # Derive restored preset name (strip _backup_YYYYMMDD suffix)
-        import re as _re
-        restored_stem = _re.sub(r"_backup_\d{8}(_\d+)?$", "", backup_path.stem,
-                                 flags=_re.IGNORECASE)
-        restored_name = f"{restored_stem}_restored.ini"
-        restored_path = backup_path.parent / restored_name
-        _sh.copy2(str(backup_path), str(restored_path))
-
-        # Activate in ReShade.ini
-        cp, _ = _rs_load_ini()
-        if not cp.has_section("GENERAL"):
-            cp.add_section("GENERAL")
-        cp.set("GENERAL", "PresetPath", str(restored_path))
-        _rs_save_ini(cp, ini_path)
-
-        return {
-            "status": "ok",
-            "restored_from": backup_path.name,
-            "preset_path": str(restored_path),
-            "activated": True,
-            "note": (
-                f"Preset '{restored_path.name}' aus Backup '{backup_path.name}' "
-                "wiederhergestellt und aktiviert. Home-Taste → ReShade-Overlay → Preset neu laden."
-            ),
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def save_reshade_profile_as(profile_name: str) -> dict:
-    """Speichert das aktuelle ReShade-Preset unter einem benutzerdefinierten Namen.
-
-    Kopiert das aktive Preset in den reshade-presets-Ordner mit dem gewünschten Namen
-    und aktiviert es als neues Preset.
-
-    Wann aufrufen: 'ReShade Preset als X speichern', 'Preset umbenennen',
-    'eigenes ReShade Profil', 'Preset für dieses Flugzeug speichern'.
-
-    Args:
-        profile_name: Name für das neue Preset (ohne .ini).
-
-    Returns:
-        status, saved_path, activated
-    """
-    try:
-        ini_path = _rs_locate_ini()
-        if ini_path is None:
-            return {"error": "ReShade.ini nicht gefunden."}
-
-        preset_path = _rs_get_active_preset_path(ini_path)
-        if preset_path is None:
-            return {
-                "error": "Kein aktives Preset gefunden.",
-                "hint": "Erstelle zuerst ein Preset mit create_reshade_vr_visual_preset().",
-            }
-
-        # Sanitise name
-        safe_name = "".join(c for c in profile_name.strip()
-                            if c.isalnum() or c in (" ", "_", "-")).strip()
-        safe_name = safe_name.replace(" ", "_")
-        if not safe_name:
-            return {"error": "Ungültiger Profilname. Nutze Buchstaben, Zahlen, _ oder -."}
-
-        dest_dir = ini_path.parent / "reshade-presets"
-        dest_dir.mkdir(exist_ok=True)
-        dest_path = dest_dir / f"{safe_name}.ini"
-
-        _sh.copy2(str(preset_path), str(dest_path))
-
-        # Activate the new named preset
-        cp, _ = _rs_load_ini()
-        if not cp.has_section("GENERAL"):
-            cp.add_section("GENERAL")
-        cp.set("GENERAL", "PresetPath", str(dest_path))
-        _rs_save_ini(cp, ini_path)
-
-        return {
-            "status": "ok",
-            "original_preset": preset_path.name,
-            "saved_as": dest_path.name,
-            "saved_path": str(dest_path),
-            "activated": True,
-            "note": (
-                f"Preset als '{safe_name}.ini' gespeichert und aktiviert. "
-                "Home-Taste → ReShade-Overlay → Preset neu laden."
-            ),
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def list_reshade_custom_profiles() -> dict:
-    """Listet alle benutzerdefinierten ReShade-Presets im GameCopilot/reshade-presets-Ordner.
-
-    Zeigt alle .ini-Presets mit Größe und Datum — nützlich um eigene Profile zu verwalten.
-
-    Wann aufrufen: 'ReShade Profile anzeigen', 'welche eigenen Presets gibt es',
-    'Preset-Liste', 'ReShade Profil-Übersicht'.
-
-    Returns:
-        presets: list of preset names with metadata
-        active_preset: currently active preset name
-    """
-    try:
-        ini_path = _rs_locate_ini()
-        if ini_path is None:
-            return {"error": "ReShade.ini nicht gefunden."}
-
-        base = ini_path.parent
-        cp, _ = _rs_load_ini()
-        general = cp["GENERAL"] if cp.has_section("GENERAL") else {}
-        active_raw = general.get("PresetPath", "")
-        active_name = Path(active_raw).name if active_raw else ""
-
-        preset_dirs = [base / "reshade-presets", base / "Presets", base / "presets"]
-        presets: list[dict] = []
-        seen: set = set()
-
-        for d in preset_dirs:
-            if not d.is_dir():
-                continue
-            for f in sorted(d.glob("*.ini")):
-                if f.name in seen:
-                    continue
-                seen.add(f.name)
-                import datetime as _dt
-                mtime = _dt.datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-                presets.append({
-                    "name": f.name,
-                    "path": str(f),
-                    "size_kb": round(f.stat().st_size / 1024, 1),
-                    "modified": mtime,
-                    "active": f.name == active_name,
-                })
-
-        return {
-            "status": "ok",
-            "preset_count": len(presets),
-            "active_preset": active_name or "none",
-            "presets": presets,
-            "note": (
-                "Keine Presets gefunden. Erstelle eines mit create_reshade_vr_visual_preset()."
-                if not presets
-                else f"{len(presets)} Preset(s) gefunden. Aktiv: {active_name or 'none'}."
-            ),
-        }
-    except Exception as e:
-        return {"error": str(e)}
+    return {"version": __version__, "repo": _GITHUB_REPO}
 
 
 if __name__ == "__main__":

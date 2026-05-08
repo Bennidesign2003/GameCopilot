@@ -227,7 +227,7 @@
         <!-- Spinning ring for active (not-yet-complete) step -->
         <Style Selector="Border.step-spinner">
             <Style.Animations>
-                <Animation Duration="0:0:1.1" IterationCount="INFINITE" Easing="Linear">
+                <Animation Duration="0:0:1.1" IterationCount="INFINITE" Easing="LinearEasing">
                     <KeyFrame Cue="0%">
                         <Setter Property="RotateTransform.Angle" Value="0"/>
                     </KeyFrame>
